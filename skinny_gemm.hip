@@ -82,7 +82,6 @@ void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
                               const dim3 &grid_dim, const dim3 &block_dim,
                               size_t shared_mem_bytes, size_t alloc_a_bytes,
                               size_t alloc_b_bytes, size_t alloc_c_bytes);
-bool shouldRunSkinnyGemmKernel();
 
 ProblemProperties getBenchmarkProblemSize(const SkinnyGemmKernel &kernel,
                                           MNKShape total) {
@@ -177,25 +176,6 @@ void checkSkinnyGemmResults(Type A_type, Type B_type, Type C_type,
 }
 
 void check(const SkinnyGemmKernel &kernel, const ProblemProperties &problem) {
-  const dim3 grid_dim(problem.outer.M, problem.outer.N);
-  const dim3 block_dim(kernel.num_threads_func(problem));
-  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
-  const size_t alloc_a_bytes =
-      static_cast<size_t>(flat_a_size(problem)) * type_size(kernel.A_type);
-  const size_t alloc_b_bytes =
-      static_cast<size_t>(flat_b_size(problem)) * type_size(kernel.B_type);
-  const size_t alloc_c_bytes =
-      static_cast<size_t>(flat_c_size(problem)) * type_size(kernel.C_type);
-  printSparseTrickScaffold(kernel, problem, grid_dim, block_dim,
-                           shared_mem_bytes, alloc_a_bytes, alloc_b_bytes,
-                           alloc_c_bytes);
-  if (!shouldRunSkinnyGemmKernel()) {
-    std::fprintf(stderr,
-                 "\tSkipping kernel launch (compute disabled). Set "
-                 "SKINNY_GEMM_FORCE_KERNEL=1 to run the stub.\n");
-    return;
-  }
-
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
       makeRandomBuffer(kernel.A_type, flat_a_size(problem), random_engine);
@@ -221,6 +201,13 @@ void check(const SkinnyGemmKernel &kernel, const ProblemProperties &problem) {
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipGetLastError());
 
+  const dim3 grid_dim(problem.outer.M, problem.outer.N);
+  const dim3 block_dim(kernel.num_threads_func(problem));
+  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
+  printSparseTrickScaffold(kernel, problem, grid_dim, block_dim,
+                           shared_mem_bytes, A_host_data.size(),
+                           B_host_data.size(), C_host_data.size());
+
   HIP_CHECK(hipGetLastError());
   kernel.gemm_func<<<grid_dim, block_dim, shared_mem_bytes, hipStreamDefault>>>(
       A_device_buffer, B_device_buffer, C_device_buffer, problem.total.M,
@@ -245,26 +232,6 @@ void benchmark(const SkinnyGemmKernel &kernel, MNKShape total) {
   ProblemProperties problem = getBenchmarkProblemSize(kernel, total);
   std::printf("  Benchmarking: ");
   print(problem, stdout);
-  std::fflush(stdout);
-
-  const dim3 grid_dim(problem.outer.M, problem.outer.N);
-  const dim3 block_dim(kernel.num_threads_func(problem));
-  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
-  const size_t alloc_a_bytes =
-      static_cast<size_t>(flat_a_size(problem)) * type_size(kernel.A_type);
-  const size_t alloc_b_bytes =
-      static_cast<size_t>(flat_b_size(problem)) * type_size(kernel.B_type);
-  const size_t alloc_c_bytes =
-      static_cast<size_t>(flat_c_size(problem)) * type_size(kernel.C_type);
-  printSparseTrickScaffold(kernel, problem, grid_dim, block_dim,
-                           shared_mem_bytes, alloc_a_bytes, alloc_b_bytes,
-                           alloc_c_bytes);
-  if (!shouldRunSkinnyGemmKernel()) {
-    std::fprintf(stderr,
-                 "\tSkipping kernel launch (compute disabled). Set "
-                 "SKINNY_GEMM_FORCE_KERNEL=1 to run the stub.\n");
-    return;
-  }
 
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
@@ -287,6 +254,13 @@ void benchmark(const SkinnyGemmKernel &kernel, MNKShape total) {
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(C_device_buffer, C_host_data.data(), C_host_data.size(),
                       hipMemcpyHostToDevice));
+
+  const dim3 grid_dim(problem.outer.M, problem.outer.N);
+  const dim3 block_dim(kernel.num_threads_func(problem));
+  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
+  printSparseTrickScaffold(kernel, problem, grid_dim, block_dim,
+                           shared_mem_bytes, A_host_data.size(),
+                           B_host_data.size(), C_host_data.size());
 
   hipEvent_t start, stop;
   HIP_CHECK(hipEventCreate(&start));
@@ -412,14 +386,6 @@ struct SharedMemLayout {
   static constexpr int total_bytes = B_offset + B_bytes;
 };
 
-bool shouldRunSkinnyGemmKernel() {
-#if SKINNY_GEMM_ENABLE_COMPUTE
-  return true;
-#else
-  return getIntEnvVar("SKINNY_GEMM_FORCE_KERNEL", 0) != 0;
-#endif
-}
-
 void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
                               const ProblemProperties &problem,
                               const dim3 &grid_dim, const dim3 &block_dim,
@@ -509,38 +475,11 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     num_threads_func = [](const ProblemProperties &) {
       return SparseTrickConfig::WARP_SIZE;
     };
-#if SKINNY_GEMM_ENABLE_COMPUTE
     shared_mem_bytes_func = [](const ProblemProperties &) {
       return static_cast<size_t>(SharedMemLayout::total_bytes);
     };
     gemm_func = run;
-#else
-    shared_mem_bytes_func = no_shared_mem;
-    gemm_func = run_stub;
-#endif
     supports_check = false;
-  }
-
-  __global__ static void run_stub(const void *A_data, const void *B_data,
-                                  void *C_data, int M, int N, int K) {
-    constexpr int OP_M = SparseTrickConfig::OP_M;
-    constexpr int OP_N = SparseTrickConfig::OP_N;
-    const int lane = threadIdx.x & (SparseTrickConfig::WARP_SIZE - 1);
-    const int m_outer = blockIdx.x;
-    const int n_outer = blockIdx.y;
-    const int global_m_base = m_outer * OP_M;
-    const int global_n_base = n_outer * OP_N;
-    if (global_m_base >= M || global_n_base >= N) {
-      return;
-    }
-    _Float16 *C =
-        static_cast<_Float16 *>(C_data) + global_m_base * N + global_n_base;
-    if (lane == 0) {
-      C[0] = static_cast<_Float16>(0);
-    }
-    (void)A_data;
-    (void)B_data;
-    (void)K;
   }
 
   __global__ static void run(const void *A_data, const void *B_data,
@@ -633,7 +572,6 @@ void test(const SkinnyGemmKernel &kernel) {
   std::printf("%s: A:%s, B:%s, C:%s, tile MxNxK=%dx%dx%d\n", kernel.name,
               str(kernel.A_type), str(kernel.B_type), str(kernel.C_type),
               kernel.M_tile, kernel.N_tile, kernel.K_tile);
-  std::fflush(stdout);
 
   if (!getenv("SKIP_CHECK") && kernel.supports_check) {
     check(kernel);
