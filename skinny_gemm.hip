@@ -344,13 +344,15 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     M_tile = SparseTrickConfig::OP_M;
     N_tile = SparseTrickConfig::OP_N;
     K_tile = SparseTrickConfig::WARPTILE_K;
-    num_threads_func = [](const ProblemProperties &) { return warpSize; };
+    num_threads_func = num_threads;
     shared_mem_bytes_func = [](const ProblemProperties &) {
       return static_cast<size_t>(SharedMemLayout::total_bytes);
     };
     gemm_func = run;
     supports_check = false;
   }
+
+  static int num_threads(const ProblemProperties &) { return warpSize; }
 
   __global__ static void run(const void *A_data, const void *B_data,
                              void *C_data, int M, int N, int K) {

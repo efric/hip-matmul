@@ -96,7 +96,8 @@ __device__ __host__ std::common_type_t<A, B> ceil_div(A a, B b) {
   return (a + b - 1) / b;
 }
 
-template <int Po2, typename A> __device__ __host__ A round_up_to_po2(A a) {
+template <int Po2, typename A>
+__device__ __host__ constexpr A round_up_to_po2(A a) {
   static_assert(Po2 > 0 && (Po2 & (Po2 - 1)) == 0);
   return ((a - 1) | (Po2 - 1)) + 1;
 }
