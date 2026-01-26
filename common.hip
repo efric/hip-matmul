@@ -8,8 +8,11 @@
 #define HIP_MATMUL_COMMON
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp8.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -33,7 +36,7 @@ struct MNKShape {
   int M, N, K;
 };
 
-enum class Type { SI8, SI16, SI32, FP16, FP32 };
+enum class Type { SI8, SI16, SI32, FP8, FP16, FP32 };
 
 inline const char *str(Type t) {
   switch (t) {
@@ -43,6 +46,8 @@ inline const char *str(Type t) {
     return "si16";
   case Type::SI32:
     return "si32";
+  case Type::FP8:
+    return "fp8";
   case Type::FP16:
     return "fp16";
   case Type::FP32:
@@ -58,6 +63,8 @@ inline __device__ __host__ int type_size(Type t) {
     return 2;
   case Type::SI32:
     return 4;
+  case Type::FP8:
+    return 1;
   case Type::FP16:
     return 2;
   case Type::FP32:
@@ -75,6 +82,9 @@ template <> struct CTypeImpl<Type::SI16> {
 template <> struct CTypeImpl<Type::SI32> {
   using type = int32_t;
 };
+template <> struct CTypeImpl<Type::FP8> {
+  using type = __hip_fp8_e4m3_fnuz;
+};
 template <> struct CTypeImpl<Type::FP16> {
   using type = _Float16;
 };
@@ -88,7 +98,8 @@ __device__ __host__ std::common_type_t<A, B> ceil_div(A a, B b) {
   return (a + b - 1) / b;
 }
 
-template <int Po2, typename A> __device__ __host__ A round_up_to_po2(A a) {
+template <int Po2, typename A>
+__device__ __host__ constexpr A round_up_to_po2(A a) {
   static_assert(Po2 > 0 && (Po2 & (Po2 - 1)) == 0);
   return ((a - 1) | (Po2 - 1)) + 1;
 }
@@ -101,13 +112,20 @@ void fillRandomBuffer(int size, std::minstd_rand &r, void *out_buffer) {
     // Generate small integers in [-2, +2] so products are in [-4, +4] so
     // accumulators are in [-4K, +4K] for accumulation depth K so they're
     // exactly representable, float rounding is exact and we don't need
-    // fuzzy compares.
-    out_buffer_typed[i] = static_cast<T>(static_cast<int>((r() % 5)) - 2);
+    // fuzzy compares. For FP8 inputs, use [-1, +1] to keep FP16 outputs
+    // away from overflow at large K.
+    float value = 0.f;
+    if constexpr (type == Type::FP8) {
+      value = static_cast<float>(static_cast<int>((r() % 3)) - 1);
+    } else {
+      value = static_cast<float>(static_cast<int>((r() % 5)) - 2);
+    }
+    out_buffer_typed[i] = static_cast<T>(value);
   }
 }
 
 inline std::vector<std::byte> makeRandomBuffer(Type type, int size,
-                                        std::minstd_rand &r) {
+                                               std::minstd_rand &r) {
   int bytes = size * type_size(type);
   std::vector<std::byte> result(bytes);
   if (type == Type::SI8) {
@@ -116,6 +134,8 @@ inline std::vector<std::byte> makeRandomBuffer(Type type, int size,
     fillRandomBuffer<Type::SI16>(size, r, result.data());
   } else if (type == Type::SI32) {
     fillRandomBuffer<Type::SI32>(size, r, result.data());
+  } else if (type == Type::FP8) {
+    fillRandomBuffer<Type::FP8>(size, r, result.data());
   } else if (type == Type::FP16) {
     fillRandomBuffer<Type::FP16>(size, r, result.data());
   } else if (type == Type::FP32) {
