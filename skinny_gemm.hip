@@ -316,6 +316,7 @@ void benchmark(const SkinnyGemmKernel &kernel, MNKShape total) {
 
 // FP8 types and packed vector aliases, mirroring hf-rocm-kernels.
 using fp8 = __hip_fp8_storage_t;
+using fp8_4 = int;
 using fp8x8 = __attribute__((__vector_size__(8 * sizeof(fp8)))) fp8;
 using fp8x16 = __attribute__((__vector_size__(16 * sizeof(fp8)))) fp8;
 using fp8_4x2 = __attribute__((__vector_size__(2 * sizeof(int)))) int;
@@ -533,11 +534,88 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
         (lane & 1) ? SparseTrickConfig::SPARSITY_ODD
                    : SparseTrickConfig::SPARSITY_EVEN;
 
+    // A tile producer (no queue/split-K): mirror produce_4_half_tiles.
+    constexpr int E_PER_THREAD = 16;
+    constexpr int E_PER_BANK = SparseTrickConfig::E_PER_BANK;
+    constexpr int THREADS_PER_LD = 8;
+    const int lane_id = lane;
+    const int curr_ld = (lane_id % THREADS_PER_LD) * E_PER_THREAD;
+    const int curr_ad = lane_id / THREADS_PER_LD;
+    const int dropped_ad = 0;
+    const int k = K;
+    const int k_blocks = K_outer;
+    const fp8 *src = A;
+    src += (curr_ad + dropped_ad > SparseTrickConfig::WARPTILE_M - 1)
+               ? 0
+               : curr_ad * k;
+    src += curr_ld;
+
+    fp8 *buffer = A_smem;
+    buffer += E_PER_BANK * curr_ad;
+    buffer += (curr_ld / 64) * SparseTrickConfig::NB_BANKS * E_PER_BANK * 4;
+    buffer += (curr_ld % 64) * 2;
+
+    fp8_4 reg0[E_PER_THREAD / 4];
+    fp8_4 reg1[E_PER_THREAD / 4];
+    fp8_4 swap_reg[E_PER_THREAD / 4];
+
     for (int k_block = 0; k_block < K_outer; ++k_block) {
       const int k_base = k_block * WARPTILE_K;
+
       (void)k_base;
 
-      // TODO: load A into A_smem (sparse swizzle) and B into B_smem (dense).
+      const fp8 *src_block = src + k_block * WARPTILE_K;
+      fp8_4 *buf = reinterpret_cast<fp8_4 *>(buffer);
+
+      // Load from gmem to reg (two 16B segments: K0..K15 and K128..K143).
+      asm volatile(
+          "global_load_dwordx4 %0, %2, off offset:0  \n\t"
+          "global_load_dwordx4 %1, %2, off offset:128\n\t"
+          : "=v"(reg0), "=v"(reg1)
+          : "v"(src_block));
+
+      // Store in smem from reg (swizzle via pack/swap).
+      asm volatile(
+          "s_waitcnt vmcnt(1)\n\t"
+          "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"
+          "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"
+          "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"
+          "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"
+          "v_swap_b32 %0, %4\n\t"
+          "v_swap_b32 %1, %6\n\t"
+          "v_swap_b32 %2, %5\n\t"
+          "v_swap_b32 %3, %7"
+          : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
+            "=v"(swap_reg[3])
+          : "v"(reg0[0]), "v"(reg0[1]), "v"(reg0[2]), "v"(reg0[3]));
+#pragma unroll
+      for (int line = 0; line < 4; ++line) {
+        buf[line * SparseTrickConfig::NB_BANKS] = reg0[line];
+      }
+
+      asm volatile(
+          "s_waitcnt vmcnt(0)\n\t"
+          "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"
+          "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"
+          "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"
+          "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"
+          "v_swap_b32 %0, %4\n\t"
+          "v_swap_b32 %1, %6\n\t"
+          "v_swap_b32 %2, %5\n\t"
+          "v_swap_b32 %3, %7"
+          : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
+            "=v"(swap_reg[3])
+          : "v"(reg1[0]), "v"(reg1[1]), "v"(reg1[2]), "v"(reg1[3]));
+#pragma unroll
+      for (int line = 0; line < 4; ++line) {
+        buf[line * SparseTrickConfig::NB_BANKS +
+            (SparseTrickConfig::OP_K * SparseTrickConfig::OP_M / 2)] =
+            reg1[line];
+      }
+
+      __syncthreads();
+
+      // TODO: load B into B_smem (dense).
       // TODO: issue OPS smfmacs, loading fp8x8/fp8x16 from LDS each op.
       (void)A_smem;
       (void)B_smem;
@@ -548,6 +626,7 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
 
     // TODO: post-process acc and store to C.
     (void)acc;
+    (void)k_blocks;
 #else
     // Stub: keep the kernel non-empty and compilable.
     if (lane == 0) {
