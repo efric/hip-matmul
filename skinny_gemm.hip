@@ -77,6 +77,13 @@ struct SkinnyGemmKernel {
   bool supports_check;          // Whether to run correctness checks.
 };
 
+void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
+                              const ProblemProperties &problem,
+                              const dim3 &grid_dim, const dim3 &block_dim,
+                              size_t shared_mem_bytes, size_t alloc_a_bytes,
+                              size_t alloc_b_bytes, size_t alloc_c_bytes);
+bool shouldRunSkinnyGemmKernel();
+
 ProblemProperties getBenchmarkProblemSize(const SkinnyGemmKernel &kernel,
                                           MNKShape total) {
   ProblemProperties problem_size = {};
@@ -170,6 +177,25 @@ void checkSkinnyGemmResults(Type A_type, Type B_type, Type C_type,
 }
 
 void check(const SkinnyGemmKernel &kernel, const ProblemProperties &problem) {
+  const dim3 grid_dim(problem.outer.M, problem.outer.N);
+  const dim3 block_dim(kernel.num_threads_func(problem));
+  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
+  const size_t alloc_a_bytes =
+      static_cast<size_t>(flat_a_size(problem)) * type_size(kernel.A_type);
+  const size_t alloc_b_bytes =
+      static_cast<size_t>(flat_b_size(problem)) * type_size(kernel.B_type);
+  const size_t alloc_c_bytes =
+      static_cast<size_t>(flat_c_size(problem)) * type_size(kernel.C_type);
+  printSparseTrickScaffold(kernel, problem, grid_dim, block_dim,
+                           shared_mem_bytes, alloc_a_bytes, alloc_b_bytes,
+                           alloc_c_bytes);
+  if (!shouldRunSkinnyGemmKernel()) {
+    std::fprintf(stderr,
+                 "\tSkipping kernel launch (compute disabled). Set "
+                 "SKINNY_GEMM_FORCE_KERNEL=1 to run the stub.\n");
+    return;
+  }
+
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
       makeRandomBuffer(kernel.A_type, flat_a_size(problem), random_engine);
@@ -195,12 +221,6 @@ void check(const SkinnyGemmKernel &kernel, const ProblemProperties &problem) {
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipGetLastError());
 
-  const dim3 grid_dim(problem.outer.M, problem.outer.N);
-  const dim3 block_dim(kernel.num_threads_func(problem));
-  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
-  fprintf(stderr, "Num threads: %d\n", block_dim.x);
-  fprintf(stderr, "Shared mem bytes: %zu\n", shared_mem_bytes);
-
   HIP_CHECK(hipGetLastError());
   kernel.gemm_func<<<grid_dim, block_dim, shared_mem_bytes, hipStreamDefault>>>(
       A_device_buffer, B_device_buffer, C_device_buffer, problem.total.M,
@@ -225,6 +245,26 @@ void benchmark(const SkinnyGemmKernel &kernel, MNKShape total) {
   ProblemProperties problem = getBenchmarkProblemSize(kernel, total);
   std::printf("  Benchmarking: ");
   print(problem, stdout);
+  std::fflush(stdout);
+
+  const dim3 grid_dim(problem.outer.M, problem.outer.N);
+  const dim3 block_dim(kernel.num_threads_func(problem));
+  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
+  const size_t alloc_a_bytes =
+      static_cast<size_t>(flat_a_size(problem)) * type_size(kernel.A_type);
+  const size_t alloc_b_bytes =
+      static_cast<size_t>(flat_b_size(problem)) * type_size(kernel.B_type);
+  const size_t alloc_c_bytes =
+      static_cast<size_t>(flat_c_size(problem)) * type_size(kernel.C_type);
+  printSparseTrickScaffold(kernel, problem, grid_dim, block_dim,
+                           shared_mem_bytes, alloc_a_bytes, alloc_b_bytes,
+                           alloc_c_bytes);
+  if (!shouldRunSkinnyGemmKernel()) {
+    std::fprintf(stderr,
+                 "\tSkipping kernel launch (compute disabled). Set "
+                 "SKINNY_GEMM_FORCE_KERNEL=1 to run the stub.\n");
+    return;
+  }
 
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
@@ -247,10 +287,6 @@ void benchmark(const SkinnyGemmKernel &kernel, MNKShape total) {
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(C_device_buffer, C_host_data.data(), C_host_data.size(),
                       hipMemcpyHostToDevice));
-
-  const dim3 grid_dim(problem.outer.M, problem.outer.N);
-  const dim3 block_dim(kernel.num_threads_func(problem));
-  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
 
   hipEvent_t start, stop;
   HIP_CHECK(hipEventCreate(&start));
@@ -313,18 +349,59 @@ using fp8_4x4 = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 using f32x4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 
 struct SparseTrickConfig {
+  static constexpr int WARP_SIZE = 64;
+  static constexpr int NB_BANKS = 32;
+  static constexpr int E_PER_BANK = 4;
+  static constexpr int A_LANES = 1;
+  static constexpr int B_LANES = 1;
   static constexpr int OP_M = 8;
   static constexpr int OP_N = 16;
   static constexpr int OP_K = 64;
   static constexpr int OPS = 4;
-  static constexpr int WARPTILE_M = OP_M;
-  static constexpr int WARPTILE_N = OP_N;
+  static constexpr int WARPTILE_M = OP_M * A_LANES;
+  static constexpr int WARPTILE_N = OP_N * B_LANES;
   static constexpr int WARPTILE_K = OP_K * OPS;
+  static constexpr int A_OP_BYTES = OP_M * OP_K; // 8x64 bytes (one SMFMAC A).
+  static constexpr int B_OP_BYTES = OP_N * OP_K; // 16x64 bytes (one SMFMAC B).
+  static constexpr int A_BANK_BYTES = A_OP_BYTES; // 8x64 bank.
+  static constexpr int A_HALF_TILE_BYTES = A_BANK_BYTES * 2; // 8x128 bytes.
+  static constexpr int B_PANEL_BYTES = B_OP_BYTES / 2; // 16x32 bytes.
   static constexpr int A_TILE_BYTES = WARPTILE_M * WARPTILE_K; // 8x256 bytes.
   static constexpr int B_TILE_BYTES = WARPTILE_N * WARPTILE_K; // 16x256 bytes.
   static constexpr int SPARSITY_EVEN = 0x00004444;
   static constexpr int SPARSITY_ODD = 0x0000EEEE;
 };
+
+static_assert(sizeof(fp8) == 1, "FP8 storage size should be 1 byte.");
+static_assert(sizeof(fp8x8) == 8, "fp8x8 should pack 8 bytes.");
+static_assert(sizeof(fp8x16) == 16, "fp8x16 should pack 16 bytes.");
+static_assert(sizeof(fp8_4x2) == 8, "fp8_4x2 should pack 8 bytes.");
+static_assert(sizeof(fp8_4x4) == 16, "fp8_4x4 should pack 16 bytes.");
+static_assert(sizeof(f32x4) == 16, "f32x4 should pack 16 bytes.");
+static_assert(SparseTrickConfig::OP_M == 8, "Scaffold assumes OP_M=8.");
+static_assert(SparseTrickConfig::OP_N == 16, "Scaffold assumes OP_N=16.");
+static_assert(SparseTrickConfig::OP_K == 64, "Scaffold assumes OP_K=64.");
+static_assert(SparseTrickConfig::OPS == 4, "Scaffold assumes OPS=4.");
+static_assert(SparseTrickConfig::A_LANES == 1,
+              "Scaffold assumes A_LANES=1.");
+static_assert(SparseTrickConfig::B_LANES == 1,
+              "Scaffold assumes B_LANES=1.");
+static_assert(SparseTrickConfig::OPS % 2 == 0,
+              "OPS must be even to form 8x128 half tiles.");
+static_assert(SparseTrickConfig::OP_K % 2 == 0,
+              "OP_K must be even to form 16x32 panels.");
+static_assert(SparseTrickConfig::A_TILE_BYTES ==
+                  SparseTrickConfig::A_OP_BYTES * SparseTrickConfig::OPS,
+              "A tile bytes mismatch.");
+static_assert(SparseTrickConfig::B_TILE_BYTES ==
+                  SparseTrickConfig::B_OP_BYTES * SparseTrickConfig::OPS,
+              "B tile bytes mismatch.");
+static_assert(SparseTrickConfig::A_HALF_TILE_BYTES ==
+                  SparseTrickConfig::A_OP_BYTES * 2,
+              "A half-tile bytes mismatch.");
+static_assert(SparseTrickConfig::B_PANEL_BYTES ==
+                  SparseTrickConfig::B_OP_BYTES / 2,
+              "B panel bytes mismatch.");
 
 struct SharedMemLayout {
   static constexpr int kAlign = 16;
@@ -335,6 +412,91 @@ struct SharedMemLayout {
   static constexpr int total_bytes = B_offset + B_bytes;
 };
 
+bool shouldRunSkinnyGemmKernel() {
+#if SKINNY_GEMM_ENABLE_COMPUTE
+  return true;
+#else
+  return getIntEnvVar("SKINNY_GEMM_FORCE_KERNEL", 0) != 0;
+#endif
+}
+
+void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
+                              const ProblemProperties &problem,
+                              const dim3 &grid_dim, const dim3 &block_dim,
+                              size_t shared_mem_bytes, size_t alloc_a_bytes,
+                              size_t alloc_b_bytes, size_t alloc_c_bytes) {
+  const size_t A_elements =
+      static_cast<size_t>(problem.total.M) * problem.total.K;
+  const size_t B_elements =
+      static_cast<size_t>(problem.total.N) * problem.total.K;
+  const size_t C_elements =
+      static_cast<size_t>(problem.total.M) * problem.total.N;
+  const size_t A_bytes =
+      A_elements * static_cast<size_t>(type_size(kernel.A_type));
+  const size_t B_bytes =
+      B_elements * static_cast<size_t>(type_size(kernel.B_type));
+  const size_t C_bytes =
+      C_elements * static_cast<size_t>(type_size(kernel.C_type));
+  const int k_blocks =
+      ceil_div(problem.total.K, SparseTrickConfig::WARPTILE_K);
+
+  fprintf(stderr, "Skinny GEMM scaffold sizes:\n");
+  print(problem, stderr);
+  fprintf(stderr,
+          "\tSparse trick: OP_M=%d OP_N=%d OP_K=%d OPS=%d (WARPTILE_K=%d)\n",
+          SparseTrickConfig::OP_M, SparseTrickConfig::OP_N,
+          SparseTrickConfig::OP_K, SparseTrickConfig::OPS,
+          SparseTrickConfig::WARPTILE_K);
+  fprintf(stderr,
+          "\tWarp tile: M=%d N=%d K=%d (A_LANES=%d, B_LANES=%d, warp=%d)\n",
+          SparseTrickConfig::WARPTILE_M, SparseTrickConfig::WARPTILE_N,
+          SparseTrickConfig::WARPTILE_K, SparseTrickConfig::A_LANES,
+          SparseTrickConfig::B_LANES, SparseTrickConfig::WARP_SIZE);
+  fprintf(stderr,
+          "\tA tile: %dx%d bytes=%d (per-op=%d, half-tile=%d, bank=%d)\n",
+          SparseTrickConfig::OP_M, SparseTrickConfig::WARPTILE_K,
+          SparseTrickConfig::A_TILE_BYTES, SparseTrickConfig::A_OP_BYTES,
+          SparseTrickConfig::A_HALF_TILE_BYTES,
+          SparseTrickConfig::A_BANK_BYTES);
+  fprintf(stderr,
+          "\tB tile: %dx%d bytes=%d (per-op=%d, panel=%d)\n",
+          SparseTrickConfig::OP_N, SparseTrickConfig::WARPTILE_K,
+          SparseTrickConfig::B_TILE_BYTES, SparseTrickConfig::B_OP_BYTES,
+          SparseTrickConfig::B_PANEL_BYTES);
+  fprintf(stderr,
+          "\tShared mem: align=%d A_off=%d A_bytes=%d B_off=%d B_bytes=%d "
+          "total=%d\n",
+          SharedMemLayout::kAlign, SharedMemLayout::A_offset,
+          SharedMemLayout::A_bytes, SharedMemLayout::B_offset,
+          SharedMemLayout::B_bytes, SharedMemLayout::total_bytes);
+  fprintf(stderr,
+          "\tBuffers (logical bytes): A=%zu B=%zu C=%zu (elements A=%zu "
+          "B=%zu C=%zu)\n",
+          A_bytes, B_bytes, C_bytes, A_elements, B_elements, C_elements);
+  fprintf(stderr, "\tBuffers (allocated bytes): A=%zu B=%zu C=%zu\n",
+          alloc_a_bytes, alloc_b_bytes, alloc_c_bytes);
+  fprintf(stderr,
+          "\tLaunch: grid=(%u,%u,%u) block=(%u,%u,%u) threads=%u shared=%zu\n",
+          static_cast<unsigned>(grid_dim.x),
+          static_cast<unsigned>(grid_dim.y),
+          static_cast<unsigned>(grid_dim.z),
+          static_cast<unsigned>(block_dim.x),
+          static_cast<unsigned>(block_dim.y),
+          static_cast<unsigned>(block_dim.z),
+          static_cast<unsigned>(block_dim.x), shared_mem_bytes);
+  fprintf(stderr, "\tK blocks: %d (K=%d / %d)\n", k_blocks, problem.total.K,
+          SparseTrickConfig::WARPTILE_K);
+  fprintf(stderr, "\tAlignment: M%%OP_M=%d N%%OP_N=%d K%%WARPTILE_K=%d\n",
+          problem.total.M % SparseTrickConfig::OP_M,
+          problem.total.N % SparseTrickConfig::OP_N,
+          problem.total.K % SparseTrickConfig::WARPTILE_K);
+#if SKINNY_GEMM_ENABLE_COMPUTE
+  fprintf(stderr, "\tCompute path: enabled\n");
+#else
+  fprintf(stderr, "\tCompute path: disabled (stub)\n");
+#endif
+}
+
 struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
   SparseTrickOpM8Kernel() {
     name = __FUNCTION__;
@@ -344,15 +506,42 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     M_tile = SparseTrickConfig::OP_M;
     N_tile = SparseTrickConfig::OP_N;
     K_tile = SparseTrickConfig::WARPTILE_K;
-    num_threads_func = num_threads;
+    num_threads_func = [](const ProblemProperties &) {
+      return SparseTrickConfig::WARP_SIZE;
+    };
+#if SKINNY_GEMM_ENABLE_COMPUTE
     shared_mem_bytes_func = [](const ProblemProperties &) {
       return static_cast<size_t>(SharedMemLayout::total_bytes);
     };
     gemm_func = run;
+#else
+    shared_mem_bytes_func = no_shared_mem;
+    gemm_func = run_stub;
+#endif
     supports_check = false;
   }
 
-  static int num_threads(const ProblemProperties &) { return warpSize; }
+  __global__ static void run_stub(const void *A_data, const void *B_data,
+                                  void *C_data, int M, int N, int K) {
+    constexpr int OP_M = SparseTrickConfig::OP_M;
+    constexpr int OP_N = SparseTrickConfig::OP_N;
+    const int lane = threadIdx.x & (SparseTrickConfig::WARP_SIZE - 1);
+    const int m_outer = blockIdx.x;
+    const int n_outer = blockIdx.y;
+    const int global_m_base = m_outer * OP_M;
+    const int global_n_base = n_outer * OP_N;
+    if (global_m_base >= M || global_n_base >= N) {
+      return;
+    }
+    _Float16 *C =
+        static_cast<_Float16 *>(C_data) + global_m_base * N + global_n_base;
+    if (lane == 0) {
+      C[0] = static_cast<_Float16>(0);
+    }
+    (void)A_data;
+    (void)B_data;
+    (void)K;
+  }
 
   __global__ static void run(const void *A_data, const void *B_data,
                              void *C_data, int M, int N, int K) {
@@ -387,7 +576,7 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     const int K_outer = ceil_div(K, WARPTILE_K);
 
 #if SKINNY_GEMM_ENABLE_COMPUTE
-    // Sparse trick overview (see fullpicture-sparse-trick.md):
+    // Sparse trick overview (see fullpicture-sparse.md):
     // 1) Load one 8x256 A tile per K block into LDS using the swizzle
     //    K0 K1 K4 K5 | K8 K9 K12 K13 | K2 K3 K6 K7 | K10 K11 K14 K15,
     //    split into 8x64 banks (two banks per 8x128 half-tile).
@@ -444,6 +633,7 @@ void test(const SkinnyGemmKernel &kernel) {
   std::printf("%s: A:%s, B:%s, C:%s, tile MxNxK=%dx%dx%d\n", kernel.name,
               str(kernel.A_type), str(kernel.B_type), str(kernel.C_type),
               kernel.M_tile, kernel.N_tile, kernel.K_tile);
+  std::fflush(stdout);
 
   if (!getenv("SKIP_CHECK") && kernel.supports_check) {
     check(kernel);
