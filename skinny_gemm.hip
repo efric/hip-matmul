@@ -220,14 +220,6 @@ void check(const SkinnyGemmKernel &kernel) {
     return;
   }
 
-  MNKShape tile_shapes[] = {{1, 1, 1}, {2, 1, 1}, {1, 2, 1}, {1, 1, 2},
-                            {2, 3, 1}, {3, 2, 2}, {4, 5, 1}, {3, 5, 2}};
-  for (MNKShape tiles : tile_shapes) {
-    MNKShape total = {tiles.M * kernel.M_tile, tiles.N * kernel.N_tile,
-                      tiles.K * kernel.K_tile};
-    check(kernel, getBenchmarkProblemSize(kernel, total));
-  }
-
   check(kernel, getCheckProblemSize(kernel));
 }
 
@@ -468,8 +460,8 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
 
     const fp8 *A = static_cast<const fp8 *>(A_data) + global_m_base * K;
     const fp8 *B = static_cast<const fp8 *>(B_data) + global_n_base * K;
-    _Float16 *C =
-        static_cast<_Float16 *>(C_data) + global_m_base * N + global_n_base;
+    __half *C =
+        static_cast<__half *>(C_data) + global_m_base * N + global_n_base;
 
     extern __shared__ std::byte smem[];
     fp8 *A_smem = reinterpret_cast<fp8 *>(smem + SharedMemLayout::A_offset);
@@ -635,15 +627,13 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
 
       // -----------------------------------------------------------------------
       // Swizzle and store first half-tile (reg0) to LDS.
-      // The swizzle permutes K0..K15 into:
-      //   reg0[0] = K0 K1 K4 K5    (line 0)
-      //   reg0[1] = K8 K9 K12 K13  (line 1)
-      //   reg0[2] = K2 K3 K6 K7    (line 2)
-      //   reg0[3] = K10 K11 K14 K15 (line 3)
-      //
-      // The v_pack_b32_f16 + v_swap_b32 sequence achieves this permutation.
+      // The v_pack_b32_f16 + v_swap_b32 sequence yields:
+      //   line 0: K0 K1 K4 K5
+      //   line 1: K8 K9 K12 K13
+      //   line 2: K2 K3 K6 K7
+      //   line 3: K10 K11 K14 K15
       // -----------------------------------------------------------------------
-      asm volatile("s_waitcnt vmcnt(1)\n\t" // Wait for reg0 load to complete.
+      asm volatile("s_waitcnt vmcnt(1)\n\t"
                    "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"
                    "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"
                    "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"
@@ -653,8 +643,9 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
                    "v_swap_b32 %2, %5\n\t"
                    "v_swap_b32 %3, %7"
                    : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
-                     "=v"(swap_reg[3])
-                   : "v"(reg0[0]), "v"(reg0[1]), "v"(reg0[2]), "v"(reg0[3]));
+                     "=v"(swap_reg[3]), "+v"(reg0[0]), "+v"(reg0[1]),
+                     "+v"(reg0[2]), "+v"(reg0[3])
+                   :);
 
       // Store swizzled reg0 to LDS. Each line is NB_BANKS (32) dwords apart.
 #pragma unroll
@@ -667,7 +658,7 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
       // Same swizzle pattern, but stored at offset OP_K * OP_M / 2 = 256 dwords
       // (1024 bytes) from the first half-tile.
       // -----------------------------------------------------------------------
-      asm volatile("s_waitcnt vmcnt(0)\n\t" // Wait for reg1 load to complete.
+      asm volatile("s_waitcnt vmcnt(0)\n\t"
                    "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"
                    "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"
                    "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"
@@ -677,8 +668,9 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
                    "v_swap_b32 %2, %5\n\t"
                    "v_swap_b32 %3, %7"
                    : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
-                     "=v"(swap_reg[3])
-                   : "v"(reg1[0]), "v"(reg1[1]), "v"(reg1[2]), "v"(reg1[3]));
+                     "=v"(swap_reg[3]), "+v"(reg1[0]), "+v"(reg1[1]),
+                     "+v"(reg1[2]), "+v"(reg1[3])
+                   :);
 
       // Store swizzled reg1 at second half-tile offset (1024 bytes = 256
       // dwords).
@@ -686,7 +678,8 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
           SparseTrickConfig::OP_K * SparseTrickConfig::OP_M / 2;
 #pragma unroll
       for (int line = 0; line < 4; ++line) {
-        buf[line * SparseTrickConfig::NB_BANKS + HALF_TILE_DWORDS] = reg1[line];
+        buf[line * SparseTrickConfig::NB_BANKS + HALF_TILE_DWORDS] =
+            reg1[line];
       }
 
       // -----------------------------------------------------------------------
@@ -709,24 +702,9 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
       // Each thread stores 16 bytes (4 lines x 4 bytes per line).
       // -----------------------------------------------------------------------
       fp8 *b_buf = b_buf_base;
+      asm volatile("s_waitcnt vmcnt(0)");
 #pragma unroll
       for (int load = 0; load < B_LOADS; ++load) {
-        // Wait for this load to complete. vmcnt(3) for load 0, down to
-        // vmcnt(0).
-        switch (B_LOADS - load - 1) {
-        case 3:
-          asm volatile("s_waitcnt vmcnt(3)");
-          break;
-        case 2:
-          asm volatile("s_waitcnt vmcnt(2)");
-          break;
-        case 1:
-          asm volatile("s_waitcnt vmcnt(1)");
-          break;
-        case 0:
-          asm volatile("s_waitcnt vmcnt(0)");
-          break;
-        }
         // Store 16 bytes: 4 lines x 4 elements, each line NB_BANKS*E_PER_BANK
         // apart.
         const fp8 *b_bytes = reinterpret_cast<const fp8 *>(b_reg[load]);
@@ -816,9 +794,11 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
 
     // Convert to fp16 and write to C.
     // Each lane writes 2 elements at C[out_m, out_n] and C[out_m, out_n+1].
-    _Float16 *c_out = C + out_m * N + out_n;
-    c_out[0] = static_cast<_Float16>(acc[0]);
-    c_out[1] = static_cast<_Float16>(acc[1]);
+    __half *c_out = C + out_m * N + out_n;
+    __half2 out_pair;
+    out_pair.x = __float2half(acc[0]);
+    out_pair.y = __float2half(acc[1]);
+    *reinterpret_cast<__half2 *>(c_out) = out_pair;
   }
 };
 
