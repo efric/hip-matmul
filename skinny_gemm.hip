@@ -10,9 +10,6 @@
 #include <random>
 #include <vector>
 
-#include <hip/hip_fp16.h>
-
-// Device function signature for a skinny GEMM (A[MxK] * B[NxK]) -> C[MxN].
 using skinny_gemm_func_t = void (*)(const void * /*A*/, const void * /*B*/,
                                     void * /*C*/, int /*M*/, int /*N*/,
                                     int /*K*/);
@@ -27,9 +24,6 @@ struct ProblemProperties {
 };
 
 using num_threads_func_t = int (*)(const ProblemProperties & /*problem*/);
-using shared_mem_bytes_func_t = size_t (*)(const ProblemProperties & /*problem*/);
-
-size_t no_shared_mem(const ProblemProperties &) { return 0; }
 
 void print(const ProblemProperties &problem, FILE *file = stderr) {
   fprintf(file, "A:%s, B:%s, C:%s, Total MxNxK=%dx%dx%d\n", str(problem.A_type),
@@ -38,16 +32,6 @@ void print(const ProblemProperties &problem, FILE *file = stderr) {
   fprintf(file, "\tOuter MxNxK=%dx%dx%d, Tile MxNxK=%dx%dx%d\n",
           problem.outer.M, problem.outer.N, problem.outer.K, problem.tile.M,
           problem.tile.N, problem.tile.K);
-}
-
-void validateProblemShape(const ProblemProperties &problem) {
-  if (problem.total.M % problem.tile.M != 0 ||
-      problem.total.N % problem.tile.N != 0 ||
-      problem.total.K % problem.tile.K != 0) {
-    fprintf(stderr, "skinny_gemm only supports full tiles.\n");
-    print(problem, stderr);
-    abort();
-  }
 }
 
 int flat_a_size(const ProblemProperties &problem) {
@@ -72,17 +56,14 @@ struct SkinnyGemmKernel {
   int K_tile;       // K-dimension tile size (reduction dimension).
   num_threads_func_t num_threads_func; // Number of threads that the kernel
                                        // requires running on.
-  shared_mem_bytes_func_t
-      shared_mem_bytes_func;    // Amount of shared memory per workgroup.
   skinny_gemm_func_t gemm_func; // Device kernel pointer.
-  bool supports_check;          // Whether to run correctness checks.
 };
 
 void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
                               const ProblemProperties &problem,
                               const dim3 &grid_dim, const dim3 &block_dim,
-                              size_t shared_mem_bytes, size_t alloc_a_bytes,
-                              size_t alloc_b_bytes, size_t alloc_c_bytes);
+                              size_t alloc_a_bytes, size_t alloc_b_bytes,
+                              size_t alloc_c_bytes);
 
 ProblemProperties getBenchmarkProblemSize(const SkinnyGemmKernel &kernel,
                                           MNKShape total) {
@@ -96,7 +77,6 @@ ProblemProperties getBenchmarkProblemSize(const SkinnyGemmKernel &kernel,
   problem_size.outer.M = ceil_div(total.M, kernel.M_tile);
   problem_size.outer.N = ceil_div(total.N, kernel.N_tile);
   problem_size.outer.K = ceil_div(total.K, kernel.K_tile);
-  validateProblemShape(problem_size);
   return problem_size;
 }
 
@@ -126,7 +106,7 @@ void checkSkinnyGemmResults(const void *A_data_void, const void *B_data_void,
         for (int n_tile = 0; n_tile < problem.tile.N; ++n_tile) {
           int global_m = m_outer * problem.tile.M + m_tile;
           int global_n = n_outer * problem.tile.N + n_tile;
-          float c = 0.f;
+          TC c = {0};
           for (int k_outer = 0; k_outer < problem.outer.K; ++k_outer) {
             for (int k_tile = 0; k_tile < problem.tile.K; ++k_tile) {
               int global_k = k_outer * problem.tile.K + k_tile;
@@ -135,14 +115,14 @@ void checkSkinnyGemmResults(const void *A_data_void, const void *B_data_void,
               c += to_float<A_type>(a) * to_float<B_type>(b);
             }
           }
-          TC expected = static_cast<TC>(c);
+          TC expected = c;
           TC actual = C_data[global_m * problem.total.N + global_n];
           if (actual != expected) {
             fprintf(stderr,
                     "skinny_gemm numerical error: actual(%g) != "
                     "expected(%g), at m_outer=%d n_outer=%d m_tile=%d "
                     "n_tile=%d, at %s:%d. Note: outer MxNxK = %dx%dx%d\n",
-                    static_cast<float>(actual), static_cast<float>(expected),
+                    to_float<C_type>(actual), to_float<C_type>(expected),
                     m_outer, n_outer, m_tile, n_tile, __FILE__, __LINE__,
                     problem.outer.M, problem.outer.N, problem.outer.K);
             abort();
@@ -198,13 +178,12 @@ void check(const SkinnyGemmKernel &kernel, const ProblemProperties &problem) {
 
   const dim3 grid_dim(problem.outer.M, problem.outer.N);
   const dim3 block_dim(kernel.num_threads_func(problem));
-  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
   printSparseTrickScaffold(kernel, problem, grid_dim, block_dim,
-                           shared_mem_bytes, A_host_data.size(),
-                           B_host_data.size(), C_host_data.size());
+                           A_host_data.size(), B_host_data.size(),
+                           C_host_data.size());
 
   HIP_CHECK(hipGetLastError());
-  kernel.gemm_func<<<grid_dim, block_dim, shared_mem_bytes, hipStreamDefault>>>(
+  kernel.gemm_func<<<grid_dim, block_dim>>>(
       A_device_buffer, B_device_buffer, C_device_buffer, problem.total.M,
       problem.total.N, problem.total.K);
   HIP_CHECK(hipGetLastError());
@@ -252,10 +231,9 @@ void benchmark(const SkinnyGemmKernel &kernel, MNKShape total) {
 
   const dim3 grid_dim(problem.outer.M, problem.outer.N);
   const dim3 block_dim(kernel.num_threads_func(problem));
-  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
   printSparseTrickScaffold(kernel, problem, grid_dim, block_dim,
-                           shared_mem_bytes, A_host_data.size(),
-                           B_host_data.size(), C_host_data.size());
+                           A_host_data.size(), B_host_data.size(),
+                           C_host_data.size());
 
   hipEvent_t start, stop;
   HIP_CHECK(hipEventCreate(&start));
@@ -267,10 +245,9 @@ void benchmark(const SkinnyGemmKernel &kernel, MNKShape total) {
   while (true) {
     HIP_CHECK(hipEventRecord(start, hipStreamDefault));
     for (int b = 0; b < iterations; ++b) {
-      kernel.gemm_func<<<grid_dim, block_dim, shared_mem_bytes,
-                         hipStreamDefault>>>(A_device_buffer, B_device_buffer,
-                                             C_device_buffer, problem.total.M,
-                                             problem.total.N, problem.total.K);
+      kernel.gemm_func<<<grid_dim, block_dim >>>(
+          A_device_buffer, B_device_buffer, C_device_buffer, problem.total.M,
+          problem.total.N, problem.total.K);
     }
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipEventRecord(stop, hipStreamDefault));
@@ -333,20 +310,11 @@ struct SparseTrickConfig {
   static constexpr int SPARSITY_ODD = 0x0000EEEE;
 };
 
-struct SharedMemLayout {
-  static constexpr int kAlign = 16;
-  static constexpr int A_offset = 0;
-  static constexpr int A_bytes = SparseTrickConfig::A_TILE_BYTES;
-  static constexpr int B_offset = round_up_to_po2<kAlign>(A_bytes);
-  static constexpr int B_bytes = SparseTrickConfig::B_TILE_BYTES;
-  static constexpr int total_bytes = B_offset + B_bytes;
-};
-
 void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
                               const ProblemProperties &problem,
                               const dim3 &grid_dim, const dim3 &block_dim,
-                              size_t shared_mem_bytes, size_t alloc_a_bytes,
-                              size_t alloc_b_bytes, size_t alloc_c_bytes) {
+                              size_t alloc_a_bytes, size_t alloc_b_bytes,
+                              size_t alloc_c_bytes) {
   // Local constants for printing only (not required for computation).
   constexpr int A_LANES = 1;
   constexpr int B_LANES = 1;
@@ -391,12 +359,11 @@ void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
   fprintf(stderr, "\tB tile: %dx%d bytes=%d (per-op=%d, panel=%d)\n",
           SparseTrickConfig::OP_N, SparseTrickConfig::WARPTILE_K,
           SparseTrickConfig::B_TILE_BYTES, B_OP_BYTES, B_PANEL_BYTES);
-  fprintf(stderr,
-          "\tShared mem: align=%d A_off=%d A_bytes=%d B_off=%d B_bytes=%d "
-          "total=%d\n",
-          SharedMemLayout::kAlign, SharedMemLayout::A_offset,
-          SharedMemLayout::A_bytes, SharedMemLayout::B_offset,
-          SharedMemLayout::B_bytes, SharedMemLayout::total_bytes);
+  const int shared_total_bytes =
+      SparseTrickConfig::A_TILE_BYTES + SparseTrickConfig::B_TILE_BYTES;
+  fprintf(stderr, "\tShared mem (static): A_bytes=%d B_bytes=%d total=%d\n",
+          SparseTrickConfig::A_TILE_BYTES, SparseTrickConfig::B_TILE_BYTES,
+          shared_total_bytes);
   fprintf(stderr,
           "\tBuffers (logical bytes): A=%zu B=%zu C=%zu (elements A=%zu "
           "B=%zu C=%zu)\n",
@@ -404,12 +371,12 @@ void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
   fprintf(stderr, "\tBuffers (allocated bytes): A=%zu B=%zu C=%zu\n",
           alloc_a_bytes, alloc_b_bytes, alloc_c_bytes);
   fprintf(stderr,
-          "\tLaunch: grid=(%u,%u,%u) block=(%u,%u,%u) threads=%u shared=%zu\n",
+          "\tLaunch: grid=(%u,%u,%u) block=(%u,%u,%u) threads=%u\n",
           static_cast<unsigned>(grid_dim.x), static_cast<unsigned>(grid_dim.y),
           static_cast<unsigned>(grid_dim.z), static_cast<unsigned>(block_dim.x),
           static_cast<unsigned>(block_dim.y),
           static_cast<unsigned>(block_dim.z),
-          static_cast<unsigned>(block_dim.x), shared_mem_bytes);
+          static_cast<unsigned>(block_dim.x));
   fprintf(stderr, "\tK blocks: %d (K=%d / %d)\n", k_blocks, problem.total.K,
           SparseTrickConfig::WARPTILE_K);
   fprintf(stderr, "\tAlignment: M%%OP_M=%d N%%OP_N=%d K%%WARPTILE_K=%d\n",
@@ -430,11 +397,7 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     num_threads_func = [](const ProblemProperties &) {
       return SparseTrickConfig::WARP_SIZE;
     };
-    shared_mem_bytes_func = [](const ProblemProperties &) {
-      return static_cast<size_t>(SharedMemLayout::total_bytes);
-    };
     gemm_func = run;
-    supports_check = true;
   }
 
   __global__ static void run(const void *A_data, const void *B_data,
@@ -463,9 +426,8 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     __half *C =
         static_cast<__half *>(C_data) + global_m_base * N + global_n_base;
 
-    extern __shared__ fp8 shared_mem[];
-    fp8 *A_smem = shared_mem + SharedMemLayout::A_offset;
-    fp8 *B_smem = shared_mem + SharedMemLayout::B_offset;
+    __shared__ fp8 A_smem[SparseTrickConfig::A_TILE_BYTES];
+    __shared__ fp8 B_smem[SparseTrickConfig::B_TILE_BYTES];
 
     const int K_outer = ceil_div(K, WARPTILE_K);
 
@@ -807,11 +769,8 @@ void test(const SkinnyGemmKernel &kernel) {
               str(kernel.A_type), str(kernel.B_type), str(kernel.C_type),
               kernel.M_tile, kernel.N_tile, kernel.K_tile);
 
-  if (!getenv("SKIP_CHECK") && kernel.supports_check) {
+  if (!getenv("SKIP_CHECK")) {
     check(kernel);
-  } else if (!kernel.supports_check) {
-    std::fprintf(stderr, "Skipping check for %s (supports_check=false)\n",
-                 kernel.name);
   }
 
   MNKShape test_shapes[] = {{8, 13312, 16384}};
