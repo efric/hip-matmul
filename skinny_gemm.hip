@@ -120,16 +120,16 @@ void checkSkinnyGemmResults(const void *A_data_void, const void *B_data_void,
         for (int n_tile = 0; n_tile < problem.tile.N; ++n_tile) {
           int global_m = m_outer * problem.tile.M + m_tile;
           int global_n = n_outer * problem.tile.N + n_tile;
-          TC c = {0};
+          float c = 0.f;
           for (int k_outer = 0; k_outer < problem.outer.K; ++k_outer) {
             for (int k_tile = 0; k_tile < problem.tile.K; ++k_tile) {
               int global_k = k_outer * problem.tile.K + k_tile;
               TA a = A_data[global_m * problem.total.K + global_k];
               TB b = B_data[global_n * problem.total.K + global_k];
-              c += static_cast<TC>(a) * static_cast<TC>(b);
+              c += to_float<A_type>(a) * to_float<B_type>(b);
             }
           }
-          TC expected = c;
+          TC expected = static_cast<TC>(c);
           TC actual = C_data[global_m * problem.total.N + global_n];
           if (actual != expected) {
             fprintf(stderr,
@@ -151,21 +151,13 @@ void checkSkinnyGemmResults(Type A_type, Type B_type, Type C_type,
                             const void *A_data_void, const void *B_data_void,
                             const void *C_data_void,
                             const ProblemProperties &problem) {
-  if (A_type == Type::FP8 || B_type == Type::FP8) {
-    fprintf(
-        stderr,
-        "Skipping FP8 correctness check (host conversion not wired up yet)\n");
-    return;
-  }
 #define HANDLE_CASE(A, B, C)                                                   \
   if (A_type == Type::A && B_type == Type::B && C_type == Type::C) {           \
     checkSkinnyGemmResults<Type::A, Type::B, Type::C>(                         \
         A_data_void, B_data_void, C_data_void, problem);                       \
     return;                                                                    \
   }
-  HANDLE_CASE(FP32, FP32, FP32)
-  HANDLE_CASE(FP16, FP16, FP32)
-  HANDLE_CASE(SI8, SI8, SI32)
+  HANDLE_CASE(FP8, FP8, FP16)
 #undef HANDLE_CASE
 
   fprintf(stderr, "%s:%d: unhandled types\n", __FILE__, __LINE__);
@@ -222,6 +214,20 @@ void check(const SkinnyGemmKernel &kernel, const ProblemProperties &problem) {
 }
 
 void check(const SkinnyGemmKernel &kernel) {
+  const bool has_env_override = getenv("M") || getenv("N") || getenv("K");
+  if (has_env_override) {
+    check(kernel, getCheckProblemSize(kernel));
+    return;
+  }
+
+  MNKShape tile_shapes[] = {{1, 1, 1}, {2, 1, 1}, {1, 2, 1}, {1, 1, 2},
+                            {2, 3, 1}, {3, 2, 2}, {4, 5, 1}, {3, 5, 2}};
+  for (MNKShape tiles : tile_shapes) {
+    MNKShape total = {tiles.M * kernel.M_tile, tiles.N * kernel.N_tile,
+                      tiles.K * kernel.K_tile};
+    check(kernel, getBenchmarkProblemSize(kernel, total));
+  }
+
   check(kernel, getCheckProblemSize(kernel));
 }
 
@@ -436,7 +442,7 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
       return static_cast<size_t>(SharedMemLayout::total_bytes);
     };
     gemm_func = run;
-    supports_check = false;
+    supports_check = true;
   }
 
   __global__ static void run(const void *A_data, const void *B_data,
@@ -482,8 +488,6 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     //    (even lanes: 0x00004444, odd lanes: 0x0000EEEE).
     // 4) Fuse D regs (D0+D1, D2+D3), shuffle lane pairs to map rows, convert
     //    to fp16, and write to C.
-    //
-    // TODO: implement the LDS producers/consumers without warp specialization.
     f32x4 acc = {0.f, 0.f, 0.f, 0.f};
     const int sparsity_indices = (lane & 1) ? SparseTrickConfig::SPARSITY_ODD
                                             : SparseTrickConfig::SPARSITY_EVEN;
@@ -527,7 +531,6 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     //     N=15:      L60   L61   L62   L63
     // =========================================================================
     constexpr int B_THREADS_PER_LD = 4;  // 4 threads cover 64 K elements.
-    constexpr int B_THREADS_PER_AD = 16; // 16 threads for 16 N columns.
     constexpr int B_LOADS = OPS;         // 4 loads for 4 sub-tiles.
     constexpr int NB_BANKS = SparseTrickConfig::NB_BANKS;
 

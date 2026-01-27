@@ -10,7 +10,9 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp8.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -91,6 +93,31 @@ template <> struct CTypeImpl<Type::FP32> {
 };
 template <Type t> using CType = typename CTypeImpl<t>::type;
 
+inline float fp16_bits_to_float(uint16_t bits) {
+  _Float16 h;
+  std::memcpy(&h, &bits, sizeof(bits));
+  return static_cast<float>(h);
+}
+
+inline __hip_fp8_storage_t fp8_from_float(float value) {
+  return __hip_cvt_float_to_fp8(value, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
+}
+
+inline float fp8_to_float(__hip_fp8_storage_t value) {
+  auto h = __hip_cvt_fp8_to_halfraw(value, __HIP_E4M3_FNUZ);
+  uint16_t bits = 0;
+  std::memcpy(&bits, &h, sizeof(bits));
+  return fp16_bits_to_float(bits);
+}
+
+template <Type t> inline float to_float(CType<t> value) {
+  return static_cast<float>(value);
+}
+
+template <> inline float to_float<Type::FP8>(CType<Type::FP8> value) {
+  return fp8_to_float(value);
+}
+
 template <typename A, typename B>
 __device__ __host__ std::common_type_t<A, B> ceil_div(A a, B b) {
   return (a + b - 1) / b;
@@ -110,8 +137,19 @@ void fillRandomBuffer(int size, std::minstd_rand &r, void *out_buffer) {
     // Generate small integers in [-2, +2] so products are in [-4, +4] so
     // accumulators are in [-4K, +4K] for accumulation depth K so they're
     // exactly representable, float rounding is exact and we don't need
-    // fuzzy compares.
-    out_buffer_typed[i] = static_cast<T>(static_cast<int>((r() % 5)) - 2);
+    // fuzzy compares. For FP8 inputs, use [-1, +1] to keep FP16 outputs
+    // away from overflow at large K.
+    float value = 0.f;
+    if constexpr (type == Type::FP8) {
+      value = static_cast<float>(static_cast<int>((r() % 3)) - 1);
+    } else {
+      value = static_cast<float>(static_cast<int>((r() % 5)) - 2);
+    }
+    if constexpr (type == Type::FP8) {
+      out_buffer_typed[i] = fp8_from_float(value);
+    } else {
+      out_buffer_typed[i] = static_cast<T>(value);
+    }
   }
 }
 
