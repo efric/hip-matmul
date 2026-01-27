@@ -6,15 +6,11 @@
 
 #include "common.hip"
 
-#include <cassert>
 #include <cstdio>
-#include <cstring>
 #include <random>
-#include <type_traits>
 #include <vector>
 
 #include <hip/hip_fp16.h>
-#include <hip/hip_fp8.h>
 
 // Device function signature for a skinny GEMM (A[MxK] * B[NxK]) -> C[MxN].
 using skinny_gemm_func_t = void (*)(const void * /*A*/, const void * /*B*/,
@@ -31,8 +27,7 @@ struct ProblemProperties {
 };
 
 using num_threads_func_t = int (*)(const ProblemProperties & /*problem*/);
-using shared_mem_bytes_func_t =
-    size_t (*)(const ProblemProperties & /*problem*/);
+using shared_mem_bytes_func_t = size_t (*)(const ProblemProperties & /*problem*/);
 
 size_t no_shared_mem(const ProblemProperties &) { return 0; }
 
@@ -43,6 +38,16 @@ void print(const ProblemProperties &problem, FILE *file = stderr) {
   fprintf(file, "\tOuter MxNxK=%dx%dx%d, Tile MxNxK=%dx%dx%d\n",
           problem.outer.M, problem.outer.N, problem.outer.K, problem.tile.M,
           problem.tile.N, problem.tile.K);
+}
+
+void validateProblemShape(const ProblemProperties &problem) {
+  if (problem.total.M % problem.tile.M != 0 ||
+      problem.total.N % problem.tile.N != 0 ||
+      problem.total.K % problem.tile.K != 0) {
+    fprintf(stderr, "skinny_gemm only supports full tiles.\n");
+    print(problem, stderr);
+    abort();
+  }
 }
 
 int flat_a_size(const ProblemProperties &problem) {
@@ -91,13 +96,14 @@ ProblemProperties getBenchmarkProblemSize(const SkinnyGemmKernel &kernel,
   problem_size.outer.M = ceil_div(total.M, kernel.M_tile);
   problem_size.outer.N = ceil_div(total.N, kernel.N_tile);
   problem_size.outer.K = ceil_div(total.K, kernel.K_tile);
+  validateProblemShape(problem_size);
   return problem_size;
 }
 
 ProblemProperties getCheckProblemSize(const SkinnyGemmKernel &kernel) {
   int M = getIntEnvVar("M", 8);
-  int N = getIntEnvVar("N", 13312);
-  int K = getIntEnvVar("K", 16384);
+  int N = getIntEnvVar("N", 32);
+  int K = getIntEnvVar("K", 512);
   MNKShape total = {M, N, K};
   return getBenchmarkProblemSize(kernel, total);
 }
@@ -214,12 +220,6 @@ void check(const SkinnyGemmKernel &kernel, const ProblemProperties &problem) {
 }
 
 void check(const SkinnyGemmKernel &kernel) {
-  const bool has_env_override = getenv("M") || getenv("N") || getenv("K");
-  if (has_env_override) {
-    check(kernel, getCheckProblemSize(kernel));
-    return;
-  }
-
   check(kernel, getCheckProblemSize(kernel));
 }
 
@@ -463,9 +463,9 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     __half *C =
         static_cast<__half *>(C_data) + global_m_base * N + global_n_base;
 
-    extern __shared__ std::byte smem[];
-    fp8 *A_smem = reinterpret_cast<fp8 *>(smem + SharedMemLayout::A_offset);
-    fp8 *B_smem = reinterpret_cast<fp8 *>(smem + SharedMemLayout::B_offset);
+    extern __shared__ fp8 shared_mem[];
+    fp8 *A_smem = shared_mem + SharedMemLayout::A_offset;
+    fp8 *B_smem = shared_mem + SharedMemLayout::B_offset;
 
     const int K_outer = ceil_div(K, WARPTILE_K);
 
@@ -642,10 +642,8 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
                    "v_swap_b32 %1, %6\n\t"
                    "v_swap_b32 %2, %5\n\t"
                    "v_swap_b32 %3, %7"
-                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
-                     "=v"(swap_reg[3]), "+v"(reg0[0]), "+v"(reg0[1]),
-                     "+v"(reg0[2]), "+v"(reg0[3])
-                   :);
+                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]), "=v"(swap_reg[3])
+                   : "v"(reg0[0]), "v"(reg0[1]), "v"(reg0[2]), "v"(reg0[3]));
 
       // Store swizzled reg0 to LDS. Each line is NB_BANKS (32) dwords apart.
 #pragma unroll
@@ -667,10 +665,8 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
                    "v_swap_b32 %1, %6\n\t"
                    "v_swap_b32 %2, %5\n\t"
                    "v_swap_b32 %3, %7"
-                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
-                     "=v"(swap_reg[3]), "+v"(reg1[0]), "+v"(reg1[1]),
-                     "+v"(reg1[2]), "+v"(reg1[3])
-                   :);
+                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]), "=v"(swap_reg[3])
+                   : "v"(reg1[0]), "v"(reg1[1]), "v"(reg1[2]), "v"(reg1[3]));
 
       // Store swizzled reg1 at second half-tile offset (1024 bytes = 256
       // dwords).
