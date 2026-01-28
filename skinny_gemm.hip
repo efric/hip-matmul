@@ -649,7 +649,6 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
                 b_bytes[E_PER_BANK * line + elem];
           }
         }
-        // Advance to next sub-tile: 64 threads x 16 bytes = 1024 bytes.
         b_buf += SparseTrickConfig::WARP_SIZE * E_PER_THREAD;
       }
 
@@ -692,8 +691,8 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
 #pragma unroll
       for (int op = 0; op < OPS; ++op) {
         acc = __builtin_amdgcn_smfmac_f32_16x16x64_fp8_fp8(
-            *reinterpret_cast<fp8_4x2 *>(&a_cons[op]),
-            *reinterpret_cast<fp8_4x4 *>(&b_cons[op]), acc, sparsity_indices,
+            reinterpret_cast<fp8_4x2 >(a_cons[op]),
+            reinterpret_cast<fp8_4x4 >(b_cons[op]), acc, sparsity_indices,
             7, // cbsz
             1  // abid
         );
