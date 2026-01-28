@@ -295,20 +295,10 @@ using fp8_4x2 = __attribute__((__vector_size__(2 * sizeof(int)))) int;
 using fp8_4x4 = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 using f32x4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 
-struct SparseTrickConfig {
-  static constexpr int WARP_SIZE = 64;
-  static constexpr int NB_BANKS = 32;
-  static constexpr int E_PER_BANK = 4;
-  static constexpr int OP_M = 8;
-  static constexpr int OP_N = 16;
-  static constexpr int OP_K = 64;
-  static constexpr int OPS = 4;
-  static constexpr int WARPTILE_K = OP_K * OPS;          // 256
-  static constexpr int A_TILE_BYTES = OP_M * WARPTILE_K; // 2048
-  static constexpr int B_TILE_BYTES = OP_N * WARPTILE_K; // 4096
-  static constexpr int SPARSITY_EVEN = 0x00004444;
-  static constexpr int SPARSITY_ODD = 0x0000EEEE;
-};
+constexpr int WARP_SIZE = 64;
+constexpr int NB_BANKS = 32;
+constexpr int SPARSITY_EVEN = 0x00004444;
+constexpr int SPARSITY_ODD = 0x0000EEEE;
 
 void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
                               const ProblemProperties &problem,
@@ -318,13 +308,20 @@ void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
   // Local constants for printing only (not required for computation).
   constexpr int A_LANES = 1;
   constexpr int B_LANES = 1;
-  constexpr int WARPTILE_M = SparseTrickConfig::OP_M * A_LANES;
-  constexpr int WARPTILE_N = SparseTrickConfig::OP_N * B_LANES;
-  constexpr int A_OP_BYTES = SparseTrickConfig::OP_M * SparseTrickConfig::OP_K;
-  constexpr int B_OP_BYTES = SparseTrickConfig::OP_N * SparseTrickConfig::OP_K;
-  constexpr int A_BANK_BYTES = A_OP_BYTES;
-  constexpr int A_HALF_TILE_BYTES = A_BANK_BYTES * 2;
-  constexpr int B_PANEL_BYTES = B_OP_BYTES / 2;
+  const int op_m = kernel.M_tile;
+  const int op_n = kernel.N_tile;
+  const int op_k = 512 / op_m;
+  const int ops = kernel.K_tile / op_k;
+  const int warptile_k = kernel.K_tile;
+  const int warptile_m = op_m * A_LANES;
+  const int warptile_n = op_n * B_LANES;
+  const int a_op_bytes = op_m * op_k;
+  const int b_op_bytes = op_n * op_k;
+  const int a_bank_bytes = a_op_bytes;
+  const int a_half_tile_bytes = a_bank_bytes * 2;
+  const int b_panel_bytes = b_op_bytes / 2;
+  const int a_tile_bytes = op_m * warptile_k;
+  const int b_tile_bytes = op_n * warptile_k;
 
   const size_t A_elements =
       static_cast<size_t>(problem.total.M) * problem.total.K;
@@ -338,32 +335,25 @@ void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
       B_elements * static_cast<size_t>(type_size(kernel.B_type));
   const size_t C_bytes =
       C_elements * static_cast<size_t>(type_size(kernel.C_type));
-  const int k_blocks = ceil_div(problem.total.K, SparseTrickConfig::WARPTILE_K);
+  const int k_blocks = ceil_div(problem.total.K, warptile_k);
 
   fprintf(stderr, "Skinny GEMM scaffold sizes:\n");
   print(problem, stderr);
   fprintf(stderr,
           "\tSparse trick: OP_M=%d OP_N=%d OP_K=%d OPS=%d (WARPTILE_K=%d)\n",
-          SparseTrickConfig::OP_M, SparseTrickConfig::OP_N,
-          SparseTrickConfig::OP_K, SparseTrickConfig::OPS,
-          SparseTrickConfig::WARPTILE_K);
+          op_m, op_n, op_k, ops, warptile_k);
   fprintf(stderr,
           "\tWarp tile: M=%d N=%d K=%d (A_LANES=%d, B_LANES=%d, warp=%d)\n",
-          WARPTILE_M, WARPTILE_N, SparseTrickConfig::WARPTILE_K, A_LANES,
-          B_LANES, SparseTrickConfig::WARP_SIZE);
-  fprintf(
-      stderr, "\tA tile: %dx%d bytes=%d (per-op=%d, half-tile=%d, bank=%d)\n",
-      SparseTrickConfig::OP_M, SparseTrickConfig::WARPTILE_K,
-      SparseTrickConfig::A_TILE_BYTES, A_OP_BYTES, A_HALF_TILE_BYTES,
-      A_BANK_BYTES);
-  fprintf(stderr, "\tB tile: %dx%d bytes=%d (per-op=%d, panel=%d)\n",
-          SparseTrickConfig::OP_N, SparseTrickConfig::WARPTILE_K,
-          SparseTrickConfig::B_TILE_BYTES, B_OP_BYTES, B_PANEL_BYTES);
-  const int shared_total_bytes =
-      SparseTrickConfig::A_TILE_BYTES + SparseTrickConfig::B_TILE_BYTES;
+          warptile_m, warptile_n, warptile_k, A_LANES, B_LANES, WARP_SIZE);
+  fprintf(stderr,
+          "\tA tile: %dx%d bytes=%d (per-op=%d, half-tile=%d, bank=%d)\n",
+          op_m, warptile_k, a_tile_bytes, a_op_bytes, a_half_tile_bytes,
+          a_bank_bytes);
+  fprintf(stderr, "\tB tile: %dx%d bytes=%d (per-op=%d, panel=%d)\n", op_n,
+          warptile_k, b_tile_bytes, b_op_bytes, b_panel_bytes);
+  const int shared_total_bytes = a_tile_bytes + b_tile_bytes;
   fprintf(stderr, "\tShared mem (static): A_bytes=%d B_bytes=%d total=%d\n",
-          SparseTrickConfig::A_TILE_BYTES, SparseTrickConfig::B_TILE_BYTES,
-          shared_total_bytes);
+          a_tile_bytes, b_tile_bytes, shared_total_bytes);
   fprintf(stderr,
           "\tBuffers (logical bytes): A=%zu B=%zu C=%zu (elements A=%zu "
           "B=%zu C=%zu)\n",
@@ -378,35 +368,36 @@ void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
           static_cast<unsigned>(block_dim.z),
           static_cast<unsigned>(block_dim.x));
   fprintf(stderr, "\tK blocks: %d (K=%d / %d)\n", k_blocks, problem.total.K,
-          SparseTrickConfig::WARPTILE_K);
+          warptile_k);
   fprintf(stderr, "\tAlignment: M%%OP_M=%d N%%OP_N=%d K%%WARPTILE_K=%d\n",
-          problem.total.M % SparseTrickConfig::OP_M,
-          problem.total.N % SparseTrickConfig::OP_N,
-          problem.total.K % SparseTrickConfig::WARPTILE_K);
+          problem.total.M % op_m, problem.total.N % op_n,
+          problem.total.K % warptile_k);
 }
 
-struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
-  SparseTrickOpM8Kernel() {
+template <int OP_M, int OP_N, int OPS>
+struct SparseTrickKernel : SkinnyGemmKernel {
+  SparseTrickKernel() {
     name = __FUNCTION__;
     A_type = Type::FP8;
     B_type = Type::FP8;
     C_type = Type::FP16;
-    M_tile = SparseTrickConfig::OP_M;
-    N_tile = SparseTrickConfig::OP_N;
-    K_tile = SparseTrickConfig::WARPTILE_K;
+    constexpr int OP_K = 512 / OP_M;
+    constexpr int WARPTILE_K = OP_K * OPS;
+    M_tile = OP_M;
+    N_tile = OP_N;
+    K_tile = WARPTILE_K;
     num_threads_func = [](const ProblemProperties &) {
-      return SparseTrickConfig::WARP_SIZE;
+      return WARP_SIZE;
     };
     gemm_func = run;
   }
 
   __global__ static void run(const void *A_data, const void *B_data,
                              void *C_data, int M, int N, int K) {
-    constexpr int OP_M = SparseTrickConfig::OP_M;
-    constexpr int OP_N = SparseTrickConfig::OP_N;
-    constexpr int OP_K = SparseTrickConfig::OP_K;
-    constexpr int OPS = SparseTrickConfig::OPS;
-    constexpr int WARPTILE_K = SparseTrickConfig::WARPTILE_K;
+    constexpr int OP_K = 512 / OP_M;
+    constexpr int WARPTILE_K = OP_K * OPS;
+    constexpr int A_TILE_BYTES = OP_M * WARPTILE_K;
+    constexpr int B_TILE_BYTES = OP_N * WARPTILE_K;
 
     const int lane_id = threadIdx.x & (warpSize - 1);
     const int m_outer = blockIdx.x;
@@ -426,8 +417,8 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     __half *C =
         static_cast<__half *>(C_data) + global_m_base * N + global_n_base;
 
-    __shared__ fp8 A_shared[SparseTrickConfig::A_TILE_BYTES];
-    __shared__ fp8 B_shared[SparseTrickConfig::B_TILE_BYTES];
+    __shared__ fp8 A_shared[A_TILE_BYTES];
+    __shared__ fp8 B_shared[B_TILE_BYTES];
 
     const int K_outer = ceil_div(K, WARPTILE_K);
 
@@ -443,8 +434,7 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     // 4) Fuse D regs (D0+D1, D2+D3), shuffle lane pairs to map rows, convert
     //    to fp16, and write to C.
     f32x4 acc = {0.f, 0.f, 0.f, 0.f};
-    const int sparsity_indices = (lane_id & 1) ? SparseTrickConfig::SPARSITY_ODD
-                                            : SparseTrickConfig::SPARSITY_EVEN;
+    const int sparsity_indices = (lane_id & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
 
     // =========================================================================
     // Loading A tile:
@@ -480,7 +470,6 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     //     N=15:      L60   L61   L62   L63
     // =========================================================================
     constexpr int B_THREADS_PER_LD = OP_K / E_PER_THREAD; // 4 threads per row.
-    constexpr int NB_BANKS = 32;
 
     // Thread position for B loading.
     const int b_curr_ld =
@@ -601,8 +590,7 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
                    : "v"(reg1[0]), "v"(reg1[1]), "v"(reg1[2]), "v"(reg1[3]));
 
       // Store swizzled reg1 to second 512 byte sub-bank.
-      constexpr int HALF_TILE_DWORDS =
-          SparseTrickConfig::OP_K * SparseTrickConfig::OP_M / 2;
+      constexpr int HALF_TILE_DWORDS = OP_K * OP_M / 2;
 #pragma unroll
       for (int line = 0; line < 4; ++line) {
         A_buffer[line * NB_BANKS + HALF_TILE_DWORDS] =
@@ -634,7 +622,7 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
                 b_bytes[E_PER_BANK * slice + elem];
           }
         }
-        b_buf += SparseTrickConfig::WARP_SIZE * E_PER_THREAD;
+        b_buf += WARP_SIZE * E_PER_THREAD;
       }
 
       __syncthreads();
@@ -705,6 +693,8 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
   }
 };
 
+using SparseTrickOP4Kernel = SparseTrickKernel<8, 16, 4>;
+
 void test(const SkinnyGemmKernel &kernel) {
   const char *filter = getenv("FILTER");
   if (filter && !strstr(kernel.name, filter)) {
@@ -725,6 +715,6 @@ void test(const SkinnyGemmKernel &kernel) {
 }
 
 int main() {
-  test(SparseTrickOpM8Kernel{});
+  test(SparseTrickOP4Kernel{});
   return 0;
 }
