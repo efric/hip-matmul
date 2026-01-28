@@ -431,12 +431,12 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
 
     const int K_outer = ceil_div(K, WARPTILE_K);
 
-    // Sparse trick overview (see fullpicture-sparse-trick.md):
+    // Sparse trick overview:
     // 1) Load one 8x256 A tile per K block into LDS using the swizzle
     //    K0 K1 K4 K5 | K8 K9 K12 K13 | K2 K3 K6 K7 | K10 K11 K14 K15,
     //    split into 8x64 banks (two banks per 8x128 half-tile).
-    // 2) Load one 16x256 B tile per K block into LDS using two 4x32 panels
-    //    per 16x64 sub-tile, stacked for OPS=4.
+    // 2) Load one 16x256 B tile per K block into LDS using two 4x32 sub-slices
+    //    per 16x64 slice, stacked for OPS=4.
     // 3) For op=0..3, load A/B registers from LDS and call
     //    __builtin_amdgcn_smfmac_f32_16x16x64_fp8_fp8 with sparse indices
     //    (even lanes: 0x00004444, odd lanes: 0x0000EEEE).
@@ -447,9 +447,8 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
                                             : SparseTrickConfig::SPARSITY_EVEN;
 
     // =========================================================================
-    // A tile producer: mirrors produce_4_half_tiles.
-    // =========================================================================
-    // Thread layout for loading one 8x128 half-tile (see fullpicture doc):
+    // Loading A tile:
+    // Thread layout for loading one 8x128 half-tile:
     //   K        0   16   32   48   64   80   96  112
     //   row 0:  t0   t1   t2   t3   t4   t5   t6   t7
     //   row 1:  t8   t9   t10  t11  t12  t13  t14  t15
@@ -472,7 +471,7 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     const int curr_ad = lane_id / THREADS_PER_LD;
 
     // =========================================================================
-    // B tile producer constants (mirrors n_full_tiles.cu for OP_K=64, OP_N=16).
+    // B tile producer constants (OP_K=64, OP_N=16).
     //   Thread layout (K chunk -> 0, 16, 32, 48; N -> 0..15):
     //     K chunk:    0     16    32    48
     //     N=0:       L0    L1    L2    L3
@@ -492,10 +491,10 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     const fp8 *a_src = A + curr_ad * K + curr_ld;
 
     // =========================================================================
-    // Compute LDS buffer pointer for this thread.
-    // The LDS layout for one 8x128 half-tile has two 8x64 banks:
-    //   Bank 0 (K 0-63):   4 lines x 32 columns x 4 bytes = 512 bytes
-    //   Bank 1 (K 64-127): 4 lines x 32 columns x 4 bytes = 512 bytes
+    // A LDS buffer pointer.
+    // The LDS layout for one 8x128 "half-tile" has two 8x64 logical slices:
+    //   slice 0 (K 0-63):   4 lines x 32 columns x 4 bytes = 512 bytes
+    //   slice 1 (K 64-127): 4 lines x 32 columns x 4 bytes = 512 bytes
     //
     // Each line has 32 columns.
     // Column assignment:
@@ -516,35 +515,33 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
 
     // =========================================================================
     // B LDS buffer pointer.
-    // LDS layout for one 16x64 sub-tile uses two 4-line panels:
-    //   Panel 0 (K 0..31): cols 0-15 for K 0-15, cols 16-31 for K 16-31
-    //   Panel 1 (K 32..63): cols 0-15 for K 32-47, cols 16-31 for K 48-63
-    // Each panel: 4 lines x 32 columns x 4 bytes = 512 bytes.
+    // LDS layout for one 16x64 tile is divided into two slices:
+    //   Slice 0 (K 0..31): cols 0-15 for K 0-15, cols 16-31 for K 16-31
+    //   Slice 1 (K 32..63): cols 0-15 for K 32-47, cols 16-31 for K 48-63
+    // Each slice: 4 lines x 32 columns x 4 bytes = 512 bytes.
     //
-    // Buffer pointer formula (from n_full_tiles.cu for OP_K=64):
+    // Buffer pointer formula (OP_K=64):
     //   b_curr_ad * E_PER_BANK              -> N column offset (0, 4, 8, ...,
-    //   60) (b_curr_ld / 32) * 512              -> panel offset (0 or 512)
-    //   (b_curr_ld % 32 >= 16) ? 64 : 0     -> K chunk within panel
+    //   (b_curr_ld / 32) * 512              -> sub-bank offset (0 or 512)
+    //   (b_curr_ld % 32 >= 16) ? 64 : 0     -> K chunk within sub-bank
     // =========================================================================
     fp8 *b_buf_base = B_shared;
     b_buf_base += b_curr_ad * E_PER_BANK;
     b_buf_base += (b_curr_ld / 32) * NB_BANKS * E_PER_BANK * 4;
     b_buf_base += (b_curr_ld % 32 >= 16) ? 16 * E_PER_BANK : 0;
 
-    // Register arrays for loading and swizzling.
-    // Each reg array holds 4 dwords (16 bytes = E_PER_THREAD).
     fp8_4 reg0[E_PER_THREAD / 4];
     fp8_4 reg1[E_PER_THREAD / 4];
     fp8_4 swap_reg[E_PER_THREAD / 4];
 
-    // B tile producer registers (4 loads x 16 bytes each, stored as dwords).
+    // B tile producer registers (4 loads x 16 bytes each).
     fp8_4 b_reg[OPS][E_PER_THREAD / 4];
 
-    // =========================================================================
     // Consumer-side buffer pointers (for SMFMAC consumption).
-    // A: Lane pairing - even lanes read lines 0-1, odd lanes read lines 2-3.
-    // B: Panel-based - lanes 0-31 read panel 0, lanes 32-63 read panel 1.
-    // =========================================================================
+    // Logically, A has four 512 byte LDS sub-banks and B has four 1024 sub-banks ones.
+    // For one SMFMAC call:
+    // A: even lanes read lines 0-1, odd lanes read lines 2-3 of one 512 byte sub-bank.
+    // B: lanes 0-31 read slice 0, lanes 32-63 slice 1.of one 1024 byte sub-bank.
     fp8 *a_cons_base = A_shared;
     a_cons_base += (lane_id / 2) * E_PER_BANK;
     a_cons_base += (lane_id % 2) * E_PER_BANK * 2 * NB_BANKS;
@@ -554,23 +551,20 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
     b_cons_base += (lane_id / 32) * E_PER_BANK * 4 * NB_BANKS;
 
     // Consumer registers for SMFMAC.
-    fp8x8 a_cons[OPS];  // 4 x 8 bytes = 32 bytes for A.
-    fp8x16 b_cons[OPS]; // 4 x 16 bytes = 64 bytes for B.
+    fp8x8 a_cons[OPS];  // 4 x 8 = 32 bytes for A.
+    fp8x16 b_cons[OPS]; // 4 x 16 = 64 bytes for B.
 
     const int k_blocks = K_outer;
 
     for (int k_block = 0; k_block < k_blocks; ++k_block) {
-      // Source pointer for this K block.
       const fp8 *a_src_k = a_src + k_block * WARPTILE_K;
-      // LDS buffer pointer (fixed for single-buffering).
+      const fp8 *b_src_k = b_src + k_block * WARPTILE_K;
       fp8_4 *A_buffer = reinterpret_cast<fp8_4 *>(a_buf_base);
 
-      // -----------------------------------------------------------------------
-      // Load from global memory to registers.
+      // Load A tile.
       // Two 16-byte loads at offset 0 and 128 cover the 8x256 tile:
       //   reg0 <- K[curr_ld .. curr_ld+15] (first half-tile)
       //   reg1 <- K[curr_ld+128 .. curr_ld+143] (second half-tile)
-      // -----------------------------------------------------------------------
       asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
                    "global_load_dwordx4 %1, %2, off offset:128\n\t"
                    : "=v"(reg0), "=v"(reg1)
@@ -588,7 +582,7 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
                    : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]), "=v"(swap_reg[3])
                    : "v"(reg0[0]), "v"(reg0[1]), "v"(reg0[2]), "v"(reg0[3]));
 
-      // Store swizzled reg0 to LDS. Each line is NB_BANKS (32) dwords apart.
+      // Store swizzled reg0 to first 512 byte sub-bank.
 #pragma unroll
       for (int line = 0; line < 4; ++line) {
         A_buffer[line * NB_BANKS] = reg0[line];
@@ -606,7 +600,7 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
                    : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]), "=v"(swap_reg[3])
                    : "v"(reg1[0]), "v"(reg1[1]), "v"(reg1[2]), "v"(reg1[3]));
 
-      // Store swizzled reg1 at second half-tile offset (1024 bytes)
+      // Store swizzled reg1 to second 512 byte sub-bank.
       constexpr int HALF_TILE_DWORDS =
           SparseTrickConfig::OP_K * SparseTrickConfig::OP_M / 2;
 #pragma unroll
@@ -615,12 +609,9 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
             reg1[line];
       }
 
-      // -----------------------------------------------------------------------
-      // Load B tile from global memory (4 loads for OPS=4 sub-tiles).
+      // Load B tile (4 loads for OPS=4 sub-tiles).
       // Each sub-tile is 16x64 bytes (1024 bytes). Offsets 0, 64, 128, 192
       // advance through K positions 0-63, 64-127, 128-191, 192-255.
-      // -----------------------------------------------------------------------
-      const fp8 *b_src_k = b_src + k_block * WARPTILE_K;
       asm volatile("global_load_dwordx4 %0, %4, off offset:0   \n\t"
                    "global_load_dwordx4 %1, %4, off offset:64  \n\t"
                    "global_load_dwordx4 %2, %4, off offset:128 \n\t"
@@ -629,24 +620,18 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
                      "=v"(b_reg[3])
                    : "v"(b_src_k));
 
-      // -----------------------------------------------------------------------
       // Store B tile to LDS (dense, no swizzle).
-      // LDS layout for each 16x64 sub-tile: 4 lines x 32 columns x 4 bytes.
-      // Each thread stores 16 bytes (4 lines x 4 bytes per line).
-      // -----------------------------------------------------------------------
       fp8 *b_buf = b_buf_base;
       asm volatile("s_waitcnt vmcnt(0)");
 #pragma unroll
       for (int load = 0; load < OPS; ++load) {
-        // Store 16 bytes: 4 lines x 4 elements, each line NB_BANKS*E_PER_BANK
-        // apart.
         const fp8 *b_bytes = reinterpret_cast<const fp8 *>(b_reg[load]);
 #pragma unroll
-        for (int line = 0; line < E_PER_THREAD / E_PER_BANK; ++line) {
+        for (int slice = 0; slice < E_PER_THREAD / E_PER_BANK; ++slice) {
 #pragma unroll
           for (int elem = 0; elem < E_PER_BANK; ++elem) {
-            b_buf[line * (NB_BANKS * E_PER_BANK) + elem] =
-                b_bytes[E_PER_BANK * line + elem];
+            b_buf[slice * (NB_BANKS * E_PER_BANK) + elem] =
+                b_bytes[E_PER_BANK * slice + elem];
           }
         }
         b_buf += SparseTrickConfig::WARP_SIZE * E_PER_THREAD;
@@ -654,11 +639,8 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
 
       __syncthreads();
 
-      // -----------------------------------------------------------------------
       // SMFMAC consumption: 4 ops per K block.
       // Each op consumes 8x64 from A and 16x64 from B.
-      // -----------------------------------------------------------------------
-
 #pragma unroll
       for (int op = 0; op < OPS; ++op) {
         // Load A for this op (8 bytes from swizzled A tile).
@@ -677,11 +659,11 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
         // Per-op offset: op * OP_N * OP_K = op * 1024 bytes.
         fp8 *b_op = b_cons_base + op * OP_N * OP_K;
 #pragma unroll
-        for (int line = 0; line < 4; ++line) {
+        for (int slice = 0; slice < 4; ++slice) {
 #pragma unroll
           for (int i = 0; i < E_PER_BANK; ++i) {
-            b_cons[op][i + line * E_PER_BANK] =
-                b_op[i + line * NB_BANKS * E_PER_BANK];
+            b_cons[op][i + slice * E_PER_BANK] =
+                b_op[i + slice * NB_BANKS * E_PER_BANK];
           }
         }
       }
@@ -699,24 +681,20 @@ struct SparseTrickOpM8Kernel : SkinnyGemmKernel {
       }
     }
 
-    // =========================================================================
     // Post-processing: Fuse partial results, shuffle, convert to fp16, output.
-    // =========================================================================
 
     acc[0] = acc[0] + acc[1];
     acc[1] = acc[2] + acc[3];
 
-    // Compute output N column: 2 * ((lane_id % 16) / 2) = 0, 0, 2, 2, 4, 4, ...
+    // Compute output N column and M row.
     const int out_n = 2 * ((lane_id % 16) / 2);
+    const int out_m = (lane_id / 16) * 2 + (lane_id % 2);
 
     // Shuffle: Exchange between even/odd lane pairs. Even lanes keep d0, odd
     // lanes keep d1. Then swap to get 2x2 tile per pair.
     const int id_to_swap = 1 - (lane_id % 2);
     const int src_lane = lane_id + 1 - 2 * (lane_id % 2);
     acc[id_to_swap] = __shfl(acc[id_to_swap], src_lane);
-
-    // Compute output M row: (lane_id / 16) * 2 + (lane_id % 2).
-    const int out_m = (lane_id / 16) * 2 + (lane_id % 2);
 
     // Each lane writes 2 elements at C[out_m, out_n] and C[out_m, out_n+1].
     __half *c_out = C + out_m * N + out_n;
