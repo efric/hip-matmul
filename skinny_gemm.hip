@@ -620,7 +620,6 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
         }
         b_buf += WARP_SIZE * E_PER_THREAD;
       }
-
       __syncthreads();
 
       // SMFMAC consumption: 4 ops per K block.
@@ -649,8 +648,6 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
           }
         }
       }
-
-      asm volatile("s_waitcnt lgkmcnt(0)");
 
 #pragma unroll
       for (int op = 0; op < OPS; ++op) {

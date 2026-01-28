@@ -10,9 +10,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp8.h>
 
-#include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <random>
 #include <vector>
 
