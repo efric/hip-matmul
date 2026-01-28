@@ -83,7 +83,7 @@ template <> struct CTypeImpl<Type::SI32> {
   using type = int32_t;
 };
 template <> struct CTypeImpl<Type::FP8> {
-  using type = __hip_fp8_storage_t;
+  using type = __hip_fp8_e4m3_fnuz;
 };
 template <> struct CTypeImpl<Type::FP16> {
   using type = _Float16;
@@ -92,31 +92,6 @@ template <> struct CTypeImpl<Type::FP32> {
   using type = float;
 };
 template <Type t> using CType = typename CTypeImpl<t>::type;
-
-inline float fp16_bits_to_float(uint16_t bits) {
-  _Float16 h;
-  std::memcpy(&h, &bits, sizeof(bits));
-  return static_cast<float>(h);
-}
-
-inline __hip_fp8_storage_t fp8_from_float(float value) {
-  return __hip_cvt_float_to_fp8(value, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
-}
-
-inline float fp8_to_float(__hip_fp8_storage_t value) {
-  auto h = __hip_cvt_fp8_to_halfraw(value, __HIP_E4M3_FNUZ);
-  uint16_t bits = 0;
-  std::memcpy(&bits, &h, sizeof(bits));
-  return fp16_bits_to_float(bits);
-}
-
-template <Type t> inline float to_float(CType<t> value) {
-  return static_cast<float>(value);
-}
-
-template <> inline float to_float<Type::FP8>(CType<Type::FP8> value) {
-  return fp8_to_float(value);
-}
 
 template <typename A, typename B>
 __device__ __host__ std::common_type_t<A, B> ceil_div(A a, B b) {
@@ -145,16 +120,12 @@ void fillRandomBuffer(int size, std::minstd_rand &r, void *out_buffer) {
     } else {
       value = static_cast<float>(static_cast<int>((r() % 5)) - 2);
     }
-    if constexpr (type == Type::FP8) {
-      out_buffer_typed[i] = fp8_from_float(value);
-    } else {
-      out_buffer_typed[i] = static_cast<T>(value);
-    }
+    out_buffer_typed[i] = static_cast<T>(value);
   }
 }
 
 inline std::vector<std::byte> makeRandomBuffer(Type type, int size,
-                                        std::minstd_rand &r) {
+                                               std::minstd_rand &r) {
   int bytes = size * type_size(type);
   std::vector<std::byte> result(bytes);
   if (type == Type::SI8) {

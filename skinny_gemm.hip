@@ -56,7 +56,7 @@ struct SkinnyGemmKernel {
   int K_tile;       // K-dimension tile size (reduction dimension).
   num_threads_func_t num_threads_func; // Number of threads that the kernel
                                        // requires running on.
-  skinny_gemm_func_t gemm_func; // Device kernel pointer.
+  skinny_gemm_func_t gemm_func;        // Device kernel pointer.
 };
 
 void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
@@ -112,7 +112,7 @@ void checkSkinnyGemmResults(const void *A_data_void, const void *B_data_void,
               int global_k = k_outer * problem.tile.K + k_tile;
               TA a = A_data[global_m * problem.total.K + global_k];
               TB b = B_data[global_n * problem.total.K + global_k];
-              c += to_float<A_type>(a) * to_float<B_type>(b);
+              c += static_cast<float>(a) * static_cast<float>(b);
             }
           }
           TC expected = c;
@@ -122,7 +122,7 @@ void checkSkinnyGemmResults(const void *A_data_void, const void *B_data_void,
                     "skinny_gemm numerical error: actual(%g) != "
                     "expected(%g), at m_outer=%d n_outer=%d m_tile=%d "
                     "n_tile=%d, at %s:%d. Note: outer MxNxK = %dx%dx%d\n",
-                    to_float<C_type>(actual), to_float<C_type>(expected),
+                    static_cast<float>(actual), static_cast<float>(expected),
                     m_outer, n_outer, m_tile, n_tile, __FILE__, __LINE__,
                     problem.outer.M, problem.outer.N, problem.outer.K);
             abort();
@@ -144,6 +144,7 @@ void checkSkinnyGemmResults(Type A_type, Type B_type, Type C_type,
     return;                                                                    \
   }
   HANDLE_CASE(FP8, FP8, FP16)
+  // TODO: Add more supported cases.
 #undef HANDLE_CASE
 
   fprintf(stderr, "%s:%d: unhandled types\n", __FILE__, __LINE__);
@@ -183,9 +184,9 @@ void check(const SkinnyGemmKernel &kernel, const ProblemProperties &problem) {
                            C_host_data.size());
 
   HIP_CHECK(hipGetLastError());
-  kernel.gemm_func<<<grid_dim, block_dim>>>(
-      A_device_buffer, B_device_buffer, C_device_buffer, problem.total.M,
-      problem.total.N, problem.total.K);
+  kernel.gemm_func<<<grid_dim, block_dim>>>(A_device_buffer, B_device_buffer,
+                                            C_device_buffer, problem.total.M,
+                                            problem.total.N, problem.total.K);
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_host_data.size(),
                       hipMemcpyDeviceToHost));
@@ -245,7 +246,7 @@ void benchmark(const SkinnyGemmKernel &kernel, MNKShape total) {
   while (true) {
     HIP_CHECK(hipEventRecord(start, hipStreamDefault));
     for (int b = 0; b < iterations; ++b) {
-      kernel.gemm_func<<<grid_dim, block_dim >>>(
+      kernel.gemm_func<<<grid_dim, block_dim>>>(
           A_device_buffer, B_device_buffer, C_device_buffer, problem.total.M,
           problem.total.N, problem.total.K);
     }
@@ -286,7 +287,6 @@ void benchmark(const SkinnyGemmKernel &kernel, MNKShape total) {
       iterations);
 }
 
-// FP8 types and packed vector aliases, mirroring hf-rocm-kernels.
 using fp8 = __hip_fp8_storage_t;
 using fp8_4 = int;
 using fp8x8 = __attribute__((__vector_size__(8 * sizeof(fp8)))) fp8;
@@ -305,7 +305,10 @@ void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
                               const dim3 &grid_dim, const dim3 &block_dim,
                               size_t alloc_a_bytes, size_t alloc_b_bytes,
                               size_t alloc_c_bytes) {
-  // Local constants for printing only (not required for computation).
+  if (getIntEnvVar("PRINT_INFO", 0) == 0) {
+    return;
+  }
+
   constexpr int A_LANES = 1;
   constexpr int B_LANES = 1;
   const int op_m = kernel.M_tile;
@@ -337,7 +340,7 @@ void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
       C_elements * static_cast<size_t>(type_size(kernel.C_type));
   const int k_blocks = ceil_div(problem.total.K, warptile_k);
 
-  fprintf(stderr, "Skinny GEMM scaffold sizes:\n");
+  fprintf(stderr, "Skinny GEMM FP8 configuration:\n");
   print(problem, stderr);
   fprintf(stderr,
           "\tSparse trick: OP_M=%d OP_N=%d OP_K=%d OPS=%d (WARPTILE_K=%d)\n",
@@ -346,8 +349,8 @@ void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
           "\tWarp tile: M=%d N=%d K=%d (A_LANES=%d, B_LANES=%d, warp=%d)\n",
           warptile_m, warptile_n, warptile_k, A_LANES, B_LANES, WARP_SIZE);
   fprintf(stderr,
-          "\tA tile: %dx%d bytes=%d (per-op=%d, half-tile=%d, bank=%d)\n",
-          op_m, warptile_k, a_tile_bytes, a_op_bytes, a_half_tile_bytes,
+          "\tA tile: %dx%d bytes=%d (per-op=%d, half-tile=%d, bank=%d)\n", op_m,
+          warptile_k, a_tile_bytes, a_op_bytes, a_half_tile_bytes,
           a_bank_bytes);
   fprintf(stderr, "\tB tile: %dx%d bytes=%d (per-op=%d, panel=%d)\n", op_n,
           warptile_k, b_tile_bytes, b_op_bytes, b_panel_bytes);
@@ -360,8 +363,7 @@ void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
           A_bytes, B_bytes, C_bytes, A_elements, B_elements, C_elements);
   fprintf(stderr, "\tBuffers (allocated bytes): A=%zu B=%zu C=%zu\n",
           alloc_a_bytes, alloc_b_bytes, alloc_c_bytes);
-  fprintf(stderr,
-          "\tLaunch: grid=(%u,%u,%u) block=(%u,%u,%u) threads=%u\n",
+  fprintf(stderr, "\tLaunch: grid=(%u,%u,%u) block=(%u,%u,%u) threads=%u\n",
           static_cast<unsigned>(grid_dim.x), static_cast<unsigned>(grid_dim.y),
           static_cast<unsigned>(grid_dim.z), static_cast<unsigned>(block_dim.x),
           static_cast<unsigned>(block_dim.y),
@@ -369,14 +371,11 @@ void printSparseTrickScaffold(const SkinnyGemmKernel &kernel,
           static_cast<unsigned>(block_dim.x));
   fprintf(stderr, "\tK blocks: %d (K=%d / %d)\n", k_blocks, problem.total.K,
           warptile_k);
-  fprintf(stderr, "\tAlignment: M%%OP_M=%d N%%OP_N=%d K%%WARPTILE_K=%d\n",
-          problem.total.M % op_m, problem.total.N % op_n,
-          problem.total.K % warptile_k);
 }
 
 template <int OP_M, int OP_N, int OPS>
-struct SparseTrickKernel : SkinnyGemmKernel {
-  SparseTrickKernel() {
+struct SparseTrickFP8Kernel : SkinnyGemmKernel {
+  SparseTrickFP8Kernel() {
     name = __FUNCTION__;
     A_type = Type::FP8;
     B_type = Type::FP8;
@@ -386,9 +385,7 @@ struct SparseTrickKernel : SkinnyGemmKernel {
     M_tile = OP_M;
     N_tile = OP_N;
     K_tile = WARPTILE_K;
-    num_threads_func = [](const ProblemProperties &) {
-      return WARP_SIZE;
-    };
+    num_threads_func = [](const ProblemProperties &) { return WARP_SIZE; };
     gemm_func = run;
   }
 
@@ -405,10 +402,6 @@ struct SparseTrickKernel : SkinnyGemmKernel {
     const int global_m_base = m_outer * OP_M;
     const int global_n_base = n_outer * OP_N;
     if (global_m_base >= M || global_n_base >= N) {
-      return;
-    }
-    if (global_m_base + OP_M > M || global_n_base + OP_N > N) {
-      // TODO: Don't handle partial tiles for now.
       return;
     }
 
@@ -451,8 +444,8 @@ struct SparseTrickKernel : SkinnyGemmKernel {
     //   reg1: K 128-255 (second half-tile, offset by 128 bytes)
     // =========================================================================
 
-    constexpr int E_PER_THREAD = 16; // Elements per thread.
-    constexpr int E_PER_BANK = 4; // 4 bytes per LDS column.
+    constexpr int E_PER_THREAD = 16;  // Elements per thread.
+    constexpr int E_PER_BANK = 4;     // 4 bytes per LDS column.
     constexpr int THREADS_PER_LD = 8; // Threads per row.
 
     // curr_ld: K offset within row (0, 16, 32, ..., 112).
@@ -526,11 +519,13 @@ struct SparseTrickKernel : SkinnyGemmKernel {
     // B tile producer registers (4 loads x 16 bytes each).
     fp8_4 b_reg[OPS][E_PER_THREAD / 4];
 
-    // Consumer-side buffer pointers (for SMFMAC consumption).
-    // Logically, A has four 512 byte LDS sub-banks and B has four 1024 sub-banks ones.
-    // For one SMFMAC call:
-    // A: even lanes read lines 0-1, odd lanes read lines 2-3 of one 512 byte sub-bank.
-    // B: lanes 0-31 read slice 0, lanes 32-63 slice 1.of one 1024 byte sub-bank.
+    // Consumer-side buffer pointers.
+    // Logically, A has four 512 byte LDS sub-banks and B has four 1024
+    // sub-banks ones. For one SMFMAC call:
+    // A: even lanes read lines 0-1, odd lanes read lines 2-3 of one 512 byte
+    // sub-bank.
+    // B: lanes 0-31 read slice 0, lanes 32-63 slice 1 of one 1024 byte
+    // sub-bank.
     fp8 *a_cons_base = A_shared;
     a_cons_base += (lane_id / 2) * E_PER_BANK;
     a_cons_base += (lane_id % 2) * E_PER_BANK * 2 * NB_BANKS;
@@ -551,9 +546,9 @@ struct SparseTrickKernel : SkinnyGemmKernel {
       fp8_4 *A_buffer = reinterpret_cast<fp8_4 *>(a_buf_base);
 
       // Load A tile.
-      // Two 16-byte loads at offset 0 and 128 cover the 8x256 tile:
-      //   reg0 <- K[curr_ld .. curr_ld+15] (first half-tile)
-      //   reg1 <- K[curr_ld+128 .. curr_ld+143] (second half-tile)
+      // Two 128bit loads at offset 0 and 128 cover the 8x256 tile:
+      //   reg0 <- K[curr_ld .. curr_ld+112] (first half-tile)
+      //   reg1 <- K[curr_ld+128 .. curr_ld+240] (second half-tile)
       asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
                    "global_load_dwordx4 %1, %2, off offset:128\n\t"
                    : "=v"(reg0), "=v"(reg1)
@@ -568,7 +563,8 @@ struct SparseTrickKernel : SkinnyGemmKernel {
                    "v_swap_b32 %1, %6\n\t"
                    "v_swap_b32 %2, %5\n\t"
                    "v_swap_b32 %3, %7"
-                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]), "=v"(swap_reg[3])
+                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
+                     "=v"(swap_reg[3])
                    : "v"(reg0[0]), "v"(reg0[1]), "v"(reg0[2]), "v"(reg0[3]));
 
       // Store swizzled reg0 to first 512 byte sub-bank.
@@ -586,15 +582,15 @@ struct SparseTrickKernel : SkinnyGemmKernel {
                    "v_swap_b32 %1, %6\n\t"
                    "v_swap_b32 %2, %5\n\t"
                    "v_swap_b32 %3, %7"
-                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]), "=v"(swap_reg[3])
+                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
+                     "=v"(swap_reg[3])
                    : "v"(reg1[0]), "v"(reg1[1]), "v"(reg1[2]), "v"(reg1[3]));
 
       // Store swizzled reg1 to second 512 byte sub-bank.
       constexpr int HALF_TILE_DWORDS = OP_K * OP_M / 2;
 #pragma unroll
       for (int line = 0; line < 4; ++line) {
-        A_buffer[line * NB_BANKS + HALF_TILE_DWORDS] =
-            reg1[line];
+        A_buffer[line * NB_BANKS + HALF_TILE_DWORDS] = reg1[line];
       }
 
       // Load B tile (4 loads for OPS=4 sub-tiles).
@@ -631,7 +627,6 @@ struct SparseTrickKernel : SkinnyGemmKernel {
       // Each op consumes 8x64 from A and 16x64 from B.
 #pragma unroll
       for (int op = 0; op < OPS; ++op) {
-        // Load A for this op (8 bytes from swizzled A tile).
         // Per-op offset: op * OP_M * OP_K = op * 512 bytes.
         fp8 *a_op = a_cons_base + op * OP_M * OP_K;
 #pragma unroll
@@ -643,7 +638,6 @@ struct SparseTrickKernel : SkinnyGemmKernel {
           a_cons[op][i + 1 * E_PER_BANK] = a_op[i + 1 * NB_BANKS * E_PER_BANK];
         }
 
-        // Load B for this op (16 bytes from dense B tile).
         // Per-op offset: op * OP_N * OP_K = op * 1024 bytes.
         fp8 *b_op = b_cons_base + op * OP_N * OP_K;
 #pragma unroll
@@ -661,8 +655,8 @@ struct SparseTrickKernel : SkinnyGemmKernel {
 #pragma unroll
       for (int op = 0; op < OPS; ++op) {
         acc = __builtin_amdgcn_smfmac_f32_16x16x64_fp8_fp8(
-            reinterpret_cast<fp8_4x2 >(a_cons[op]),
-            reinterpret_cast<fp8_4x4 >(b_cons[op]), acc, sparsity_indices,
+            reinterpret_cast<fp8_4x2>(a_cons[op]),
+            reinterpret_cast<fp8_4x4>(b_cons[op]), acc, sparsity_indices,
             7, // cbsz
             1  // abid
         );
@@ -670,7 +664,6 @@ struct SparseTrickKernel : SkinnyGemmKernel {
     }
 
     // Post-processing: Fuse partial results, shuffle, convert to fp16, output.
-
     acc[0] = acc[0] + acc[1];
     acc[1] = acc[2] + acc[3];
 
@@ -686,14 +679,9 @@ struct SparseTrickKernel : SkinnyGemmKernel {
 
     // Each lane writes 2 elements at C[out_m, out_n] and C[out_m, out_n+1].
     __half *c_out = C + out_m * N + out_n;
-    __half2 out_pair;
-    out_pair.x = __float2half(acc[0]);
-    out_pair.y = __float2half(acc[1]);
-    *reinterpret_cast<__half2 *>(c_out) = out_pair;
+    *reinterpret_cast<__half2 *>(c_out) = __floats2half2_rn(acc[0], acc[1]);
   }
 };
-
-using SparseTrickOP4Kernel = SparseTrickKernel<8, 16, 4>;
 
 void test(const SkinnyGemmKernel &kernel) {
   const char *filter = getenv("FILTER");
@@ -708,13 +696,14 @@ void test(const SkinnyGemmKernel &kernel) {
     check(kernel);
   }
 
-  MNKShape test_shapes[] = {{8, 13312, 16384}};
+  MNKShape test_shapes[] = {
+      {8, 2304, 16384}, {8, 6656, 16384}, {8, 13312, 16384}};
   for (MNKShape shape : test_shapes) {
     benchmark(kernel, shape);
   }
 }
 
 int main() {
-  test(SparseTrickOP4Kernel{});
+  test(SparseTrickFP8Kernel<8, 16, 4>{});
   return 0;
 }
