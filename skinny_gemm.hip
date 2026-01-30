@@ -688,50 +688,118 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
 // ============================================================================
 namespace layout_gpu_tests {
 
-// GPU kernel to test the swizzle asm sequence.
-// Each thread processes 16 bytes using the production swizzle.
+// Architecture constants (must match production kernel)
+constexpr int E_PER_THREAD = 16; // Bytes per thread per load
+constexpr int E_PER_BANK = 4;    // 4 bytes per LDS column
+
+// Static asserts for architectural invariants
+static_assert(WARP_SIZE == 64, "Tests assume 64-lane wavefront");
+static_assert(NB_BANKS == 32, "Tests assume 32 LDS banks");
+
+// Swizzle output pattern: input K0..K15 -> output positions
+// After v_pack + v_swap, byte at input position i ends up at SWIZZLE_PATTERN[i]
+// Documented in fullpicture-sparse-trick.md
+constexpr uint8_t SWIZZLE_PATTERN[16] = {0,  1,  4,  5, 8, 9, 12, 13,
+                                         2,  3,  6,  7, 10, 11, 14, 15};
+
+// Consumer lane patterns after LDS round-trip
+// Even lanes receive K positions: 0,1,4,5,8,9,12,13
+// Odd lanes receive K positions: 2,3,6,7,10,11,14,15
+constexpr uint8_t EVEN_LANE_PATTERN[8] = {0, 1, 4, 5, 8, 9, 12, 13};
+constexpr uint8_t ODD_LANE_PATTERN[8] = {2, 3, 6, 7, 10, 11, 14, 15};
+
+// Compile-time validation that patterns are complementary
+constexpr bool validate_lane_patterns() {
+  bool seen[16] = {};
+  for (int i = 0; i < 8; ++i) {
+    if (EVEN_LANE_PATTERN[i] >= 16 || ODD_LANE_PATTERN[i] >= 16)
+      return false;
+    seen[EVEN_LANE_PATTERN[i]] = true;
+    seen[ODD_LANE_PATTERN[i]] = true;
+  }
+  for (int i = 0; i < 16; ++i)
+    if (!seen[i])
+      return false;
+  return true;
+}
+static_assert(validate_lane_patterns(),
+              "Lane patterns must cover all 16 K positions");
+
+// Validate swizzle is a valid permutation
+constexpr bool validate_swizzle_pattern() {
+  bool seen[16] = {};
+  for (int i = 0; i < 16; ++i) {
+    if (SWIZZLE_PATTERN[i] >= 16 || seen[SWIZZLE_PATTERN[i]])
+      return false;
+    seen[SWIZZLE_PATTERN[i]] = true;
+  }
+  return true;
+}
+static_assert(validate_swizzle_pattern(),
+              "Swizzle must be valid permutation of 0-15");
+
+// ============================================================================
+// Test: Swizzle (v_pack + v_swap sequence)
+// ============================================================================
+
+// Swizzle test is independent of OPS - tests the v_pack + v_swap sequence.
+// Each thread processes 16 bytes using the production swizzle pattern.
+//
+// The v_swap_b32 instruction swaps both operands. Production code relies on
+// reg0 being modified as a side effect (input-only constraint but actually
+// read-modify-write). For the test, we use explicit output variables to make
+// the data flow clear and avoid undefined behavior per GCC inline asm semantics.
 __global__ void test_swizzle_kernel(const fp8 *input, fp8 *output) {
   int lane_id = threadIdx.x;
-  if (lane_id >= 64)
+  if (lane_id >= WARP_SIZE)
     return;
 
-  // Load 16 bytes into 4 dwords (same as production)
-  const fp8 *src = input + lane_id * 16;
+  const fp8 *src = input + lane_id * E_PER_THREAD;
   fp8_4 reg0[4];
+  fp8_4 swizzled[4] = {}; // Zero-init; receives swapped values
+
   asm volatile("global_load_dwordx4 %0, %1, off" : "=v"(reg0) : "v"(src));
 
-  // Apply swizzle (copy from production lines 557-568)
+  // Swizzle: v_pack interleaves bytes, v_swap places result in swizzled[]
+  // v_pack creates: swap_reg[0]={b0,b1,b4,b5}, swap_reg[1]={b2,b3,b6,b7}, etc.
+  // v_swap then exchanges swap_reg[i] <-> reg0[j], putting packed data into
+  // what were the input registers.
+  //
+  // We use "+v" (read-write) constraints for the swap destinations so the
+  // compiler knows both operands of v_swap are modified.
   fp8_4 swap_reg[4];
-  asm volatile("s_waitcnt vmcnt(0)\n\t"
-               "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"
-               "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"
-               "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"
-               "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"
-               "v_swap_b32 %0, %4\n\t"
-               "v_swap_b32 %1, %6\n\t"
-               "v_swap_b32 %2, %5\n\t"
-               "v_swap_b32 %3, %7"
-               : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
-                 "=v"(swap_reg[3])
-               : "v"(reg0[0]), "v"(reg0[1]), "v"(reg0[2]), "v"(reg0[3]));
+  asm volatile(
+      "s_waitcnt vmcnt(0)\n\t"
+      "v_pack_b32_f16 %0, %8, %9, op_sel:[0,0]\n\t"  // swap_reg[0] = {b0,b1,b4,b5}
+      "v_pack_b32_f16 %1, %8, %9, op_sel:[1,1]\n\t"  // swap_reg[1] = {b2,b3,b6,b7}
+      "v_pack_b32_f16 %2, %10, %11, op_sel:[0,0]\n\t" // swap_reg[2] = {b8,b9,b12,b13}
+      "v_pack_b32_f16 %3, %10, %11, op_sel:[1,1]\n\t" // swap_reg[3] = {b10,b11,b14,b15}
+      "v_swap_b32 %4, %0\n\t"  // swizzled[0] <-> swap_reg[0]
+      "v_swap_b32 %5, %2\n\t"  // swizzled[1] <-> swap_reg[2]
+      "v_swap_b32 %6, %1\n\t"  // swizzled[2] <-> swap_reg[1]
+      "v_swap_b32 %7, %3\n\t"  // swizzled[3] <-> swap_reg[3]
+      : "=&v"(swap_reg[0]), "=&v"(swap_reg[1]), "=&v"(swap_reg[2]),
+        "=&v"(swap_reg[3]), "+v"(swizzled[0]), "+v"(swizzled[1]),
+        "+v"(swizzled[2]), "+v"(swizzled[3])
+      : "v"(reg0[0]), "v"(reg0[1]), "v"(reg0[2]), "v"(reg0[3]));
 
-  // Store swizzled result (reg0 now contains the swizzled data)
-  fp8 *dst = output + lane_id * 16;
+  // Store swizzled output
+  fp8 *dst = output + lane_id * E_PER_THREAD;
+#pragma unroll
   for (int i = 0; i < 4; ++i) {
-    reinterpret_cast<fp8_4 *>(dst)[i] = reg0[i];
+    reinterpret_cast<fp8_4 *>(dst)[i] = swizzled[i];
   }
 }
 
 void test_swizzle_gpu() {
-  constexpr int NUM_THREADS = 64;
-  constexpr int BYTES_PER_THREAD = 16;
-  constexpr int TOTAL_BYTES = NUM_THREADS * BYTES_PER_THREAD;
+  constexpr int NUM_THREADS = WARP_SIZE;
+  constexpr int TOTAL_BYTES = NUM_THREADS * E_PER_THREAD;
 
-  // Allocate and initialize input: each thread gets bytes with pattern
+  // Allocate and initialize input: each thread gets bytes 0..15
   std::vector<uint8_t> h_input(TOTAL_BYTES);
   for (int t = 0; t < NUM_THREADS; ++t) {
-    for (int b = 0; b < BYTES_PER_THREAD; ++b) {
-      h_input[t * BYTES_PER_THREAD + b] = static_cast<uint8_t>(b);
+    for (int b = 0; b < E_PER_THREAD; ++b) {
+      h_input[t * E_PER_THREAD + b] = static_cast<uint8_t>(b);
     }
   }
 
@@ -742,24 +810,24 @@ void test_swizzle_gpu() {
   HIP_CHECK(
       hipMemcpy(d_input, h_input.data(), TOTAL_BYTES, hipMemcpyHostToDevice));
 
-  // Launch kernel
   test_swizzle_kernel<<<1, NUM_THREADS>>>(d_input, d_output);
   HIP_CHECK(hipGetLastError());
 
-  // Copy back results
   std::vector<uint8_t> h_output(TOTAL_BYTES);
   HIP_CHECK(
       hipMemcpy(h_output.data(), d_output, TOTAL_BYTES, hipMemcpyDeviceToHost));
 
-  // Verify against CPU reference
-  int expected[] = {0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15};
+  // Verify against SWIZZLE_PATTERN constant
   bool passed = true;
   for (int t = 0; t < NUM_THREADS && passed; ++t) {
-    for (int b = 0; b < BYTES_PER_THREAD; ++b) {
-      if (h_output[t * BYTES_PER_THREAD + b] != expected[b]) {
+    for (int b = 0; b < E_PER_THREAD; ++b) {
+      uint8_t expected = SWIZZLE_PATTERN[b];
+      uint8_t actual = h_output[t * E_PER_THREAD + b];
+      if (actual != expected) {
         fprintf(stderr,
-                "test_swizzle_gpu FAILED: thread %d byte %d = %d, expected %d\n",
-                t, b, h_output[t * BYTES_PER_THREAD + b], expected[b]);
+                "test_swizzle_gpu FAILED: thread %d byte %d = %d, expected %d "
+                "(input byte at position %d)\n",
+                t, b, actual, expected, SWIZZLE_PATTERN[b]);
         passed = false;
         break;
       }
@@ -776,24 +844,36 @@ void test_swizzle_gpu() {
   }
 }
 
-// GPU kernel to test the full LDS round-trip.
-// Producer: swizzle + store to LDS. Consumer: load from LDS.
+// ============================================================================
+// Test: LDS Round-Trip (Templated on <OP_M, OP_N, OPS>)
+// ============================================================================
+
+// GPU kernel to test the full LDS round-trip for ALL half-tiles and ALL ops.
+// Producer: load from global, swizzle, store to LDS.
+// Consumer: load from LDS in SMFMAC-ready layout.
+//
+// Template parameters match production SparseTrickFP8Kernel<OP_M, OP_N, OPS>.
+template <int OP_M, int OP_N, int OPS>
 __global__ void test_lds_roundtrip_kernel(const fp8 *input, fp8 *output) {
-  constexpr int OP_M = 8;
-  constexpr int OP_K = 64;
-  constexpr int OPS = 4;
-  constexpr int WARPTILE_K = OP_K * OPS; // 256
-  constexpr int A_TILE_BYTES = OP_M * WARPTILE_K; // 2048
+  // Derive constants from template parameters (same as SparseTrickFP8Kernel)
+  constexpr int OP_K = 512 / OP_M; // 64 for OP_M=8
+  constexpr int WARPTILE_K = OP_K * OPS;
+  constexpr int A_TILE_BYTES = OP_M * WARPTILE_K;
+  constexpr int HALF_TILE_K = 128; // Each load covers 128 K elements
+  constexpr int HALF_TILE_DWORDS = OP_K * OP_M / 2;
+  constexpr int NUM_HALF_TILES = WARPTILE_K / HALF_TILE_K;
+  constexpr int THREADS_PER_LD = 8;
+
+  // Static asserts for this instantiation
+  static_assert(OP_K == 64, "Sparse trick requires OP_K=64 for OP_M=8");
+  static_assert(WARPTILE_K == OP_K * OPS, "WARPTILE_K derivation check");
+  static_assert(NUM_HALF_TILES == OPS / 2, "Each half-tile covers 2 ops");
 
   __shared__ fp8 A_shared[A_TILE_BYTES];
 
   int lane_id = threadIdx.x;
-  if (lane_id >= 64)
+  if (lane_id >= WARP_SIZE)
     return;
-
-  constexpr int E_PER_THREAD = 16;
-  constexpr int E_PER_BANK = 4;
-  constexpr int THREADS_PER_LD = 8;
 
   // Producer position (same as production)
   int curr_ld = (lane_id % THREADS_PER_LD) * E_PER_THREAD;
@@ -806,64 +886,91 @@ __global__ void test_lds_roundtrip_kernel(const fp8 *input, fp8 *output) {
   a_buf_base += (curr_ld % 64) * 2;
   fp8_4 *A_buffer = reinterpret_cast<fp8_4 *>(a_buf_base);
 
-  // Load and swizzle (simplified: only first half-tile for test)
   const fp8 *src = input + lane_id * E_PER_THREAD;
-  fp8_4 reg0[4];
-  asm volatile("global_load_dwordx4 %0, %1, off" : "=v"(reg0) : "v"(src));
 
-  fp8_4 swap_reg[4];
-  asm volatile("s_waitcnt vmcnt(0)\n\t"
-               "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"
-               "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"
-               "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"
-               "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"
-               "v_swap_b32 %0, %4\n\t"
-               "v_swap_b32 %1, %6\n\t"
-               "v_swap_b32 %2, %5\n\t"
-               "v_swap_b32 %3, %7"
-               : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
-                 "=v"(swap_reg[3])
-               : "v"(reg0[0]), "v"(reg0[1]), "v"(reg0[2]), "v"(reg0[3]));
+  // Load ALL half-tiles based on OPS
+  // For OPS=4: 2 half-tiles (K 0-127, 128-255)
+  // For OPS=8: 4 half-tiles (K 0-127, 128-255, 256-383, 384-511)
+  fp8_4 reg[NUM_HALF_TILES][4];
 
-  // Store to LDS (same as production lines 571-574)
 #pragma unroll
-  for (int line = 0; line < 4; ++line) {
-    A_buffer[line * NB_BANKS] = reg0[line];
+  for (int ht = 0; ht < NUM_HALF_TILES; ++ht) {
+    asm volatile("global_load_dwordx4 %0, %1, off"
+                 : "=v"(reg[ht])
+                 : "v"(src + ht * HALF_TILE_K));
+  }
+
+  // Swizzle and store each half-tile
+#pragma unroll
+  for (int ht = 0; ht < NUM_HALF_TILES; ++ht) {
+    fp8_4 swap_reg[4];
+    asm volatile("s_waitcnt vmcnt(0)\n\t"
+                 "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"
+                 "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"
+                 "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"
+                 "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"
+                 "v_swap_b32 %0, %4\n\t"
+                 "v_swap_b32 %1, %6\n\t"
+                 "v_swap_b32 %2, %5\n\t"
+                 "v_swap_b32 %3, %7"
+                 : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
+                   "=v"(swap_reg[3])
+                 : "v"(reg[ht][0]), "v"(reg[ht][1]), "v"(reg[ht][2]),
+                   "v"(reg[ht][3]));
+
+#pragma unroll
+    for (int line = 0; line < 4; ++line) {
+      A_buffer[line * NB_BANKS + ht * HALF_TILE_DWORDS] = reg[ht][line];
+    }
   }
 
   __syncthreads();
 
-  // Consumer load (same as production lines 529-538)
+  // Consumer: read ALL ops
   fp8 *a_cons_base = A_shared;
   a_cons_base += (lane_id / 2) * E_PER_BANK;
   a_cons_base += (lane_id % 2) * E_PER_BANK * 2 * NB_BANKS;
 
-  fp8 a_cons[8];
-#pragma unroll
-  for (int i = 0; i < E_PER_BANK; ++i) {
-    a_cons[i + 0 * E_PER_BANK] = a_cons_base[i + 0 * NB_BANKS * E_PER_BANK];
-  }
-#pragma unroll
-  for (int i = 0; i < E_PER_BANK; ++i) {
-    a_cons[i + 1 * E_PER_BANK] = a_cons_base[i + 1 * NB_BANKS * E_PER_BANK];
-  }
+  // Output: 8 bytes per op, OPS ops total
+  constexpr int OUTPUT_BYTES_PER_LANE = 8 * OPS;
+  fp8 *out = output + lane_id * OUTPUT_BYTES_PER_LANE;
 
-  // Dump consumer view
-  for (int i = 0; i < 8; ++i) {
-    output[lane_id * 8 + i] = a_cons[i];
+#pragma unroll
+  for (int op = 0; op < OPS; ++op) {
+    fp8 *a_op = a_cons_base + op * OP_M * OP_K;
+    fp8 a_cons[8];
+
+#pragma unroll
+    for (int i = 0; i < E_PER_BANK; ++i) {
+      a_cons[i + 0 * E_PER_BANK] = a_op[i + 0 * NB_BANKS * E_PER_BANK];
+    }
+#pragma unroll
+    for (int i = 0; i < E_PER_BANK; ++i) {
+      a_cons[i + 1 * E_PER_BANK] = a_op[i + 1 * NB_BANKS * E_PER_BANK];
+    }
+
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      out[op * 8 + i] = a_cons[i];
+    }
   }
 }
 
-void test_lds_roundtrip_gpu() {
-  constexpr int NUM_THREADS = 64;
-  constexpr int INPUT_BYTES = NUM_THREADS * 16; // Producer input
-  constexpr int OUTPUT_BYTES = NUM_THREADS * 8; // Consumer output
+template <int OP_M, int OP_N, int OPS> void test_lds_roundtrip_gpu() {
+  constexpr int OP_K = 512 / OP_M;
+  constexpr int WARPTILE_K = OP_K * OPS;
+  constexpr int A_TILE_BYTES = OP_M * WARPTILE_K;
+  constexpr int NUM_THREADS = WARP_SIZE;
+  constexpr int INPUT_BYTES = A_TILE_BYTES;
+  constexpr int OUTPUT_BYTES = NUM_THREADS * 8 * OPS;
 
-  // Initialize input: each thread's 16 bytes are 0..15
+  // Generate input with K-position encoded values.
+  // Input layout: row-major [OP_M x WARPTILE_K], value at (row, k) = k % 256.
+  // This lets us verify which K positions each consumer lane receives.
   std::vector<uint8_t> h_input(INPUT_BYTES);
-  for (int t = 0; t < NUM_THREADS; ++t) {
-    for (int b = 0; b < 16; ++b) {
-      h_input[t * 16 + b] = static_cast<uint8_t>(b);
+  for (int row = 0; row < OP_M; ++row) {
+    for (int k = 0; k < WARPTILE_K; ++k) {
+      h_input[row * WARPTILE_K + k] = static_cast<uint8_t>(k % 256);
     }
   }
 
@@ -874,31 +981,40 @@ void test_lds_roundtrip_gpu() {
   HIP_CHECK(
       hipMemcpy(d_input, h_input.data(), INPUT_BYTES, hipMemcpyHostToDevice));
 
-  test_lds_roundtrip_kernel<<<1, NUM_THREADS>>>(d_input, d_output);
+  test_lds_roundtrip_kernel<OP_M, OP_N, OPS>
+      <<<1, NUM_THREADS>>>(d_input, d_output);
   HIP_CHECK(hipGetLastError());
 
   std::vector<uint8_t> h_output(OUTPUT_BYTES);
   HIP_CHECK(hipMemcpy(h_output.data(), d_output, OUTPUT_BYTES,
                       hipMemcpyDeviceToHost));
 
-  // Verify: even lanes get K0,K1,K4,K5,K8,K9,K12,K13
-  //         odd lanes get K2,K3,K6,K7,K10,K11,K14,K15
-  int even_expected[] = {0, 1, 4, 5, 8, 9, 12, 13};
-  int odd_expected[] = {2, 3, 6, 7, 10, 11, 14, 15};
+  // Verify consumer output for ALL ops.
+  // Even lanes receive K positions: 0,1,4,5,8,9,12,13 within each op's K range.
+  // Odd lanes receive K positions: 2,3,6,7,10,11,14,15 within each op's K range.
   bool passed = true;
-
   for (int lane = 0; lane < NUM_THREADS && passed; ++lane) {
-    int *expected = (lane % 2 == 0) ? even_expected : odd_expected;
-    for (int i = 0; i < 8; ++i) {
-      if (h_output[lane * 8 + i] != expected[i]) {
-        fprintf(stderr,
-                "test_lds_roundtrip_gpu FAILED: lane %d byte %d = %d, "
-                "expected %d (lane is %s)\n",
-                lane, i, h_output[lane * 8 + i], expected[i],
-                (lane % 2 == 0) ? "even" : "odd");
-        passed = false;
-        break;
+    bool is_even = (lane % 2 == 0);
+    const uint8_t *pattern = is_even ? EVEN_LANE_PATTERN : ODD_LANE_PATTERN;
+
+    for (int op = 0; op < OPS; ++op) {
+      int k_base = op * OP_K;
+      for (int i = 0; i < 8; ++i) {
+        int expected_k = k_base + pattern[i];
+        uint8_t expected = static_cast<uint8_t>(expected_k % 256);
+        uint8_t actual = h_output[lane * 8 * OPS + op * 8 + i];
+        if (actual != expected) {
+          fprintf(stderr,
+                  "test_lds_roundtrip_gpu<%d,%d,%d> FAILED: lane %d (%s), "
+                  "op %d, byte %d = %d, expected %d (K=%d)\n",
+                  OP_M, OP_N, OPS, lane, is_even ? "even" : "odd", op, i,
+                  actual, expected, expected_k);
+          passed = false;
+          break;
+        }
       }
+      if (!passed)
+        break;
     }
   }
 
@@ -906,30 +1022,49 @@ void test_lds_roundtrip_gpu() {
   HIP_CHECK(hipFree(d_output));
 
   if (passed) {
-    printf("test_lds_roundtrip_gpu: PASSED\n");
+    printf("test_lds_roundtrip_gpu<%d,%d,%d>: PASSED\n", OP_M, OP_N, OPS);
   } else {
     abort();
   }
 }
 
-// GPU kernel to test the shuffle exchange.
-__global__ void test_shuffle_kernel(void *output) {
+// ============================================================================
+// Test: Shuffle Exchange (post-SMFMAC result fusing)
+// ============================================================================
+
+// GPU kernel to test the shuffle exchange that fuses results between lane pairs.
+// In production, after SMFMAC ops, adjacent lanes exchange partial sums.
+//
+// CRITICAL FIX: Previous version had identical values in all lanes, making the
+// shuffle meaningless. Now we initialize with LANE-UNIQUE values to actually
+// verify the shuffle exchanges data correctly.
+__global__ void test_shuffle_kernel(float *output) {
   int lane_id = threadIdx.x;
-  if (lane_id >= 64)
+  if (lane_id >= WARP_SIZE)
     return;
 
-  f32x4 acc = {0.0f, 1.0f, 2.0f, 3.0f};
+  // Initialize with LANE-UNIQUE values simulating post-SMFMAC state.
+  // We encode lane identity: acc[i] = lane_id * 100 + i
+  // This lets us verify which lane's data ends up where after shuffle.
+  f32x4 acc;
+  acc[0] = static_cast<float>(lane_id * 100 + 0);
+  acc[1] = static_cast<float>(lane_id * 100 + 1);
+  acc[2] = 0.0f; // Unused after fuse
+  acc[3] = 0.0f; // Unused after fuse
 
-  // Apply shuffle (copy from production lines 673-675)
+  // Shuffle exchange (production lines 673-675)
+  // Even lanes swap acc[1], odd lanes swap acc[0]
   int id_to_swap = 1 - (lane_id % 2);
   int src_lane = lane_id + 1 - 2 * (lane_id % 2);
   acc[id_to_swap] = __shfl(acc[id_to_swap], src_lane);
 
-  *reinterpret_cast<__half2 *>(output) = __floats2half2_rn(acc[0], acc[1]);
+  // Each lane writes to ITS OWN output position (fixed: was writing to same addr)
+  output[lane_id * 2 + 0] = acc[0];
+  output[lane_id * 2 + 1] = acc[1];
 }
 
 void test_shuffle_exchange_gpu() {
-  constexpr int NUM_THREADS = 64;
+  constexpr int NUM_THREADS = WARP_SIZE;
   constexpr int OUTPUT_FLOATS = NUM_THREADS * 2;
 
   float *d_output = nullptr;
@@ -943,39 +1078,35 @@ void test_shuffle_exchange_gpu() {
                       hipMemcpyDeviceToHost));
 
   // Verify the shuffle exchange:
-  // After shuffle, for each lane pair (even, odd):
-  //   even lane: acc[0] = even, acc[1] = odd + 100 (received from odd)
-  //   odd lane: acc[0] = even (received from even), acc[1] = odd + 100
+  // Before: even lane has (even*100+0, even*100+1), odd has (odd*100+0, odd*100+1)
+  // After shuffle:
+  //   Even lane: keeps acc[0], receives acc[1] from odd neighbor
+  //     -> (even*100+0, odd*100+1)
+  //   Odd lane: receives acc[0] from even neighbor, keeps acc[1]
+  //     -> (even*100+0, odd*100+1)
+  // Both lanes end up with the same fused result!
   bool passed = true;
-  for (int base = 0; base < NUM_THREADS && passed; base += 2) {
-    int even_lane = base;
-    int odd_lane = base + 1;
+  for (int lane = 0; lane < NUM_THREADS && passed; ++lane) {
+    float actual_0 = h_output[lane * 2 + 0];
+    float actual_1 = h_output[lane * 2 + 1];
 
-    // Even lane should have: acc[0] = even, acc[1] = odd + 100
-    float even_acc0 = h_output[even_lane * 2 + 0];
-    float even_acc1 = h_output[even_lane * 2 + 1];
-    float exp_even_acc0 = static_cast<float>(even_lane);
-    float exp_even_acc1 = static_cast<float>(odd_lane + 100);
-
-    if (even_acc0 != exp_even_acc0 || even_acc1 != exp_even_acc1) {
-      fprintf(stderr,
-              "test_shuffle_exchange_gpu FAILED: even lane %d has "
-              "(%.0f, %.0f), expected (%.0f, %.0f)\n",
-              even_lane, even_acc0, even_acc1, exp_even_acc0, exp_even_acc1);
-      passed = false;
+    float expected_0, expected_1;
+    if (lane % 2 == 0) {
+      // Even lane: keeps acc[0], receives acc[1] from odd neighbor
+      expected_0 = static_cast<float>(lane * 100 + 0);       // own
+      expected_1 = static_cast<float>((lane + 1) * 100 + 1); // from lane+1
+    } else {
+      // Odd lane: receives acc[0] from even neighbor, keeps acc[1]
+      expected_0 = static_cast<float>((lane - 1) * 100 + 0); // from lane-1
+      expected_1 = static_cast<float>(lane * 100 + 1);       // own
     }
 
-    // Odd lane should have: acc[0] = even (received), acc[1] = odd + 100
-    float odd_acc0 = h_output[odd_lane * 2 + 0];
-    float odd_acc1 = h_output[odd_lane * 2 + 1];
-    float exp_odd_acc0 = static_cast<float>(even_lane);
-    float exp_odd_acc1 = static_cast<float>(odd_lane + 100);
-
-    if (odd_acc0 != exp_odd_acc0 || odd_acc1 != exp_odd_acc1) {
+    if (actual_0 != expected_0 || actual_1 != expected_1) {
       fprintf(stderr,
-              "test_shuffle_exchange_gpu FAILED: odd lane %d has "
-              "(%.0f, %.0f), expected (%.0f, %.0f)\n",
-              odd_lane, odd_acc0, odd_acc1, exp_odd_acc0, exp_odd_acc1);
+              "test_shuffle_exchange_gpu FAILED: lane %d (%s): "
+              "got (%.0f, %.0f), expected (%.0f, %.0f)\n",
+              lane, (lane % 2 == 0) ? "even" : "odd", actual_0, actual_1,
+              expected_0, expected_1);
       passed = false;
     }
   }
@@ -991,9 +1122,17 @@ void test_shuffle_exchange_gpu() {
 
 void run_gpu_tests() {
   printf("Running GPU layout tests...\n");
+
+  // Swizzle test (independent of OPS)
   test_swizzle_gpu();
-  test_lds_roundtrip_gpu();
+
+  // LDS round-trip test - templated to match production kernel
+  // SparseTrickFP8Kernel<8,16,4> is tested in main()
+  test_lds_roundtrip_gpu<8, 16, 4>();
+
+  // Shuffle exchange test (independent of OPS)
   test_shuffle_exchange_gpu();
+
   printf("All GPU layout tests passed.\n");
 }
 
