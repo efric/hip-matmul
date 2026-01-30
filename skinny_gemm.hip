@@ -399,6 +399,14 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
     constexpr int A_TILE_BYTES = OP_M * WARPTILE_K;
     constexpr int B_TILE_BYTES = OP_N * WARPTILE_K;
 
+    // OPS-dependent load counts:
+    // A tile: each 16-byte load covers K=16, need OPS/2 loads to cover WARPTILE_K
+    //   (with 8 threads per row, 8 loads cover K=128; for WARPTILE_K=64*OPS,
+    //    each thread needs OPS/2 loads)
+    // B tile: each 16-byte load covers one OP_K=64 chunk, need OPS loads
+    static constexpr int A_LOADS = OPS / 2;       // 1, 2, or 4
+    static constexpr int B_LOADS = OPS;           // 2, 4, or 8
+
     const int lane_id = threadIdx.x & (warpSize - 1);
     const int m_outer = blockIdx.x;
     const int n_outer = blockIdx.y;
@@ -515,12 +523,14 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
     b_buf_base += (b_curr_ld / 32) * NB_BANKS * E_PER_BANK * 4;
     b_buf_base += (b_curr_ld % 32 >= 16) ? 16 * E_PER_BANK : 0;
 
-    fp8_4 reg0[E_PER_THREAD / 4];
-    fp8_4 reg1[E_PER_THREAD / 4];
+    // A tile producer registers: A_LOADS 16-byte loads.
+    // Each load covers K=16 for one thread; 8 threads per row cover K=128.
+    // For WARPTILE_K = 64*OPS, each thread needs A_LOADS = OPS/2 loads.
+    fp8_4 a_reg[A_LOADS][E_PER_THREAD / 4];
     fp8_4 swap_reg[E_PER_THREAD / 4];
 
-    // B tile producer registers (4 loads x 16 bytes each).
-    fp8_4 b_reg[OPS][E_PER_THREAD / 4];
+    // B tile producer registers (B_LOADS loads x 16 bytes each).
+    fp8_4 b_reg[B_LOADS][E_PER_THREAD / 4];
 
     // Consumer-side buffer pointers.
     // Logically, A has four 512 byte LDS sub-banks and B has four 1024
@@ -549,63 +559,103 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
       fp8_4 *A_buffer = reinterpret_cast<fp8_4 *>(a_buf_base);
 
       // Load A tile.
-      // Two 128bit loads at offset 0 and 128 cover the 8x256 tile:
-      //   reg0 <- K[curr_ld .. curr_ld+112] (first half-tile)
-      //   reg1 <- K[curr_ld+128 .. curr_ld+240] (second half-tile)
-      asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
-                   "global_load_dwordx4 %1, %2, off offset:128\n\t"
-                   : "=v"(reg0), "=v"(reg1)
-                   : "v"(a_src_k));
-
-      asm volatile("s_waitcnt vmcnt(1)\n\t"
-                   "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"
-                   "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"
-                   "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"
-                   "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"
-                   "v_swap_b32 %0, %4\n\t"
-                   "v_swap_b32 %1, %6\n\t"
-                   "v_swap_b32 %2, %5\n\t"
-                   "v_swap_b32 %3, %7"
-                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
-                     "=v"(swap_reg[3])
-                   : "v"(reg0[0]), "v"(reg0[1]), "v"(reg0[2]), "v"(reg0[3]));
-
-      // Store swizzled reg0 to first 512 byte sub-bank.
-#pragma unroll
-      for (int line = 0; line < 4; ++line) {
-        A_buffer[line * NB_BANKS] = reg0[line];
+      // Each thread loads A_LOADS 16-byte chunks at 128-byte intervals.
+      // With 8 threads per row, each 128-byte offset covers the next K=128 slice.
+      // OPS=2 (WARPTILE_K=128): 1 load at offset 0
+      // OPS=4 (WARPTILE_K=256): 2 loads at offsets 0, 128
+      // OPS=8 (WARPTILE_K=512): 4 loads at offsets 0, 128, 256, 384
+      if constexpr (OPS == 2) {
+        asm volatile("global_load_dwordx4 %0, %1, off offset:0"
+                     : "=v"(a_reg[0])
+                     : "v"(a_src_k));
+      } else if constexpr (OPS == 4) {
+        asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
+                     "global_load_dwordx4 %1, %2, off offset:128\n\t"
+                     : "=v"(a_reg[0]), "=v"(a_reg[1])
+                     : "v"(a_src_k));
+      } else if constexpr (OPS == 8) {
+        asm volatile("global_load_dwordx4 %0, %4, off offset:0  \n\t"
+                     "global_load_dwordx4 %1, %4, off offset:128\n\t"
+                     "global_load_dwordx4 %2, %4, off offset:256\n\t"
+                     "global_load_dwordx4 %3, %4, off offset:384\n\t"
+                     : "=v"(a_reg[0]), "=v"(a_reg[1]),
+                       "=v"(a_reg[2]), "=v"(a_reg[3])
+                     : "v"(a_src_k));
       }
 
-      asm volatile("s_waitcnt vmcnt(0)\n\t"
-                   "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"
-                   "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"
-                   "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"
-                   "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"
-                   "v_swap_b32 %0, %4\n\t"
-                   "v_swap_b32 %1, %6\n\t"
-                   "v_swap_b32 %2, %5\n\t"
-                   "v_swap_b32 %3, %7"
-                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
-                     "=v"(swap_reg[3])
-                   : "v"(reg1[0]), "v"(reg1[1]), "v"(reg1[2]), "v"(reg1[3]));
-
-      // Store swizzled reg1 to second 512 byte sub-bank.
+      // Swizzle and store A tile. Each load covers one 8x128 sub-tile (1024 bytes).
+      // HALF_TILE_DWORDS = 64*8/2 = 256 (in fp8_4 units = 1024 bytes).
+      // This is the stride between consecutive loads in the LDS layout.
       constexpr int HALF_TILE_DWORDS = OP_K * OP_M / 2;
-#pragma unroll
-      for (int line = 0; line < 4; ++line) {
-        A_buffer[line * NB_BANKS + HALF_TILE_DWORDS] = reg1[line];
+
+      // Helper macro for swizzle+store of one 16-byte register.
+      // The swizzle rearranges the data for efficient SMFMAC consumption.
+#define SWIZZLE_AND_STORE_A(load_idx, vmcnt_val, bank_offset)                 \
+      asm volatile("s_waitcnt vmcnt(" #vmcnt_val ")\n\t"                       \
+                   "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"               \
+                   "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"               \
+                   "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"               \
+                   "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"               \
+                   "v_swap_b32 %0, %4\n\t"                                     \
+                   "v_swap_b32 %1, %6\n\t"                                     \
+                   "v_swap_b32 %2, %5\n\t"                                     \
+                   "v_swap_b32 %3, %7"                                         \
+                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),  \
+                     "=v"(swap_reg[3])                                         \
+                   : "v"(a_reg[load_idx][0]), "v"(a_reg[load_idx][1]),         \
+                     "v"(a_reg[load_idx][2]), "v"(a_reg[load_idx][3]));        \
+      _Pragma("unroll")                                                        \
+      for (int line = 0; line < 4; ++line) {                                   \
+        A_buffer[line * NB_BANKS + (bank_offset)] = a_reg[load_idx][line];     \
       }
 
-      // Load B tile (4 loads for OPS=4 sub-tiles).
-      // Each sub-tile is 16x64 bytes (1024 bytes). Offsets 0, 64, 128, 192
-      // advance through K positions 0-63, 64-127, 128-191, 192-255.
-      asm volatile("global_load_dwordx4 %0, %4, off offset:0   \n\t"
-                   "global_load_dwordx4 %1, %4, off offset:64  \n\t"
-                   "global_load_dwordx4 %2, %4, off offset:128 \n\t"
-                   "global_load_dwordx4 %3, %4, off offset:192 \n\t"
-                   : "=v"(b_reg[0]), "=v"(b_reg[1]), "=v"(b_reg[2]),
-                     "=v"(b_reg[3])
-                   : "v"(b_src_k));
+      // Process each A load. vmcnt values count down from total A loads.
+      // OPS=2: 1 load. vmcnt(0) for load 0.
+      // OPS=4: 2 loads. vmcnt(1,0) for loads 0,1.
+      // OPS=8: 4 loads. vmcnt(3,2,1,0) for loads 0-3.
+      if constexpr (OPS == 2) {
+        SWIZZLE_AND_STORE_A(0, 0, 0);
+      } else if constexpr (OPS == 4) {
+        SWIZZLE_AND_STORE_A(0, 1, 0);
+        SWIZZLE_AND_STORE_A(1, 0, HALF_TILE_DWORDS);
+      } else if constexpr (OPS == 8) {
+        SWIZZLE_AND_STORE_A(0, 3, 0);
+        SWIZZLE_AND_STORE_A(1, 2, HALF_TILE_DWORDS);
+        SWIZZLE_AND_STORE_A(2, 1, 2 * HALF_TILE_DWORDS);
+        SWIZZLE_AND_STORE_A(3, 0, 3 * HALF_TILE_DWORDS);
+      }
+#undef SWIZZLE_AND_STORE_A
+
+      // Load B tile (B_LOADS = OPS loads for OPS sub-tiles).
+      // Each sub-tile is 16x64 bytes (1024 bytes). Offsets advance by 64 bytes
+      // through K positions: 0-63, 64-127, etc.
+      if constexpr (OPS == 2) {
+        asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
+                     "global_load_dwordx4 %1, %2, off offset:64 \n\t"
+                     : "=v"(b_reg[0]), "=v"(b_reg[1])
+                     : "v"(b_src_k));
+      } else if constexpr (OPS == 4) {
+        asm volatile("global_load_dwordx4 %0, %4, off offset:0   \n\t"
+                     "global_load_dwordx4 %1, %4, off offset:64  \n\t"
+                     "global_load_dwordx4 %2, %4, off offset:128 \n\t"
+                     "global_load_dwordx4 %3, %4, off offset:192 \n\t"
+                     : "=v"(b_reg[0]), "=v"(b_reg[1]), "=v"(b_reg[2]),
+                       "=v"(b_reg[3])
+                     : "v"(b_src_k));
+      } else if constexpr (OPS == 8) {
+        asm volatile("global_load_dwordx4 %0, %8, off offset:0   \n\t"
+                     "global_load_dwordx4 %1, %8, off offset:64  \n\t"
+                     "global_load_dwordx4 %2, %8, off offset:128 \n\t"
+                     "global_load_dwordx4 %3, %8, off offset:192 \n\t"
+                     "global_load_dwordx4 %4, %8, off offset:256 \n\t"
+                     "global_load_dwordx4 %5, %8, off offset:320 \n\t"
+                     "global_load_dwordx4 %6, %8, off offset:384 \n\t"
+                     "global_load_dwordx4 %7, %8, off offset:448 \n\t"
+                     : "=v"(b_reg[0]), "=v"(b_reg[1]), "=v"(b_reg[2]),
+                       "=v"(b_reg[3]), "=v"(b_reg[4]), "=v"(b_reg[5]),
+                       "=v"(b_reg[6]), "=v"(b_reg[7])
+                     : "v"(b_src_k));
+      }
 
       // Store B tile to LDS (dense, no swizzle).
       fp8 *b_buf = b_buf_base;
@@ -625,7 +675,7 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
       }
       __syncthreads();
 
-      // SMFMAC consumption: 4 ops per K block.
+      // SMFMAC consumption: OPS ops per K block.
       // Each op consumes 8x64 from A and 16x64 from B.
 #pragma unroll
       for (int op = 0; op < OPS; ++op) {
@@ -1754,8 +1804,9 @@ void run_gpu_tests() {
   test_swizzle_gpu();
 
   // LDS round-trip test - templated to match production kernel
-  // SparseTrickFP8Kernel<8,16,4> is tested in main()
+  test_lds_roundtrip_gpu<8, 16, 2>();
   test_lds_roundtrip_gpu<8, 16, 4>();
+  test_lds_roundtrip_gpu<8, 16, 8>();
 
   // Shuffle exchange test (independent of OPS)
   test_shuffle_exchange_gpu();
@@ -1792,7 +1843,9 @@ int main() {
     layout_gpu_tests::run_gpu_tests();
   }
 
+  test(SparseTrickFP8Kernel<8, 16, 2>{});
   test(SparseTrickFP8Kernel<8, 16, 4>{});
+  test(SparseTrickFP8Kernel<8, 16, 8>{});
   test(PaddingFP8Kernel<8, 16, 8>{});
   test(PaddingFP8KernelWithSwizzle<8, 16, 8>{});
   return 0;
