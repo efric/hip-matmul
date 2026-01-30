@@ -753,11 +753,17 @@ template <int OP_M, int OP_N, int OPS>
 struct PaddingFP8Kernel : SkinnyGemmKernel {
   static_assert(OP_M == 8, "PaddingFP8Kernel only supports OP_M=8");
   static_assert(OP_N == 16, "PaddingFP8Kernel only supports OP_N=16");
+  static_assert(OPS >= 4, "OPS=2 not supported: thread layout (8 threads/row × 16 bytes) "
+                          "exceeds WARPTILE_K=64, requiring complex partial-thread handling");
 
   // Dense MFMA parameters
   static constexpr int OP_K = 32;       // Fixed for MFMA 16x16x32
   static constexpr int MFMA_M = 16;     // Padded row count
   static constexpr int WARPTILE_K = OP_K * OPS;
+
+  // Load counts depend on OPS (OPS=8: 2 A loads, 4 B loads; OPS=4: 1 A load, 2 B loads)
+  static constexpr int A_LOADS = OPS / 4;  // 2 for OPS=8, 1 for OPS=4
+  static constexpr int B_LOADS = OPS / 2;  // 4 for OPS=8, 2 for OPS=4
 
   PaddingFP8Kernel() {
     name = __FUNCTION__;
@@ -874,34 +880,47 @@ struct PaddingFP8Kernel : SkinnyGemmKernel {
     // Consumer B layout is similar: B[j,k] where j=0..15, k=0..31
 
     // Temporary registers for loading
-    fp8_4 a_reg[2][A_BYTES_PER_THREAD / 4];  // 2 loads × 4 dwords
-    fp8_4 b_reg[4][B_BYTES_PER_THREAD / 4];  // 4 loads × 4 dwords
+    fp8_4 a_reg[A_LOADS][A_BYTES_PER_THREAD / 4];
+    fp8_4 b_reg[B_LOADS][B_BYTES_PER_THREAD / 4];
 
     for (int k_block = 0; k_block < K_outer; ++k_block) {
       const fp8 *a_src_k = a_src + k_block * WARPTILE_K;
       const fp8 *b_src_k = b_src + k_block * WARPTILE_K;
 
-      // Load A tile (2 loads for WARPTILE_K=256)
-      asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
-                   "global_load_dwordx4 %1, %2, off offset:128\n\t"
-                   : "=v"(a_reg[0]), "=v"(a_reg[1])
-                   : "v"(a_src_k));
+      // Load A tile (A_LOADS loads at 128-byte intervals)
+      if constexpr (OPS == 4) {
+        asm volatile("global_load_dwordx4 %0, %1, off offset:0"
+                     : "=v"(a_reg[0])
+                     : "v"(a_src_k));
+      } else if constexpr (OPS == 8) {
+        asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
+                     "global_load_dwordx4 %1, %2, off offset:128\n\t"
+                     : "=v"(a_reg[0]), "=v"(a_reg[1])
+                     : "v"(a_src_k));
+      }
 
-      // Load B tile (4 loads for WARPTILE_K=256)
-      asm volatile("global_load_dwordx4 %0, %4, off offset:0  \n\t"
-                   "global_load_dwordx4 %1, %4, off offset:64 \n\t"
-                   "global_load_dwordx4 %2, %4, off offset:128\n\t"
-                   "global_load_dwordx4 %3, %4, off offset:192\n\t"
-                   : "=v"(b_reg[0]), "=v"(b_reg[1]), "=v"(b_reg[2]),
-                     "=v"(b_reg[3])
-                   : "v"(b_src_k));
+      // Load B tile (B_LOADS loads at 64-byte intervals)
+      if constexpr (OPS == 4) {
+        asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
+                     "global_load_dwordx4 %1, %2, off offset:64 \n\t"
+                     : "=v"(b_reg[0]), "=v"(b_reg[1])
+                     : "v"(b_src_k));
+      } else if constexpr (OPS == 8) {
+        asm volatile("global_load_dwordx4 %0, %4, off offset:0  \n\t"
+                     "global_load_dwordx4 %1, %4, off offset:64 \n\t"
+                     "global_load_dwordx4 %2, %4, off offset:128\n\t"
+                     "global_load_dwordx4 %3, %4, off offset:192\n\t"
+                     : "=v"(b_reg[0]), "=v"(b_reg[1]), "=v"(b_reg[2]),
+                       "=v"(b_reg[3])
+                     : "v"(b_src_k));
+      }
 
       asm volatile("s_waitcnt vmcnt(0)");
 
       // Store A to LDS (row-major, no swizzle)
       // Only store valid rows (0-7), padded rows (8-15) stay zero
 #pragma unroll
-      for (int load = 0; load < 2; ++load) {
+      for (int load = 0; load < A_LOADS; ++load) {
         fp8 *a_store = a_dst + load * 128;
 #pragma unroll
         for (int d = 0; d < 4; ++d) {
@@ -911,7 +930,7 @@ struct PaddingFP8Kernel : SkinnyGemmKernel {
 
       // Store B to LDS (row-major)
 #pragma unroll
-      for (int load = 0; load < 4; ++load) {
+      for (int load = 0; load < B_LOADS; ++load) {
         fp8 *b_store = b_dst + load * 64;
 #pragma unroll
         for (int d = 0; d < 4; ++d) {
@@ -1000,11 +1019,17 @@ template <int OP_M, int OP_N, int OPS>
 struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
   static_assert(OP_M == 8, "PaddingFP8KernelWithSwizzle only supports OP_M=8");
   static_assert(OP_N == 16, "PaddingFP8KernelWithSwizzle only supports OP_N=16");
+  static_assert(OPS >= 4, "OPS=2 not supported: thread layout (8 threads/row × 16 bytes) "
+                          "exceeds WARPTILE_K=64, requiring complex partial-thread handling");
 
   // Dense MFMA parameters (same as PaddingFP8Kernel)
   static constexpr int OP_K = 32;       // Fixed for MFMA 16x16x32
   static constexpr int MFMA_M = 16;     // Padded row count
   static constexpr int WARPTILE_K = OP_K * OPS;
+
+  // Load counts depend on OPS (OPS=8: 2 A loads, 4 B loads; OPS=4: 1 A load, 2 B loads)
+  static constexpr int A_LOADS = OPS / 4;  // 2 for OPS=8, 1 for OPS=4
+  static constexpr int B_LOADS = OPS / 2;  // 4 for OPS=8, 2 for OPS=4
 
   // Scatter-gather constants
   static constexpr int E_PER_BANK = 4;  // 4 bytes per LDS bank slot
@@ -1130,27 +1155,40 @@ struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
     const int k_pair_offset = (cons_k_group / 2) * 256;  // 0 for K-groups 0-1, 256 for K-groups 2-3
 
     // Temporary registers for loading
-    fp8_4 a_reg[2][4];  // 2 loads × 16 bytes each
-    fp8_4 b_reg[4][4];  // 4 loads × 16 bytes each
+    fp8_4 a_reg[A_LOADS][4];
+    fp8_4 b_reg[B_LOADS][4];
 
     for (int k_block = 0; k_block < K_outer; ++k_block) {
       const fp8 *a_src_k = a_src + k_block * WARPTILE_K;
       const fp8 *b_src_k = b_src + k_block * WARPTILE_K;
 
-      // Load A tile (2 loads for WARPTILE_K=256)
-      asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
-                   "global_load_dwordx4 %1, %2, off offset:128\n\t"
-                   : "=v"(a_reg[0]), "=v"(a_reg[1])
-                   : "v"(a_src_k));
+      // Load A tile (A_LOADS loads at 128-byte intervals)
+      if constexpr (OPS == 4) {
+        asm volatile("global_load_dwordx4 %0, %1, off offset:0"
+                     : "=v"(a_reg[0])
+                     : "v"(a_src_k));
+      } else if constexpr (OPS == 8) {
+        asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
+                     "global_load_dwordx4 %1, %2, off offset:128\n\t"
+                     : "=v"(a_reg[0]), "=v"(a_reg[1])
+                     : "v"(a_src_k));
+      }
 
-      // Load B tile (4 loads for WARPTILE_K=256)
-      asm volatile("global_load_dwordx4 %0, %4, off offset:0  \n\t"
-                   "global_load_dwordx4 %1, %4, off offset:64 \n\t"
-                   "global_load_dwordx4 %2, %4, off offset:128\n\t"
-                   "global_load_dwordx4 %3, %4, off offset:192\n\t"
-                   : "=v"(b_reg[0]), "=v"(b_reg[1]), "=v"(b_reg[2]),
-                     "=v"(b_reg[3])
-                   : "v"(b_src_k));
+      // Load B tile (B_LOADS loads at 64-byte intervals)
+      if constexpr (OPS == 4) {
+        asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
+                     "global_load_dwordx4 %1, %2, off offset:64 \n\t"
+                     : "=v"(b_reg[0]), "=v"(b_reg[1])
+                     : "v"(b_src_k));
+      } else if constexpr (OPS == 8) {
+        asm volatile("global_load_dwordx4 %0, %4, off offset:0  \n\t"
+                     "global_load_dwordx4 %1, %4, off offset:64 \n\t"
+                     "global_load_dwordx4 %2, %4, off offset:128\n\t"
+                     "global_load_dwordx4 %3, %4, off offset:192\n\t"
+                     : "=v"(b_reg[0]), "=v"(b_reg[1]), "=v"(b_reg[2]),
+                       "=v"(b_reg[3])
+                     : "v"(b_src_k));
+      }
 
       asm volatile("s_waitcnt vmcnt(0)");
 
@@ -1175,9 +1213,9 @@ struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
       //   4 bytes to base + row * E_PER_BANK + 64
       // =====================================================================
 
-      // Process both loads (0 and 128 offset)
+      // Process A_LOADS loads (at 128-byte intervals)
 #pragma unroll
-      for (int load = 0; load < 2; ++load) {
+      for (int load = 0; load < A_LOADS; ++load) {
         // K offset for this load within WARPTILE_K
         int k_offset = a_k_chunk * A_BYTES_PER_THREAD + load * 128;
 
@@ -1235,7 +1273,7 @@ struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
       // Store B to LDS with scatter-gather layout (same pattern as A)
       // =====================================================================
 #pragma unroll
-      for (int load = 0; load < 4; ++load) {
+      for (int load = 0; load < B_LOADS; ++load) {
         int k_offset = b_k_chunk * B_BYTES_PER_THREAD + load * 64;
         int op = k_offset / OP_K;
         int k_within_op = k_offset % OP_K;
@@ -1846,7 +1884,9 @@ int main() {
   test(SparseTrickFP8Kernel<8, 16, 2>{});
   test(SparseTrickFP8Kernel<8, 16, 4>{});
   test(SparseTrickFP8Kernel<8, 16, 8>{});
+  test(PaddingFP8Kernel<8, 16, 4>{});
   test(PaddingFP8Kernel<8, 16, 8>{});
+  test(PaddingFP8KernelWithSwizzle<8, 16, 4>{});
   test(PaddingFP8KernelWithSwizzle<8, 16, 8>{});
   return 0;
 }
