@@ -929,6 +929,357 @@ struct PaddingFP8Kernel : SkinnyGemmKernel {
 };
 
 // ============================================================================
+// PaddingFP8KernelWithSwizzle: Dense MFMA with scatter-gather LDS layout
+// ============================================================================
+// This kernel combines PaddingFP8Kernel's zero-padding approach with
+// SparseTrickFP8Kernel's scatter-gather LDS layout to reduce bank conflicts.
+//
+// Key insight: PaddingFP8Kernel has 16-way bank conflicts because all 16 rows
+// hit the same banks when reading contiguous data. By using scatter-gather:
+// - Instead of reading 8 contiguous bytes, read 2 × 4-byte chunks 128 bytes apart
+// - Interleave row + k_group to spread 64 lanes across 32 bank slots
+// - Achieve 2-way conflicts (64 lanes / 32 banks) instead of 16-way
+//
+// LDS Layout (per op, 512 bytes for A, 512 bytes for B):
+// - Slots 0-15 (K-groups 0,2): bytes [0-63] first 4B, [64-127] second 4B
+// - Slots 16-31 (K-groups 1,3): bytes [128-191] first 4B, [192-255] second 4B
+// - K-group pairs 2-3 at offset 256-511
+// ============================================================================
+
+template <int OP_M, int OP_N, int OPS>
+struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
+  static_assert(OP_M == 8, "PaddingFP8KernelWithSwizzle only supports OP_M=8");
+  static_assert(OP_N == 16, "PaddingFP8KernelWithSwizzle only supports OP_N=16");
+
+  // Dense MFMA parameters (same as PaddingFP8Kernel)
+  static constexpr int OP_K = 32;       // Fixed for MFMA 16x16x32
+  static constexpr int MFMA_M = 16;     // Padded row count
+  static constexpr int WARPTILE_K = OP_K * OPS;
+
+  // Scatter-gather constants
+  static constexpr int E_PER_BANK = 4;  // 4 bytes per LDS bank slot
+
+  PaddingFP8KernelWithSwizzle() {
+    name = __FUNCTION__;
+    A_type = Type::FP8;
+    B_type = Type::FP8;
+    C_type = Type::FP16;
+    M_tile = OP_M;
+    N_tile = OP_N;
+    K_tile = WARPTILE_K;
+    num_threads_func = [](const ProblemProperties &) { return WARP_SIZE; };
+    gemm_func = run;
+  }
+
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int M, int N, int K) {
+    // LDS layout: Scatter-gather for both A and B
+    // A: 512 bytes per op × OPS ops = 512 * OPS bytes (MFMA_M=16 padded rows)
+    // B: 512 bytes per op × OPS ops = 512 * OPS bytes (OP_N=16 rows)
+    //
+    // Per-op layout (512 bytes):
+    //   Offset 0-63:    Slots 0-15,  K-group 0/2 first 4 bytes
+    //   Offset 64-127:  Slots 0-15,  K-group 0/2 second 4 bytes
+    //   Offset 128-191: Slots 16-31, K-group 1/3 first 4 bytes
+    //   Offset 192-255: Slots 16-31, K-group 1/3 second 4 bytes
+    //   Offset 256-511: Same pattern for K-group pairs 2-3
+    constexpr int BYTES_PER_OP = 512;  // 16 rows × 32 K = 512 bytes
+    constexpr int A_TILE_BYTES = BYTES_PER_OP * OPS;
+    constexpr int B_TILE_BYTES = BYTES_PER_OP * OPS;
+
+    const int lane_id = threadIdx.x & (warpSize - 1);
+    const int m_outer = blockIdx.x;
+    const int n_outer = blockIdx.y;
+    const int global_m_base = m_outer * OP_M;
+    const int global_n_base = n_outer * OP_N;
+    if (global_m_base >= M || global_n_base >= N) {
+      return;
+    }
+
+    const fp8 *A = static_cast<const fp8 *>(A_data) + global_m_base * K;
+    const fp8 *B = static_cast<const fp8 *>(B_data) + global_n_base * K;
+    __half *C =
+        static_cast<__half *>(C_data) + global_m_base * N + global_n_base;
+
+    __shared__ fp8 A_shared[A_TILE_BYTES];
+    __shared__ fp8 B_shared[B_TILE_BYTES];
+
+    // Zero-initialize A's padded slots (rows 8-15) once at start.
+    // In scatter-gather layout, padded rows occupy specific slot positions.
+    // Rows 8-15 use slots 8-15 (for K-groups 0,2) and slots 24-31 (for K-groups 1,3).
+    //
+    // For simplicity, zero the entire A_shared buffer since only valid rows
+    // will be overwritten by producers. This is safe and simple.
+    for (int i = lane_id * 4; i < A_TILE_BYTES; i += WARP_SIZE * 4) {
+      *reinterpret_cast<int *>(A_shared + i) = 0;
+    }
+    __syncthreads();
+
+    const int K_outer = ceil_div(K, WARPTILE_K);
+
+    // Accumulator: 4 f32 values per lane (MFMA output layout)
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+    // =========================================================================
+    // Producer layout for A (OP_M=8 valid rows, WARPTILE_K columns)
+    //
+    // Thread assignment: 64 threads, each loads 16 bytes per iteration
+    //   a_row = lane_id / 8 (0-7)
+    //   a_k_chunk = lane_id % 8 (0-7, each covering 16 bytes of K)
+    //
+    // Each thread's 16 bytes spans 2 K-groups (16 bytes = 2 × 8 bytes per K-group)
+    // =========================================================================
+    constexpr int A_THREADS_PER_ROW = 8;
+    constexpr int A_BYTES_PER_THREAD = 16;
+    const int a_row = lane_id / A_THREADS_PER_ROW;
+    const int a_k_chunk = lane_id % A_THREADS_PER_ROW;
+
+    // Global memory source pointer for A
+    const fp8 *a_src = A + a_row * K + a_k_chunk * A_BYTES_PER_THREAD;
+
+    // =========================================================================
+    // Producer layout for B (OP_N=16 rows, WARPTILE_K columns)
+    //
+    // Thread assignment:
+    //   b_row = lane_id / 4 (0-15)
+    //   b_k_chunk = lane_id % 4 (0-3, each covering 16 bytes of K)
+    // =========================================================================
+    constexpr int B_THREADS_PER_ROW = 4;
+    constexpr int B_BYTES_PER_THREAD = 16;
+    const int b_row = lane_id / B_THREADS_PER_ROW;
+    const int b_k_chunk = lane_id % B_THREADS_PER_ROW;
+
+    const fp8 *b_src = B + b_row * K + b_k_chunk * B_BYTES_PER_THREAD;
+
+    // =========================================================================
+    // Consumer layout for MFMA 16x16x32 with scatter-gather
+    //
+    // MFMA lane mapping: A[i,k] in item (k % 8) of lane (i + 16 * (k / 8))
+    //   cons_row = lane_id % 16 (0-15)
+    //   cons_k_group = lane_id / 16 (0-3, which 8-element K group)
+    //
+    // Scatter-gather slot assignment (for 2-way bank conflicts):
+    //   slot = cons_row + (cons_k_group % 2) * 16  (0-31)
+    //
+    // This spreads 64 lanes across 32 bank slots:
+    //   K-group 0 (lanes 0-15):  slots 0-15  → banks 0-15
+    //   K-group 1 (lanes 16-31): slots 16-31 → banks 16-31
+    //   K-group 2 (lanes 32-47): slots 0-15  → banks 0-15 (different op region)
+    //   K-group 3 (lanes 48-63): slots 16-31 → banks 16-31 (different op region)
+    // =========================================================================
+    const int cons_row = lane_id % MFMA_M;       // 0-15
+    const int cons_k_group = lane_id / MFMA_M;   // 0-3
+
+    // Interleaved slot for 2-way conflicts
+    const int slot = cons_row + (cons_k_group % 2) * 16;
+    const int k_pair_offset = (cons_k_group / 2) * 256;  // 0 for K-groups 0-1, 256 for K-groups 2-3
+
+    // Temporary registers for loading
+    fp8_4 a_reg[2][4];  // 2 loads × 16 bytes each
+    fp8_4 b_reg[4][4];  // 4 loads × 16 bytes each
+
+    for (int k_block = 0; k_block < K_outer; ++k_block) {
+      const fp8 *a_src_k = a_src + k_block * WARPTILE_K;
+      const fp8 *b_src_k = b_src + k_block * WARPTILE_K;
+
+      // Load A tile (2 loads for WARPTILE_K=256)
+      asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
+                   "global_load_dwordx4 %1, %2, off offset:128\n\t"
+                   : "=v"(a_reg[0]), "=v"(a_reg[1])
+                   : "v"(a_src_k));
+
+      // Load B tile (4 loads for WARPTILE_K=256)
+      asm volatile("global_load_dwordx4 %0, %4, off offset:0  \n\t"
+                   "global_load_dwordx4 %1, %4, off offset:64 \n\t"
+                   "global_load_dwordx4 %2, %4, off offset:128\n\t"
+                   "global_load_dwordx4 %3, %4, off offset:192\n\t"
+                   : "=v"(b_reg[0]), "=v"(b_reg[1]), "=v"(b_reg[2]),
+                     "=v"(b_reg[3])
+                   : "v"(b_src_k));
+
+      asm volatile("s_waitcnt vmcnt(0)");
+
+      // =====================================================================
+      // Store A to LDS with scatter-gather layout
+      //
+      // Each thread's 16 bytes (from a_k_chunk position) spans 2 K-groups.
+      // K position range: [a_k_chunk * 16 .. a_k_chunk * 16 + 15]
+      //
+      // For OPS=8, WARPTILE_K=256, OP_K=32:
+      //   a_k_chunk=0: K[0..15]   -> K-groups 0-1 within op 0
+      //   a_k_chunk=1: K[16..31]  -> K-groups 2-3 within op 0
+      //   a_k_chunk=2: K[32..47]  -> K-groups 0-1 within op 1
+      //   ...
+      //
+      // Within each 16-byte load:
+      //   Bytes 0-7:  First K-group (8 elements)
+      //   Bytes 8-15: Second K-group (8 elements)
+      //
+      // Scatter pattern for each 8-byte group:
+      //   4 bytes to slot * E_PER_BANK
+      //   4 bytes to slot * E_PER_BANK + 64 (128 bytes apart in bank terms)
+      // =====================================================================
+
+      // Process both loads (0 and 128 offset)
+#pragma unroll
+      for (int load = 0; load < 2; ++load) {
+        // K offset for this load within WARPTILE_K
+        int k_offset = a_k_chunk * A_BYTES_PER_THREAD + load * 128;
+
+        // Which op does this K range belong to?
+        // op = k_offset / OP_K
+        // k_within_op = k_offset % OP_K
+        int op = k_offset / OP_K;
+        int k_within_op = k_offset % OP_K;
+
+        // Which K-group within the op?
+        int k_group_base = k_within_op / 8;  // 0-3
+
+        // Determine slots for the two K-groups in this 16-byte load
+        // K-group 0,2 -> slot = a_row
+        // K-group 1,3 -> slot = a_row + 16
+        int slot0 = a_row + (k_group_base % 2) * 16;
+        int slot1 = a_row + ((k_group_base + 1) % 2) * 16;
+
+        // K-pair offset within the op's 512 bytes
+        int k_pair0 = (k_group_base / 2) * 256;
+        int k_pair1 = ((k_group_base + 1) / 2) * 256;
+
+        // Base address in LDS for this op
+        fp8 *op_base = A_shared + op * BYTES_PER_OP;
+
+        // Destination pointers for the two K-groups
+        fp8 *a_dst0 = op_base + slot0 * E_PER_BANK + k_pair0;
+        fp8 *a_dst1 = op_base + slot1 * E_PER_BANK + k_pair1;
+
+        // Get bytes from the loaded register
+        const fp8 *a_bytes = reinterpret_cast<const fp8 *>(&a_reg[load][0]);
+
+        // Scatter first 8 bytes (K-group k_group_base)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          a_dst0[i] = a_bytes[i];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          a_dst0[64 + i] = a_bytes[4 + i];
+        }
+
+        // Scatter second 8 bytes (K-group k_group_base + 1)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          a_dst1[i] = a_bytes[8 + i];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          a_dst1[64 + i] = a_bytes[12 + i];
+        }
+      }
+
+      // =====================================================================
+      // Store B to LDS with scatter-gather layout (same pattern as A)
+      // =====================================================================
+#pragma unroll
+      for (int load = 0; load < 4; ++load) {
+        int k_offset = b_k_chunk * B_BYTES_PER_THREAD + load * 64;
+        int op = k_offset / OP_K;
+        int k_within_op = k_offset % OP_K;
+        int k_group_base = k_within_op / 8;
+
+        int slot0 = b_row + (k_group_base % 2) * 16;
+        int slot1 = b_row + ((k_group_base + 1) % 2) * 16;
+
+        int k_pair0 = (k_group_base / 2) * 256;
+        int k_pair1 = ((k_group_base + 1) / 2) * 256;
+
+        fp8 *op_base = B_shared + op * BYTES_PER_OP;
+        fp8 *b_dst0 = op_base + slot0 * E_PER_BANK + k_pair0;
+        fp8 *b_dst1 = op_base + slot1 * E_PER_BANK + k_pair1;
+
+        const fp8 *b_bytes = reinterpret_cast<const fp8 *>(&b_reg[load][0]);
+
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          b_dst0[i] = b_bytes[i];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          b_dst0[64 + i] = b_bytes[4 + i];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          b_dst1[i] = b_bytes[8 + i];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          b_dst1[64 + i] = b_bytes[12 + i];
+        }
+      }
+
+      __syncthreads();
+
+      // =====================================================================
+      // MFMA consumption: OPS ops per K block
+      // Each op: 16x16x32 matrix multiply
+      //
+      // Consumer scatter-gather read: 8 bytes as 2 × 4-byte gathers
+      // =====================================================================
+#pragma unroll
+      for (int op = 0; op < OPS; ++op) {
+        // A consumer base for this op
+        fp8 *a_op_base = A_shared + op * BYTES_PER_OP + slot * E_PER_BANK + k_pair_offset;
+
+        // Scatter-gather read: 8 bytes from 2 locations 64 bytes apart
+        fp8x8 a_cons;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          a_cons[i] = a_op_base[i];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          a_cons[4 + i] = a_op_base[64 + i];
+        }
+
+        // B consumer base for this op (same layout as A)
+        fp8 *b_op_base = B_shared + op * BYTES_PER_OP + slot * E_PER_BANK + k_pair_offset;
+
+        fp8x8 b_cons;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          b_cons[i] = b_op_base[i];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          b_cons[4 + i] = b_op_base[64 + i];
+        }
+
+        // Call dense MFMA
+        acc = __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(
+            reinterpret_cast<long>(a_cons), reinterpret_cast<long>(b_cons), acc,
+            0, 0, 0);
+      }
+
+      __syncthreads();
+    }
+
+    // Output: Only lanes 0-31 write valid results (rows 0-7)
+    // MFMA output layout: ci = 4 * (lane_id / 16) + gpr, cj = lane_id % 16
+    if (lane_id < 32) {
+      const int out_row_base = (lane_id / 16) * 4;
+      const int out_col = lane_id % 16;
+      __half *c_ptr = C + out_row_base * N + out_col;
+
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        if (out_row_base + r < OP_M) {
+          c_ptr[r * N] = __float2half(acc[r]);
+        }
+      }
+    }
+  }
+};
+
+// ============================================================================
 // Layout Tests (GPU Micro-Kernels)
 // ============================================================================
 namespace layout_gpu_tests {
@@ -1438,5 +1789,6 @@ int main() {
 
   test(SparseTrickFP8Kernel<8, 16, 4>{});
   test(PaddingFP8Kernel<8, 16, 8>{});
+  test(PaddingFP8KernelWithSwizzle<8, 16, 8>{});
   return 0;
 }
