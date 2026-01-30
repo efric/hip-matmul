@@ -1070,8 +1070,13 @@ struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
     const int cons_row = lane_id % MFMA_M;       // 0-15
     const int cons_k_group = lane_id / MFMA_M;   // 0-3
 
-    // Interleaved slot for 2-way conflicts
-    const int slot = cons_row + (cons_k_group % 2) * 16;
+    // Region-based addressing for correct data placement
+    // Layout per op (512 bytes):
+    //   K-group 0: k_pair_offset=0,   k_odd=0 -> offset = 0 + 0 + row*4
+    //   K-group 1: k_pair_offset=0,   k_odd=1 -> offset = 0 + 128 + row*4
+    //   K-group 2: k_pair_offset=256, k_odd=0 -> offset = 256 + 0 + row*4
+    //   K-group 3: k_pair_offset=256, k_odd=1 -> offset = 256 + 128 + row*4
+    const int k_odd = cons_k_group % 2;          // 0 or 1
     const int k_pair_offset = (cons_k_group / 2) * 256;  // 0 for K-groups 0-1, 256 for K-groups 2-3
 
     // Temporary registers for loading
@@ -1116,8 +1121,8 @@ struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
       //   Bytes 8-15: Second K-group (8 elements)
       //
       // Scatter pattern for each 8-byte group:
-      //   4 bytes to slot * E_PER_BANK
-      //   4 bytes to slot * E_PER_BANK + 64 (128 bytes apart in bank terms)
+      //   4 bytes to base + row * E_PER_BANK
+      //   4 bytes to base + row * E_PER_BANK + 64
       // =====================================================================
 
       // Process both loads (0 and 128 offset)
@@ -1135,11 +1140,11 @@ struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
         // Which K-group within the op?
         int k_group_base = k_within_op / 8;  // 0-3
 
-        // Determine slots for the two K-groups in this 16-byte load
-        // K-group 0,2 -> slot = a_row
-        // K-group 1,3 -> slot = a_row + 16
-        int slot0 = a_row + (k_group_base % 2) * 16;
-        int slot1 = a_row + ((k_group_base + 1) % 2) * 16;
+        // Region-based addressing for the two K-groups in this 16-byte load
+        // K-group 0,2 -> k_odd=0 (offset 0 within 128-byte sub-region)
+        // K-group 1,3 -> k_odd=1 (offset 128 within 256-byte k_pair region)
+        int k_odd0 = k_group_base % 2;
+        int k_odd1 = (k_group_base + 1) % 2;
 
         // K-pair offset within the op's 512 bytes
         int k_pair0 = (k_group_base / 2) * 256;
@@ -1148,9 +1153,9 @@ struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
         // Base address in LDS for this op
         fp8 *op_base = A_shared + op * BYTES_PER_OP;
 
-        // Destination pointers for the two K-groups
-        fp8 *a_dst0 = op_base + slot0 * E_PER_BANK + k_pair0;
-        fp8 *a_dst1 = op_base + slot1 * E_PER_BANK + k_pair1;
+        // Destination pointers for the two K-groups (region-based addressing)
+        fp8 *a_dst0 = op_base + k_pair0 + k_odd0 * 128 + a_row * E_PER_BANK;
+        fp8 *a_dst1 = op_base + k_pair1 + k_odd1 * 128 + a_row * E_PER_BANK;
 
         // Get bytes from the loaded register
         const fp8 *a_bytes = reinterpret_cast<const fp8 *>(&a_reg[load][0]);
@@ -1186,15 +1191,15 @@ struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
         int k_within_op = k_offset % OP_K;
         int k_group_base = k_within_op / 8;
 
-        int slot0 = b_row + (k_group_base % 2) * 16;
-        int slot1 = b_row + ((k_group_base + 1) % 2) * 16;
+        int k_odd0 = k_group_base % 2;
+        int k_odd1 = (k_group_base + 1) % 2;
 
         int k_pair0 = (k_group_base / 2) * 256;
         int k_pair1 = ((k_group_base + 1) / 2) * 256;
 
         fp8 *op_base = B_shared + op * BYTES_PER_OP;
-        fp8 *b_dst0 = op_base + slot0 * E_PER_BANK + k_pair0;
-        fp8 *b_dst1 = op_base + slot1 * E_PER_BANK + k_pair1;
+        fp8 *b_dst0 = op_base + k_pair0 + k_odd0 * 128 + b_row * E_PER_BANK;
+        fp8 *b_dst1 = op_base + k_pair1 + k_odd1 * 128 + b_row * E_PER_BANK;
 
         const fp8 *b_bytes = reinterpret_cast<const fp8 *>(&b_reg[load][0]);
 
@@ -1226,8 +1231,8 @@ struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
       // =====================================================================
 #pragma unroll
       for (int op = 0; op < OPS; ++op) {
-        // A consumer base for this op
-        fp8 *a_op_base = A_shared + op * BYTES_PER_OP + slot * E_PER_BANK + k_pair_offset;
+        // A consumer base for this op (region-based addressing)
+        fp8 *a_op_base = A_shared + op * BYTES_PER_OP + k_pair_offset + k_odd * 128 + cons_row * E_PER_BANK;
 
         // Scatter-gather read: 8 bytes from 2 locations 64 bytes apart
         fp8x8 a_cons;
@@ -1240,8 +1245,8 @@ struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
           a_cons[4 + i] = a_op_base[64 + i];
         }
 
-        // B consumer base for this op (same layout as A)
-        fp8 *b_op_base = B_shared + op * BYTES_PER_OP + slot * E_PER_BANK + k_pair_offset;
+        // B consumer base for this op (same layout as A, region-based addressing)
+        fp8 *b_op_base = B_shared + op * BYTES_PER_OP + k_pair_offset + k_odd * 128 + cons_row * E_PER_BANK;
 
         fp8x8 b_cons;
 #pragma unroll
