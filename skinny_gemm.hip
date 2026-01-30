@@ -963,6 +963,8 @@ template <int OP_M, int OP_N, int OPS> void test_lds_roundtrip_gpu() {
   constexpr int NUM_THREADS = WARP_SIZE;
   constexpr int INPUT_BYTES = A_TILE_BYTES;
   constexpr int OUTPUT_BYTES = NUM_THREADS * 8 * OPS;
+  constexpr int HALF_TILE_K = 128; // Each load covers 128 K elements
+  constexpr int NUM_HALF_TILES = WARPTILE_K / HALF_TILE_K;
 
   // Generate input with lane-strided layout matching kernel load pattern.
   //
