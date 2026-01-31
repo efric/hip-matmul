@@ -1373,6 +1373,321 @@ struct PaddingFP8KernelWithSwizzle : SkinnyGemmKernel {
 };
 
 // ============================================================================
+// PaddingFP8KernelMatchingBLayout: Dense MFMA with SparseTrickFP8Kernel B layout
+// ============================================================================
+// This kernel uses the exact LDS layout of SparseTrickFP8Kernel's B tile for
+// the A operand, adapted for 8-byte reads required by dense MFMA 16x16x32.
+//
+// Key insight: SparseTrickFP8Kernel's B tile uses 128-byte scatter intervals:
+//   - Producer stores 16 bytes as 4 × 4-byte chunks at 0, 128, 256, 384 offsets
+//   - Consumer reads 16 bytes as 4 × 4-byte gathers at 128-byte intervals
+//
+// For dense MFMA 16x16x32, each lane needs only 8 bytes (not 16), so we read
+// 2 × 4-byte chunks at 128-byte intervals, extracting the correct K elements.
+//
+// LDS Layout per op (512 bytes total = 16 rows × 32 K):
+//   Each row occupies 4 bytes in each of 4 "lines" at 128-byte intervals.
+//   K[0:3]   at line 0 (offset 0)
+//   K[4:7]   at line 1 (offset 128)
+//   K[8:11]  at line 2 (offset 256)
+//   K[12:15] at line 3 (offset 384)
+//
+//   K[16:19] at line 0 + col_offset 64
+//   K[20:23] at line 1 + col_offset 64
+//   K[24:27] at line 2 + col_offset 64
+//   K[28:31] at line 3 + col_offset 64
+//
+// Consumer lane-to-K-group mapping for MFMA 16x16x32:
+//   K-group 0 (lanes 0-15):  needs K[0:7]   -> lines 0,1 at col_offset 0
+//   K-group 1 (lanes 16-31): needs K[8:15]  -> lines 2,3 at col_offset 0
+//   K-group 2 (lanes 32-47): needs K[16:23] -> lines 0,1 at col_offset 64
+//   K-group 3 (lanes 48-63): needs K[24:31] -> lines 2,3 at col_offset 64
+// ============================================================================
+
+template <int OP_M, int OP_N, int OPS>
+struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
+  static_assert(OP_M == 8, "PaddingFP8KernelMatchingBLayout only supports OP_M=8");
+  static_assert(OP_N == 16, "PaddingFP8KernelMatchingBLayout only supports OP_N=16");
+  static_assert(OPS >= 4, "OPS must be >= 4 for this layout");
+
+  // Dense MFMA parameters
+  static constexpr int OP_K = 32;       // Fixed for MFMA 16x16x32
+  static constexpr int MFMA_M = 16;     // Padded row count
+  static constexpr int WARPTILE_K = OP_K * OPS;
+
+  // Thread layout: 4 threads per row (matching SparseTrickFP8Kernel B)
+  static constexpr int THREADS_PER_ROW = 4;
+  static constexpr int E_PER_THREAD = 16;
+  static constexpr int E_PER_BANK = 4;
+
+  // LDS bytes per op (16 rows × 32 K = 512 bytes)
+  static constexpr int BYTES_PER_OP = 512;
+
+  // Load counts: each 64-thread wavefront covers 16 rows × 64 K per load
+  // For WARPTILE_K / 64 loads needed (OPS=4: 2 loads, OPS=8: 4 loads)
+  static constexpr int A_LOADS = (WARPTILE_K + 63) / 64;  // Ceiling division
+  static constexpr int B_LOADS = OPS / 2;  // Each load covers 64 K elements
+
+  PaddingFP8KernelMatchingBLayout() {
+    name = __FUNCTION__;
+    A_type = Type::FP8;
+    B_type = Type::FP8;
+    C_type = Type::FP16;
+    M_tile = OP_M;
+    N_tile = OP_N;
+    K_tile = WARPTILE_K;
+    num_threads_func = [](const ProblemProperties &) { return WARP_SIZE; };
+    gemm_func = run;
+  }
+
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int M, int N, int K) {
+    // LDS layout: SparseTrickFP8Kernel B-style for A, row-major for B
+    // A: BYTES_PER_OP * OPS bytes (512 * OPS)
+    // B: OP_N * WARPTILE_K bytes (row-major, simple)
+    constexpr int A_TILE_BYTES = BYTES_PER_OP * OPS;
+    constexpr int B_TILE_BYTES = OP_N * WARPTILE_K;
+
+    const int lane_id = threadIdx.x & (warpSize - 1);
+    const int m_outer = blockIdx.x;
+    const int n_outer = blockIdx.y;
+    const int global_m_base = m_outer * OP_M;
+    const int global_n_base = n_outer * OP_N;
+    if (global_m_base >= M || global_n_base >= N) {
+      return;
+    }
+
+    const fp8 *A = static_cast<const fp8 *>(A_data) + global_m_base * K;
+    const fp8 *B = static_cast<const fp8 *>(B_data) + global_n_base * K;
+    __half *C =
+        static_cast<__half *>(C_data) + global_m_base * N + global_n_base;
+
+    __shared__ fp8 A_shared[A_TILE_BYTES];
+    __shared__ fp8 B_shared[B_TILE_BYTES];
+
+    // Zero-initialize A_shared (padded rows 8-15 stay zero)
+    for (int i = lane_id * 4; i < A_TILE_BYTES; i += WARP_SIZE * 4) {
+      *reinterpret_cast<int *>(A_shared + i) = 0;
+    }
+    __syncthreads();
+
+    const int K_outer = ceil_div(K, WARPTILE_K);
+
+    // Accumulator: 4 f32 values per lane (MFMA output layout)
+    f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+
+    // =========================================================================
+    // Producer layout for A (OP_M=8 valid rows, padded to MFMA_M=16)
+    //
+    // Thread layout: 4 threads/row × 16 rows = 64 threads (matching B's layout)
+    //   prod_row = lane_id / 4 (0-15, rows 8-15 are padded)
+    //   prod_k_chunk = (lane_id % 4) * 16 (K: 0, 16, 32, 48)
+    //
+    // Each load covers 64 K elements (16 rows × 64 K = 1024 bytes / 16 = 64 threads)
+    // =========================================================================
+    const int prod_row = lane_id / THREADS_PER_ROW;   // 0-15
+    const int prod_k_chunk = (lane_id % THREADS_PER_ROW) * E_PER_THREAD;  // 0, 16, 32, 48
+
+    // Global memory source pointer for A (only valid for rows 0-7)
+    // Rows 8-15 will simply skip their stores
+    const fp8 *a_src = (prod_row < OP_M) ? (A + prod_row * K + prod_k_chunk) : nullptr;
+
+    // =========================================================================
+    // Producer layout for B (OP_N=16 rows, WARPTILE_K columns) - Row-major
+    //
+    // Thread assignment: 4 threads/row × 16 rows = 64 threads
+    //   b_row = lane_id / 4 (0-15)
+    //   b_k_chunk = lane_id % 4 (0-3, each covering 16 bytes of K)
+    // =========================================================================
+    const int b_row = lane_id / THREADS_PER_ROW;
+    const int b_k_chunk = lane_id % THREADS_PER_ROW;
+    const int b_k_offset = b_k_chunk * E_PER_THREAD;
+
+    const fp8 *b_src = B + b_row * K + b_k_offset;
+    fp8 *b_dst = B_shared + b_row * WARPTILE_K + b_k_offset;
+
+    // =========================================================================
+    // Consumer layout for MFMA 16x16x32 with SparseTrickFP8Kernel B-style layout
+    //
+    // MFMA lane mapping: A[i,k] in item (k % 8) of lane (i + 16 * (k / 8))
+    //   cons_row = lane_id % 16 (0-15)
+    //   cons_k_group = lane_id / 16 (0-3, which 8-element K group)
+    //
+    // Consumer offset computation (from plan):
+    //   k_col_offset = (cons_k_group / 2) * 64    // 0 for K-groups 0-1, 64 for K-groups 2-3
+    //   k_line_offset = (cons_k_group % 2) * 256  // 0 for K-groups 0,2; 256 for K-groups 1,3
+    //   base = op * 512 + cons_row * 4 + k_col_offset + k_line_offset
+    //   Read 2 × 4 bytes at base and base + 128
+    // =========================================================================
+    const int cons_row = lane_id % MFMA_M;       // 0-15
+    const int cons_k_group = lane_id / MFMA_M;   // 0-3
+
+    // Pre-compute consumer offsets
+    const int k_col_offset = (cons_k_group / 2) * 64;    // 0 or 64
+    const int k_line_offset = (cons_k_group % 2) * 256;  // 0 or 256
+
+    // B consumer (row-major): simple contiguous access
+    const int b_cons_row = cons_row;  // 0-15
+    const int b_cons_k_base = cons_k_group * 8;  // 0, 8, 16, 24
+
+    // Temporary registers for loading
+    fp8_4 a_reg[A_LOADS][E_PER_THREAD / 4];
+    fp8_4 b_reg[B_LOADS][E_PER_THREAD / 4];
+
+    for (int k_block = 0; k_block < K_outer; ++k_block) {
+      const fp8 *a_src_k = a_src ? (a_src + k_block * WARPTILE_K) : nullptr;
+      const fp8 *b_src_k = b_src + k_block * WARPTILE_K;
+
+      // Load A tile (A_LOADS loads at 64-byte intervals for each thread)
+      // Each load covers one 16×64 chunk (threads collectively load 64 K elements)
+      if (a_src_k) {
+        if constexpr (OPS == 4) {
+          asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
+                       "global_load_dwordx4 %1, %2, off offset:64 \n\t"
+                       : "=v"(a_reg[0]), "=v"(a_reg[1])
+                       : "v"(a_src_k));
+        } else if constexpr (OPS == 8) {
+          asm volatile("global_load_dwordx4 %0, %4, off offset:0   \n\t"
+                       "global_load_dwordx4 %1, %4, off offset:64  \n\t"
+                       "global_load_dwordx4 %2, %4, off offset:128 \n\t"
+                       "global_load_dwordx4 %3, %4, off offset:192 \n\t"
+                       : "=v"(a_reg[0]), "=v"(a_reg[1]), "=v"(a_reg[2]),
+                         "=v"(a_reg[3])
+                       : "v"(a_src_k));
+        }
+      }
+
+      // Load B tile (B_LOADS loads at 64-byte intervals)
+      if constexpr (OPS == 4) {
+        asm volatile("global_load_dwordx4 %0, %2, off offset:0  \n\t"
+                     "global_load_dwordx4 %1, %2, off offset:64 \n\t"
+                     : "=v"(b_reg[0]), "=v"(b_reg[1])
+                     : "v"(b_src_k));
+      } else if constexpr (OPS == 8) {
+        asm volatile("global_load_dwordx4 %0, %4, off offset:0   \n\t"
+                     "global_load_dwordx4 %1, %4, off offset:64  \n\t"
+                     "global_load_dwordx4 %2, %4, off offset:128 \n\t"
+                     "global_load_dwordx4 %3, %4, off offset:192 \n\t"
+                     : "=v"(b_reg[0]), "=v"(b_reg[1]), "=v"(b_reg[2]),
+                       "=v"(b_reg[3])
+                     : "v"(b_src_k));
+      }
+
+      asm volatile("s_waitcnt vmcnt(0)");
+
+      // =====================================================================
+      // Store A to LDS with SparseTrickFP8Kernel B-style scatter layout
+      //
+      // Each thread stores 16 bytes as 4 × 4-byte chunks at 128-byte intervals.
+      // Formula (from SparseTrickFP8Kernel B producer):
+      //   buffer = op_base + prod_row * 4
+      //   buffer += (k_within_op >= 16) ? 64 : 0   (K chunk column offset)
+      //   Store bytes[0:3] at buffer + 0
+      //   Store bytes[4:7] at buffer + 128
+      //   Store bytes[8:11] at buffer + 256
+      //   Store bytes[12:15] at buffer + 384
+      // =====================================================================
+      if (prod_row < OP_M) {  // Only valid rows store
+#pragma unroll
+        for (int load = 0; load < A_LOADS; ++load) {
+          // K offset for this load
+          int k_offset = prod_k_chunk + load * 64;
+
+          // Which op and K position within op
+          int op = k_offset / OP_K;
+          int k_within_op = k_offset % OP_K;
+
+          // Column offset: 0 for K[0:15], 64 for K[16:31]
+          int col_offset = (k_within_op >= 16) ? 64 : 0;
+
+          // Base address in LDS
+          fp8 *a_buf = A_shared + op * BYTES_PER_OP + prod_row * E_PER_BANK + col_offset;
+
+          // Get bytes from loaded register
+          const fp8 *a_bytes = reinterpret_cast<const fp8 *>(&a_reg[load][0]);
+
+          // Store 4 × 4 bytes at 128-byte intervals
+#pragma unroll
+          for (int line = 0; line < 4; ++line) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              a_buf[line * 128 + i] = a_bytes[line * 4 + i];
+            }
+          }
+        }
+      }
+
+      // Store B to LDS (row-major, simple layout)
+#pragma unroll
+      for (int load = 0; load < B_LOADS; ++load) {
+        fp8 *b_store = b_dst + load * 64;
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+          reinterpret_cast<fp8_4 *>(b_store)[d] = b_reg[load][d];
+        }
+      }
+
+      __syncthreads();
+
+      // =====================================================================
+      // MFMA consumption: OPS ops per K block
+      //
+      // A consumer: scatter-gather read matching SparseTrickFP8Kernel B layout
+      // B consumer: simple row-major read
+      // =====================================================================
+#pragma unroll
+      for (int op = 0; op < OPS; ++op) {
+        // A consumer base with SparseTrickFP8Kernel B-style addressing
+        // base = op * 512 + cons_row * 4 + k_col_offset + k_line_offset
+        fp8 *a_op_base = A_shared + op * BYTES_PER_OP + cons_row * E_PER_BANK +
+                         k_col_offset + k_line_offset;
+
+        // Scatter-gather read: 8 bytes from 2 locations 128 bytes apart
+        fp8x8 a_cons;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          a_cons[i] = a_op_base[i];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          a_cons[4 + i] = a_op_base[128 + i];
+        }
+
+        // B consumer (row-major): contiguous 8-byte read
+        fp8 *b_op = B_shared + b_cons_row * WARPTILE_K + op * OP_K + b_cons_k_base;
+        fp8x8 b_cons;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          b_cons[i] = b_op[i];
+        }
+
+        // Call dense MFMA
+        acc = __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(
+            reinterpret_cast<long>(a_cons), reinterpret_cast<long>(b_cons), acc,
+            0, 0, 0);
+      }
+
+      __syncthreads();
+    }
+
+    // Output: Only lanes 0-31 write valid results (rows 0-7)
+    // MFMA output layout: ci = 4 * (lane_id / 16) + gpr, cj = lane_id % 16
+    if (lane_id < 32) {
+      const int out_row_base = (lane_id / 16) * 4;
+      const int out_col = lane_id % 16;
+      __half *c_ptr = C + out_row_base * N + out_col;
+
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        if (out_row_base + r < OP_M) {
+          c_ptr[r * N] = __float2half(acc[r]);
+        }
+      }
+    }
+  }
+};
+
+// ============================================================================
 // Layout Tests (GPU Micro-Kernels)
 // ============================================================================
 namespace layout_gpu_tests {
@@ -1888,5 +2203,7 @@ int main() {
   test(PaddingFP8Kernel<8, 16, 8>{});
   test(PaddingFP8KernelWithSwizzle<8, 16, 4>{});
   test(PaddingFP8KernelWithSwizzle<8, 16, 8>{});
+  test(PaddingFP8KernelMatchingBLayout<8, 16, 4>{});
+  test(PaddingFP8KernelMatchingBLayout<8, 16, 8>{});
   return 0;
 }
