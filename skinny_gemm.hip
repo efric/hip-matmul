@@ -1523,7 +1523,6 @@ struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
     const int b_k_offset = b_k_chunk * E_PER_THREAD;
 
     const fp8 *b_src = B + b_row * K + b_k_offset;
-    fp8 *b_dst = B_shared + b_row * WARPTILE_K + b_k_offset;
 
     // =========================================================================
     // Consumer layout for MFMA 16x16x32 with SparseTrickFP8Kernel B-style layout
@@ -1545,9 +1544,7 @@ struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
     const int k_col_offset = (cons_k_group / 2) * 64;    // 0 or 64
     const int k_line_offset = (cons_k_group % 2) * 256;  // 0 or 256
 
-    // B consumer (row-major): simple contiguous access
-    const int b_cons_row = cons_row;  // 0-15
-    const int b_cons_k_base = cons_k_group * 8;  // 0, 8, 16, 24
+    // B consumer uses identical scatter-gather pattern as A (cons_row, k_col_offset, k_line_offset)
 
     // Temporary registers for loading
     fp8_4 a_reg[A_LOADS][E_PER_THREAD / 4];
@@ -1634,13 +1631,30 @@ struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
         }
       }
 
-      // Store B to LDS (row-major, simple layout)
+      // Store B to LDS with scatter layout (matching A and SparseTrickFP8Kernel B)
 #pragma unroll
       for (int load = 0; load < B_LOADS; ++load) {
-        fp8 *b_store = b_dst + load * 64;
+        // K offset for this load
+        int k_offset = b_k_offset + load * 64;
+
+        // Which op (512-byte region) and K position within op
+        int op = k_offset / OP_K;
+        int k_within_op = k_offset % OP_K;
+
+        // Column offset: 0 for K[0:15], 64 for K[16:31]
+        int col_offset = (k_within_op >= 16) ? 64 : 0;
+
+        // Base address in LDS
+        fp8 *b_buf = B_shared + op * BYTES_PER_OP + b_row * E_PER_BANK + col_offset;
+
+        // Store 4 × 4 bytes at 128-byte intervals (matching A store)
+        const fp8 *b_bytes = reinterpret_cast<const fp8 *>(b_reg[load]);
 #pragma unroll
-        for (int d = 0; d < 4; ++d) {
-          reinterpret_cast<fp8_4 *>(b_store)[d] = b_reg[load][d];
+        for (int line = 0; line < 4; ++line) {
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            b_buf[line * 128 + i] = b_bytes[line * 4 + i];
+          }
         }
       }
 
@@ -1735,12 +1749,18 @@ struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
         }
 #endif
 
-        // B consumer (row-major): contiguous 8-byte read
-        fp8 *b_op = B_shared + b_cons_row * WARPTILE_K + op * OP_K + b_cons_k_base;
+        // B consumer: scatter-gather read (matching A and SparseTrickFP8Kernel B)
+        fp8 *b_op_base = B_shared + op * BYTES_PER_OP + cons_row * E_PER_BANK +
+                         k_col_offset + k_line_offset;
+
         fp8x8 b_cons;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          b_cons[i] = b_op[i];
+        for (int i = 0; i < 4; ++i) {
+          b_cons[i] = b_op_base[i];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          b_cons[4 + i] = b_op_base[128 + i];
         }
 
         // Call dense MFMA
