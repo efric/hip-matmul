@@ -1603,16 +1603,10 @@ struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
           // Base address in LDS
           fp8 *a_buf = A_shared + op * BYTES_PER_OP + prod_row * E_PER_BANK + col_offset;
 
-          // Get bytes from loaded register
-          const fp8 *a_bytes = reinterpret_cast<const fp8 *>(&a_reg[load][0]);
-
-          // Store 4 × 4 bytes at 128-byte intervals
+          // Store 4 × 4 bytes at 128-byte intervals (4-byte stores)
 #pragma unroll
           for (int line = 0; line < 4; ++line) {
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-              a_buf[line * 128 + i] = a_bytes[line * 4 + i];
-            }
+            *reinterpret_cast<fp8_4 *>(a_buf + line * 128) = a_reg[load][line];
           }
         }
       }
@@ -1642,16 +1636,10 @@ struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
         fp8 *a_op_base = A_shared + op * BYTES_PER_OP + cons_row * E_PER_BANK +
                          k_col_offset + k_line_offset;
 
-        // Scatter-gather read: 8 bytes from 2 locations 128 bytes apart
+        // Scatter-gather read: 8 bytes from 2 locations 128 bytes apart (4-byte reads)
         fp8x8 a_cons;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          a_cons[i] = a_op_base[i];
-        }
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          a_cons[4 + i] = a_op_base[128 + i];
-        }
+        *reinterpret_cast<fp8_4 *>(&a_cons[0]) = *reinterpret_cast<fp8_4 *>(a_op_base);
+        *reinterpret_cast<fp8_4 *>(&a_cons[4]) = *reinterpret_cast<fp8_4 *>(a_op_base + 128);
 
         // B consumer (row-major): contiguous 8-byte read
         fp8 *b_op = B_shared + b_cons_row * WARPTILE_K + op * OP_K + b_cons_k_base;
