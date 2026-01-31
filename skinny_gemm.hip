@@ -154,6 +154,18 @@ void checkSkinnyGemmResults(Type A_type, Type B_type, Type C_type,
   abort();
 }
 
+// Helper to create identity pattern for debugging.
+// A[row][k] = ((row & 0x7) << 5) | (k & 0x1F) - encodes row in bits 5-7, k in bits 0-4
+// B[n][k] = ((n & 0x7) << 5) | (k & 0x1F) - encodes n in bits 5-7, k in bits 0-4
+void makeIdentityBuffer(std::vector<std::byte> &buffer, int rows, int cols) {
+  for (int row = 0; row < rows; ++row) {
+    for (int col = 0; col < cols; ++col) {
+      uint8_t val = ((row & 0x7) << 5) | (col & 0x1F);
+      buffer[row * cols + col] = static_cast<std::byte>(val);
+    }
+  }
+}
+
 void check(const SkinnyGemmKernel &kernel, const ProblemProperties &problem) {
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
@@ -162,6 +174,13 @@ void check(const SkinnyGemmKernel &kernel, const ProblemProperties &problem) {
       makeRandomBuffer(kernel.B_type, flat_b_size(problem), random_engine);
   std::vector<std::byte> C_host_data =
       makeRandomBuffer(kernel.C_type, flat_c_size(problem), random_engine);
+
+#ifdef DEBUG_IDENTITY
+  // Override with identity pattern for tracing data flow
+  printf("DEBUG: Using identity pattern for A and B\n");
+  makeIdentityBuffer(A_host_data, problem.total.M, problem.total.K);
+  makeIdentityBuffer(B_host_data, problem.total.N, problem.total.K);
+#endif
 
   void *A_device_buffer = nullptr;
   void *B_device_buffer = nullptr;
@@ -1623,6 +1642,52 @@ struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
 
       __syncthreads();
 
+#ifdef DEBUG_LDS
+      // DEBUG: Dump A_shared layout after producer stores
+      if (k_block == 0 && lane_id == 0) {
+        printf("\n=== A_shared dump (first 512 bytes = op 0) ===\n");
+        printf("Layout: K[0:3]@0, K[4:7]@128, K[8:11]@256, K[12:15]@384\n");
+        printf("        K[16:19]@64, K[20:23]@192, K[24:27]@320, K[28:31]@448\n\n");
+
+        // Dump rows 0-7 showing the scatter pattern
+        for (int row = 0; row < 8; ++row) {
+          printf("Row %d:\n", row);
+          printf("  K[0:3]   @%3d: ", row * E_PER_BANK);
+          for (int i = 0; i < 4; ++i)
+            printf("%02x ", (uint8_t)A_shared[row * E_PER_BANK + i]);
+          printf("\n");
+          printf("  K[4:7]   @%3d: ", row * E_PER_BANK + 128);
+          for (int i = 0; i < 4; ++i)
+            printf("%02x ", (uint8_t)A_shared[row * E_PER_BANK + 128 + i]);
+          printf("\n");
+          printf("  K[8:11]  @%3d: ", row * E_PER_BANK + 256);
+          for (int i = 0; i < 4; ++i)
+            printf("%02x ", (uint8_t)A_shared[row * E_PER_BANK + 256 + i]);
+          printf("\n");
+          printf("  K[12:15] @%3d: ", row * E_PER_BANK + 384);
+          for (int i = 0; i < 4; ++i)
+            printf("%02x ", (uint8_t)A_shared[row * E_PER_BANK + 384 + i]);
+          printf("\n");
+          printf("  K[16:19] @%3d: ", row * E_PER_BANK + 64);
+          for (int i = 0; i < 4; ++i)
+            printf("%02x ", (uint8_t)A_shared[row * E_PER_BANK + 64 + i]);
+          printf("\n");
+          printf("  K[20:23] @%3d: ", row * E_PER_BANK + 192);
+          for (int i = 0; i < 4; ++i)
+            printf("%02x ", (uint8_t)A_shared[row * E_PER_BANK + 192 + i]);
+          printf("\n");
+          printf("  K[24:27] @%3d: ", row * E_PER_BANK + 320);
+          for (int i = 0; i < 4; ++i)
+            printf("%02x ", (uint8_t)A_shared[row * E_PER_BANK + 320 + i]);
+          printf("\n");
+          printf("  K[28:31] @%3d: ", row * E_PER_BANK + 448);
+          for (int i = 0; i < 4; ++i)
+            printf("%02x ", (uint8_t)A_shared[row * E_PER_BANK + 448 + i]);
+          printf("\n\n");
+        }
+      }
+#endif
+
       // =====================================================================
       // MFMA consumption: OPS ops per K block
       //
@@ -1640,6 +1705,25 @@ struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
         fp8x8 a_cons;
         *reinterpret_cast<fp8_4 *>(&a_cons[0]) = *reinterpret_cast<fp8_4 *>(a_op_base);
         *reinterpret_cast<fp8_4 *>(&a_cons[4]) = *reinterpret_cast<fp8_4 *>(a_op_base + 128);
+
+#ifdef DEBUG_CONSUMER
+        // DEBUG: Verify consumer reads correct K elements
+        if (k_block == 0 && op == 0) {
+          // Print for lanes 0, 16, 32, 48 (one per K-group, all row 0)
+          if (lane_id == 0 || lane_id == 16 || lane_id == 32 || lane_id == 48) {
+            int lds_offset = (int)(a_op_base - A_shared);
+            printf("Lane %2d (row=%d, k_group=%d, k_col=%d, k_line=%d): "
+                   "lds_offset=%d, a_cons = [",
+                   lane_id, cons_row, cons_k_group, k_col_offset, k_line_offset,
+                   lds_offset);
+            for (int i = 0; i < 8; ++i) {
+              printf("%02x", (uint8_t)a_cons[i]);
+              if (i < 7) printf(" ");
+            }
+            printf("] (expect K[%d:%d])\n", cons_k_group * 8, cons_k_group * 8 + 7);
+          }
+        }
+#endif
 
         // B consumer (row-major): contiguous 8-byte read
         fp8 *b_op = B_shared + b_cons_row * WARPTILE_K + op * OP_K + b_cons_k_base;
