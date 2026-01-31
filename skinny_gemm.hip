@@ -793,20 +793,9 @@ struct PaddingFP8Kernel : SkinnyGemmKernel {
     // Constants
     // =========================================================================
     constexpr int MFMA_K = 32;                  // Dense MFMA K dimension
-    constexpr int MFMA_M = 16;                  // Dense MFMA M dimension (padded)
-    constexpr int SMFMAC_K = 64;                // SparseTrick K per op (for reference)
+    constexpr int SMFMAC_K = 64;                // SparseTrick K per op (for comparison)
     constexpr int WARPTILE_K = SMFMAC_K * OPS;  // Same as SparseTrick: 128, 256, or 512
     constexpr int MFMA_OPS = WARPTILE_K / MFMA_K;  // 4, 8, or 16 internal MFMAs
-
-    // Tile sizes
-    // A: We load 8 rows from global, but need 16×32 per MFMA (rows 8-15 are zeros)
-    // B: We load 32×16 per MFMA (same as data requirements)
-    constexpr int A_TILE_BYTES = MFMA_M * WARPTILE_K;  // 16 × K (includes padding)
-    constexpr int B_TILE_BYTES = OP_N * WARPTILE_K;    // 16 × K
-
-    // Bytes per single MFMA operation
-    constexpr int A_MFMA_BYTES = MFMA_M * MFMA_K;  // 16 × 32 = 512 bytes
-    constexpr int B_MFMA_BYTES = OP_N * MFMA_K;    // 16 × 32 = 512 bytes
 
     const int lane_id = threadIdx.x & (warpSize - 1);
     const int m_outer = blockIdx.x;
@@ -822,36 +811,64 @@ struct PaddingFP8Kernel : SkinnyGemmKernel {
     __half *C = static_cast<__half *>(C_data) + global_m_base * N + global_n_base;
 
     // =========================================================================
-    // Shared memory layout (MFMA-native for simple consumer)
+    // Shared memory layout (MFMA-native, lane-sequential for bank conflict-free)
     // =========================================================================
-    // A_shared: 16 rows × WARPTILE_K columns
-    //   - Rows 0-7: actual data from global memory
-    //   - Rows 8-15: zeros (initialized once at kernel start)
-    //   - Layout per MFMA op: 64 lanes × 8 bytes = 512 bytes contiguous
+    // Layout: Each MFMA op gets 512 contiguous bytes, stored so that
+    // lane L reads its 8 bytes from offset (L * 8) within the op's region.
     //
-    // B_shared: 16 columns × WARPTILE_K rows (transposed for coalescing)
-    //   - Layout per MFMA op: 64 lanes × 8 bytes = 512 bytes contiguous
-    __shared__ fp8 A_shared[A_TILE_BYTES];
-    __shared__ fp8 B_shared[B_TILE_BYTES];
+    // A_shared: MFMA_OPS * 512 bytes
+    //   - Per MFMA op: lane L (0-63) reads offset [L*8 : L*8+8)
+    //   - Lane L needs row (L%16), K[(L/16)*8 : (L/16)*8+8)
+    //   - Rows 8-15 are zeros (padding), so lanes 8-15, 24-31, 40-47, 56-63
+    //     read zeros (initialized once at kernel start)
+    //
+    // B_shared: MFMA_OPS * 512 bytes (same layout pattern)
+    //
+    // Bank access: Lane L reads address L*8, accessing banks (L*8/4)%32 and
+    // (L*8/4+1)%32. With ds_read_b64, 32 lanes per phase give 2-way conflicts
+    // (optimal for 64-bit reads).
+    __shared__ fp8 A_shared[MFMA_OPS * 512];
+    __shared__ fp8 B_shared[MFMA_OPS * 512];
 
     // =========================================================================
-    // Initialize A padding rows (8-15) to zero - one-time setup
-    // Each lane zeroes 8 bytes at a time across all MFMA ops
+    // Initialize A padding lanes to zero - one-time setup
     // =========================================================================
+    // In lane-sequential layout, lanes 8-15, 24-31, 40-47, 56-63 correspond to
+    // rows 8-15 (padding rows). These need to be zeroed for all MFMA ops.
+    // That's 32 lane positions × 8 bytes × MFMA_OPS = 256 × MFMA_OPS bytes.
+    //
+    // We have 64 threads, each zeros (256 * MFMA_OPS / 64) = 4 * MFMA_OPS bytes.
     {
-      // Zero out rows 8-15 of A_shared for all K positions
-      // A_shared layout: row-major, so row r, col k is at offset r * WARPTILE_K + k
-      // Rows 8-15 span bytes [8 * WARPTILE_K, 16 * WARPTILE_K)
-      // That's 8 * WARPTILE_K bytes = 8 * 64 * OPS bytes
-      constexpr int PADDING_BYTES = 8 * WARPTILE_K;
-      constexpr int BYTES_PER_LANE = PADDING_BYTES / WARP_SIZE;
-      static_assert(PADDING_BYTES % WARP_SIZE == 0,
-                    "Padding bytes must be divisible by warp size");
+      // Padding lane indices within each MFMA op (lanes that read rows 8-15)
+      // These are: 8-15, 24-31, 40-47, 56-63 (32 lanes total per MFMA op)
+      constexpr int PADDING_LANES_PER_OP = 32;
+      constexpr int PADDING_BYTES_PER_OP = PADDING_LANES_PER_OP * 8;  // 256 bytes
+      constexpr int TOTAL_PADDING_BYTES = PADDING_BYTES_PER_OP * MFMA_OPS;
+      constexpr int BYTES_PER_THREAD = TOTAL_PADDING_BYTES / WARP_SIZE;
+      static_assert(TOTAL_PADDING_BYTES % WARP_SIZE == 0,
+                    "Total padding bytes must be divisible by warp size");
 
-      fp8 *pad_base = A_shared + 8 * WARPTILE_K;
+      // Each thread zeros BYTES_PER_THREAD contiguous bytes
+      // Thread T zeros bytes [T * BYTES_PER_THREAD : T * BYTES_PER_THREAD + BYTES_PER_THREAD)
+      // in the padding region. We interleave across MFMA ops for simplicity.
       #pragma unroll
-      for (int i = 0; i < BYTES_PER_LANE; ++i) {
-        pad_base[lane_id * BYTES_PER_LANE + i] = 0;
+      for (int i = 0; i < BYTES_PER_THREAD; ++i) {
+        int byte_idx = lane_id * BYTES_PER_THREAD + i;
+        // Map byte_idx to (mfma_op, padding_lane_within_op, byte_within_lane)
+        int mfma_op = byte_idx / PADDING_BYTES_PER_OP;
+        int within_op = byte_idx % PADDING_BYTES_PER_OP;
+        int padding_lane_local = within_op / 8;  // 0-31 within padding lanes
+        int byte_in_lane = within_op % 8;
+
+        // Map padding_lane_local (0-31) to actual lane index (8-15, 24-31, 40-47, 56-63)
+        // padding_lane_local / 8 gives group (0-3), maps to base 8, 24, 40, 56
+        // padding_lane_local % 8 gives offset within group
+        int group = padding_lane_local / 8;
+        int lane_in_group = padding_lane_local % 8;
+        int actual_lane = group * 16 + 8 + lane_in_group;
+
+        int lds_offset = mfma_op * 512 + actual_lane * 8 + byte_in_lane;
+        A_shared[lds_offset] = 0;
       }
     }
     __syncthreads();
@@ -862,20 +879,23 @@ struct PaddingFP8Kernel : SkinnyGemmKernel {
     f32x4 acc = {0.f, 0.f, 0.f, 0.f};
 
     // =========================================================================
-    // Producer thread layout for A tile (8 rows × WARPTILE_K)
+    // Producer thread layout for A tile (8 actual rows × WARPTILE_K)
     // =========================================================================
     // Thread assignment: 8 threads per row × 8 rows = 64 threads
-    // Each thread loads (WARPTILE_K / 8) bytes = OPS * 8 bytes per k_block
+    // Each thread loads 16 bytes per load from its assigned row.
     //
-    // For MFMA-native layout, we need:
-    //   Lane 0-15:  row 0-15, K[0:7]   → but we only have 8 rows, so lanes 8-15 unused
-    //   Lane 16-31: row 0-15, K[8:15]  → lanes 24-31 unused
-    //   Lane 32-47: row 0-15, K[16:23] → lanes 40-47 unused
-    //   Lane 48-63: row 0-15, K[24:31] → lanes 56-63 unused
+    // Global load: thread loads row a_row, K positions [k_start : k_start + 16)
+    // LDS store: scatter to lane-sequential positions for MFMA consumption
     //
-    // Simpler approach: store row-major in LDS, consumer loads with stride
+    // For each byte at global position (a_row, k_pos):
+    //   mfma_op = k_pos / 32           (which MFMA op)
+    //   k_in_mfma = k_pos % 32         (K within MFMA [0,31])
+    //   k_group = k_in_mfma / 8        (0-3: which 8-byte chunk)
+    //   k_byte = k_in_mfma % 8         (0-7: byte within chunk)
+    //   consumer_lane = a_row + k_group * 16  (lane that will read this)
+    //   lds_offset = mfma_op * 512 + consumer_lane * 8 + k_byte
     constexpr int A_THREADS_PER_ROW = 8;
-    const int a_row = lane_id / A_THREADS_PER_ROW;     // 0-7
+    const int a_row = lane_id / A_THREADS_PER_ROW;        // 0-7
     const int a_col_chunk = lane_id % A_THREADS_PER_ROW;  // 0-7
 
     // Each thread is responsible for a portion of one row
@@ -886,11 +906,22 @@ struct PaddingFP8Kernel : SkinnyGemmKernel {
                   "WARPTILE_K must be divisible by threads * bytes per load");
 
     // =========================================================================
-    // Producer thread layout for B tile (16 rows × WARPTILE_K, stored as N×K)
+    // Producer thread layout for B tile (16 N columns × WARPTILE_K)
     // =========================================================================
     // B is stored as B[n][k] in global memory
     // Thread assignment: 4 threads per N column × 16 N columns = 64 threads
     // Each thread loads 16 bytes at a time
+    //
+    // Global load: thread loads N column b_n, K positions [k_start : k_start + 16)
+    // LDS store: scatter to lane-sequential positions for MFMA consumption
+    //
+    // For each byte at global position (b_n, k_pos):
+    //   mfma_op = k_pos / 32           (which MFMA op)
+    //   k_in_mfma = k_pos % 32         (K within MFMA [0,31])
+    //   k_group = k_in_mfma / 8        (0-3: which 8-byte chunk)
+    //   k_byte = k_in_mfma % 8         (0-7: byte within chunk)
+    //   consumer_lane = b_n + k_group * 16  (lane that will read this)
+    //   lds_offset = mfma_op * 512 + consumer_lane * 8 + k_byte
     constexpr int B_THREADS_PER_N = 4;
     const int b_n = lane_id / B_THREADS_PER_N;           // N column: 0-15
     const int b_k_chunk = lane_id % B_THREADS_PER_N;     // K chunk: 0-3
@@ -940,31 +971,52 @@ struct PaddingFP8Kernel : SkinnyGemmKernel {
       asm volatile("s_waitcnt vmcnt(0)");
 
       // =====================================================================
-      // Store A tile to LDS (row-major layout)
+      // Store A tile to LDS (lane-sequential layout for bank-conflict-free)
       // =====================================================================
-      // A_shared[row][k] at offset row * WARPTILE_K + k
+      // Each byte at (a_row, k_pos) maps to LDS offset:
+      //   mfma_op * 512 + consumer_lane * 8 + k_byte
+      // where consumer_lane = a_row + (k_in_mfma / 8) * 16
       #pragma unroll
       for (int load = 0; load < A_LOADS_PER_ROW; ++load) {
-        int k_offset = a_col_chunk * A_BYTES_PER_LOAD +
-                       load * A_THREADS_PER_ROW * A_BYTES_PER_LOAD;
-        fp8 *a_dst = A_shared + a_row * WARPTILE_K + k_offset;
+        int k_base_in_tile = a_col_chunk * A_BYTES_PER_LOAD +
+                             load * A_THREADS_PER_ROW * A_BYTES_PER_LOAD;
+        const fp8 *a_bytes = reinterpret_cast<const fp8 *>(a_reg[load]);
+
         #pragma unroll
-        for (int d = 0; d < 4; ++d) {
-          reinterpret_cast<fp8_4 *>(a_dst)[d] = a_reg[load][d];
+        for (int byte = 0; byte < A_BYTES_PER_LOAD; ++byte) {
+          int k_pos = k_base_in_tile + byte;
+          int mfma_op = k_pos / MFMA_K;
+          int k_in_mfma = k_pos % MFMA_K;
+          int k_group = k_in_mfma / 8;
+          int k_byte = k_in_mfma % 8;
+          int consumer_lane = a_row + k_group * 16;
+          int lds_offset = mfma_op * 512 + consumer_lane * 8 + k_byte;
+          A_shared[lds_offset] = a_bytes[byte];
         }
       }
 
       // =====================================================================
-      // Store B tile to LDS (N-major layout: B_shared[n][k])
+      // Store B tile to LDS (lane-sequential layout for bank-conflict-free)
       // =====================================================================
+      // Each byte at (b_n, k_pos) maps to LDS offset:
+      //   mfma_op * 512 + consumer_lane * 8 + k_byte
+      // where consumer_lane = b_n + (k_in_mfma / 8) * 16
       #pragma unroll
       for (int load = 0; load < B_LOADS_PER_N; ++load) {
-        int k_offset = b_k_chunk * B_BYTES_PER_LOAD +
-                       load * B_THREADS_PER_N * B_BYTES_PER_LOAD;
-        fp8 *b_dst = B_shared + b_n * WARPTILE_K + k_offset;
+        int k_base_in_tile = b_k_chunk * B_BYTES_PER_LOAD +
+                             load * B_THREADS_PER_N * B_BYTES_PER_LOAD;
+        const fp8 *b_bytes = reinterpret_cast<const fp8 *>(b_reg[load]);
+
         #pragma unroll
-        for (int d = 0; d < 4; ++d) {
-          reinterpret_cast<fp8_4 *>(b_dst)[d] = b_reg[load][d];
+        for (int byte = 0; byte < B_BYTES_PER_LOAD; ++byte) {
+          int k_pos = k_base_in_tile + byte;
+          int mfma_op = k_pos / MFMA_K;
+          int k_in_mfma = k_pos % MFMA_K;
+          int k_group = k_in_mfma / 8;
+          int k_byte = k_in_mfma % 8;
+          int consumer_lane = b_n + k_group * 16;
+          int lds_offset = mfma_op * 512 + consumer_lane * 8 + k_byte;
+          B_shared[lds_offset] = b_bytes[byte];
         }
       }
 
@@ -973,38 +1025,20 @@ struct PaddingFP8Kernel : SkinnyGemmKernel {
       // =====================================================================
       // MFMA consumption: MFMA_OPS ops per K block
       // =====================================================================
-      // Dense MFMA A layout (16×32):
-      //   Lane 0-15:  rows 0-15, K[0:7]
-      //   Lane 16-31: rows 0-15, K[8:15]
-      //   Lane 32-47: rows 0-15, K[16:23]
-      //   Lane 48-63: rows 0-15, K[24:31]
+      // Lane-sequential LDS layout: lane L reads its 8 bytes from offset L*8
+      // within each MFMA op's 512-byte region.
       //
-      // Dense MFMA B layout (32×16):
-      //   Lane 0-15:  N cols 0-15, K[0:7]
-      //   Lane 16-31: N cols 0-15, K[8:15]
-      //   Lane 32-47: N cols 0-15, K[16:23]
-      //   Lane 48-63: N cols 0-15, K[24:31]
-      //
-      // Each lane reads 8 contiguous bytes from its assigned row/column.
-
-      const int mfma_row = lane_id % 16;       // Which row (0-15)
-      const int k_group = lane_id / 16;        // Which K group (0-3): K[0:7], K[8:15], etc.
-      const int k_within_mfma = k_group * 8;   // K offset within 32-element MFMA K
-
-      const int mfma_n = lane_id % 16;         // Which N column (0-15)
+      // This is bank-conflict-free: consecutive lanes read consecutive 8-byte
+      // chunks, hitting consecutive pairs of banks (2-way conflict optimal
+      // for ds_read_b64).
 
       #pragma unroll
       for (int op = 0; op < MFMA_OPS; ++op) {
-        int k_offset = op * MFMA_K + k_within_mfma;
-
-        // Load A: row mfma_row, K positions [k_offset : k_offset+8)
-        // A_shared layout: row-major, so A_shared[row * WARPTILE_K + k]
-        const fp8 *a_lds = A_shared + mfma_row * WARPTILE_K + k_offset;
+        // Lane-sequential read: lane_id's data is at op * 512 + lane_id * 8
+        const fp8 *a_lds = A_shared + op * 512 + lane_id * 8;
         a_cons = *reinterpret_cast<const fp8_4x2 *>(a_lds);
 
-        // Load B: N column mfma_n, K positions [k_offset : k_offset+8)
-        // B_shared layout: N-major, so B_shared[n * WARPTILE_K + k]
-        const fp8 *b_lds = B_shared + mfma_n * WARPTILE_K + k_offset;
+        const fp8 *b_lds = B_shared + op * 512 + lane_id * 8;
         b_cons = *reinterpret_cast<const fp8_4x2 *>(b_lds);
 
         acc = __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(
