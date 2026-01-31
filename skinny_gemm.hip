@@ -1622,8 +1622,8 @@ struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
           // Base address in LDS
           fp8 *a_buf = A_shared + op * BYTES_PER_OP + prod_row * E_PER_BANK + col_offset;
 
-          // Store 4 × 4 bytes at 128-byte intervals (byte-by-byte)
-          fp8 *a_bytes = reinterpret_cast<fp8 *>(&a_reg[load]);
+          // Store 4 × 4 bytes at 128-byte intervals (matching SparseTrickFP8Kernel B)
+          const fp8 *a_bytes = reinterpret_cast<const fp8 *>(a_reg[load]);
 #pragma unroll
           for (int line = 0; line < 4; ++line) {
 #pragma unroll
