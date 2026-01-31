@@ -1622,10 +1622,14 @@ struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
           // Base address in LDS
           fp8 *a_buf = A_shared + op * BYTES_PER_OP + prod_row * E_PER_BANK + col_offset;
 
-          // Store 4 × 4 bytes at 128-byte intervals (4-byte stores)
+          // Store 4 × 4 bytes at 128-byte intervals (byte-by-byte)
+          fp8 *a_bytes = reinterpret_cast<fp8 *>(&a_reg[load]);
 #pragma unroll
           for (int line = 0; line < 4; ++line) {
-            *reinterpret_cast<fp8_4 *>(a_buf + line * 128) = a_reg[load][line];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              a_buf[line * 128 + i] = a_bytes[line * 4 + i];
+            }
           }
         }
       }
@@ -1701,10 +1705,16 @@ struct PaddingFP8KernelMatchingBLayout : SkinnyGemmKernel {
         fp8 *a_op_base = A_shared + op * BYTES_PER_OP + cons_row * E_PER_BANK +
                          k_col_offset + k_line_offset;
 
-        // Scatter-gather read: 8 bytes from 2 locations 128 bytes apart (4-byte reads)
+        // Scatter-gather read: 8 bytes from 2 locations 128 bytes apart (byte-by-byte)
         fp8x8 a_cons;
-        *reinterpret_cast<fp8_4 *>(&a_cons[0]) = *reinterpret_cast<fp8_4 *>(a_op_base);
-        *reinterpret_cast<fp8_4 *>(&a_cons[4]) = *reinterpret_cast<fp8_4 *>(a_op_base + 128);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          a_cons[i] = a_op_base[i];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          a_cons[4 + i] = a_op_base[128 + i];
+        }
 
 #ifdef DEBUG_CONSUMER
         // DEBUG: Verify consumer reads correct K elements
