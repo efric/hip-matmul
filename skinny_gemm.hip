@@ -1042,7 +1042,9 @@ struct PaddingFP8Kernel : SkinnyGemmKernel {
         b_cons = *reinterpret_cast<const fp8_4x2 *>(b_lds);
 
         acc = __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(
-            a_cons, b_cons, acc, 0, 0, 0);
+            reinterpret_cast<long&>(a_cons),
+            reinterpret_cast<long&>(b_cons),
+            acc, 0, 0, 0);
       }
 
       __syncthreads();
