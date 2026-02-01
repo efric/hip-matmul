@@ -500,27 +500,6 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
     // Each thread reads from row curr_ad, starting at K position curr_ld.
     const fp8 *a_src = A + curr_ad * K + curr_ld;
 
-    // =========================================================================
-    // A LDS buffer pointer.
-    // The LDS layout for one 8x128 "half-tile" has two 8x64 logical slices:
-    //   slice 0 (K 0-63):   4 lines x 32 columns x 4 bytes = 512 bytes
-    //   slice 1 (K 64-127): 4 lines x 32 columns x 4 bytes = 512 bytes
-    //
-    // Each line has 32 columns.
-    // Column assignment:
-    //   col = curr_ad + (curr_ld % 64) / 16 * 8
-    //       = row + K_chunk_within_bank * 8
-    //
-    // The formula below encodes this:
-    //   E_PER_BANK * curr_ad     -> column offset for row (0, 4, 8, ..., 28)
-    //   (curr_ld / 64) * 512     -> bank offset (0 for K<64, 512 for K>=64)
-    //   (curr_ld % 64) * 2       -> K chunk offset within bank (0, 32, 64, 96)
-    // =========================================================================
-    fp8 *a_buf_base = A_shared;
-    a_buf_base += E_PER_BANK * curr_ad;
-    a_buf_base += (curr_ld / 64) * NB_BANKS * E_PER_BANK * 4;
-    a_buf_base += (curr_ld % 64) * 2;
-
     const fp8 *b_src = B + b_curr_ad * K + b_curr_ld;
 
     // =========================================================================
@@ -543,13 +522,8 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
     // B tile producer registers (B_LOADS loads x 16 bytes each).
     fp8_4 b_reg[B_LOADS][E_PER_THREAD / 4];
 
-    // A consumer-side buffer pointer.
-    // A: even lanes read lines 0-1, odd lanes read lines 2-3 of one 512 byte
-    // sub-bank.
-    // B: lane-sequential layout, lane L reads at offset L*16 (contiguous).
-    fp8 *a_cons_base = A_shared;
-    a_cons_base += (lane_id / 2) * E_PER_BANK;
-    a_cons_base += (lane_id % 2) * E_PER_BANK * 2 * NB_BANKS;
+    // A tile consumer: lane-sequential layout, lane L reads at offset L*8.
+    // B tile consumer: lane-sequential layout, lane L reads at offset L*16.
 
     // Consumer registers for SMFMAC.
     fp8x8 a_cons[OPS];  // 4 x 8 = 32 bytes for A.
@@ -560,7 +534,6 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
     for (int k_block = 0; k_block < k_blocks; ++k_block) {
       const fp8 *a_src_k = a_src + k_block * WARPTILE_K;
       const fp8 *b_src_k = b_src + k_block * WARPTILE_K;
-      fp8_4 *A_buffer = reinterpret_cast<fp8_4 *>(a_buf_base);
 
       // Load A tile.
       // Each thread loads A_LOADS 16-byte chunks at 128-byte intervals.
@@ -587,14 +560,24 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
                      : "v"(a_src_k));
       }
 
-      // Swizzle and store A tile. Each load covers one 8x128 sub-tile (1024 bytes).
-      // HALF_TILE_DWORDS = 64*8/2 = 256 (in fp8_4 units = 1024 bytes).
-      // This is the stride between consecutive loads in the LDS layout.
-      constexpr int HALF_TILE_DWORDS = OP_K * OP_M / 2;
+      // Swizzle and store A tile to lane-sequential layout.
+      // Each load covers K 0-127, which spans two ops (512 bytes each).
+      // The macro computes the correct op index from the load_idx and lane_id.
 
       // Helper macro for swizzle+store of one 16-byte register.
-      // The swizzle rearranges the data for efficient SMFMAC consumption.
-#define SWIZZLE_AND_STORE_A(load_idx, vmcnt_val, bank_offset)                 \
+      // The swizzle rearranges K positions for SMFMAC consumption pattern.
+      // After swizzle: a_reg[0]=K0145, [1]=K2367, [2]=K89CD, [3]=KABEF
+      // Even consumer lanes need [0],[2]; odd lanes need [1],[3].
+      //
+      // Lane-sequential store: consumer lane L reads 8 bytes at offset L*8.
+      // Each load covers K 0-127 (128 bytes), which spans two ops (K 0-63, 64-127).
+      // Producer thread mapping:
+      //   op_within_load = (lane_id % 8) / 4    (0 for K 0-63, 1 for K 64-127)
+      //   k_chunk = (lane_id % 8) % 4           (0-3 within the op's K range)
+      //   row = lane_id / 8                     (0-7)
+      //   even_lane = 16 * k_chunk + 2 * row
+      //   odd_lane  = even_lane + 1
+#define SWIZZLE_AND_STORE_A(load_idx, vmcnt_val)                              \
       asm volatile("s_waitcnt vmcnt(" #vmcnt_val ")\n\t"                       \
                    "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"               \
                    "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"               \
@@ -608,25 +591,35 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
                      "=v"(swap_reg[3])                                         \
                    : "v"(a_reg[load_idx][0]), "v"(a_reg[load_idx][1]),         \
                      "v"(a_reg[load_idx][2]), "v"(a_reg[load_idx][3]));        \
-      _Pragma("unroll")                                                        \
-      for (int line = 0; line < 4; ++line) {                                   \
-        A_buffer[line * NB_BANKS + (bank_offset)] = a_reg[load_idx][line];     \
+      {                                                                        \
+        int op_within_load = (lane_id % 8) / 4;                                \
+        int k_chunk = (lane_id % 8) % 4;                                       \
+        int row = lane_id / 8;                                                 \
+        int even_lane = 16 * k_chunk + 2 * row;                                \
+        int op = (load_idx) * 2 + op_within_load;                              \
+        fp8 *base = A_shared + op * OP_M * OP_K;                               \
+        fp8_4 *even_dst = reinterpret_cast<fp8_4 *>(base + even_lane * 8);     \
+        fp8_4 *odd_dst = reinterpret_cast<fp8_4 *>(base + (even_lane + 1) * 8);\
+        even_dst[0] = a_reg[load_idx][0];                                      \
+        even_dst[1] = a_reg[load_idx][2];                                      \
+        odd_dst[0] = a_reg[load_idx][1];                                       \
+        odd_dst[1] = a_reg[load_idx][3];                                       \
       }
 
       // Process each A load. vmcnt values count down from total A loads.
-      // OPS=2: 1 load. vmcnt(0) for load 0.
-      // OPS=4: 2 loads. vmcnt(1,0) for loads 0,1.
-      // OPS=8: 4 loads. vmcnt(3,2,1,0) for loads 0-3.
+      // OPS=2: 1 load → ops 0,1. vmcnt(0) for load 0.
+      // OPS=4: 2 loads → ops 0-3. vmcnt(1,0) for loads 0,1.
+      // OPS=8: 4 loads → ops 0-7. vmcnt(3,2,1,0) for loads 0-3.
       if constexpr (OPS == 2) {
-        SWIZZLE_AND_STORE_A(0, 0, 0);
+        SWIZZLE_AND_STORE_A(0, 0);
       } else if constexpr (OPS == 4) {
-        SWIZZLE_AND_STORE_A(0, 1, 0);
-        SWIZZLE_AND_STORE_A(1, 0, HALF_TILE_DWORDS);
+        SWIZZLE_AND_STORE_A(0, 1);
+        SWIZZLE_AND_STORE_A(1, 0);
       } else if constexpr (OPS == 8) {
-        SWIZZLE_AND_STORE_A(0, 3, 0);
-        SWIZZLE_AND_STORE_A(1, 2, HALF_TILE_DWORDS);
-        SWIZZLE_AND_STORE_A(2, 1, 2 * HALF_TILE_DWORDS);
-        SWIZZLE_AND_STORE_A(3, 0, 3 * HALF_TILE_DWORDS);
+        SWIZZLE_AND_STORE_A(0, 3);
+        SWIZZLE_AND_STORE_A(1, 2);
+        SWIZZLE_AND_STORE_A(2, 1);
+        SWIZZLE_AND_STORE_A(3, 0);
       }
 #undef SWIZZLE_AND_STORE_A
 
@@ -674,19 +667,11 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
       // Each op consumes 8x64 from A and 16x64 from B.
 #pragma unroll
       for (int op = 0; op < OPS; ++op) {
-        // Per-op offset: op * OP_M * OP_K = op * 512 bytes.
-        fp8 *a_op = a_cons_base + op * OP_M * OP_K;
-#pragma unroll
-        for (int i = 0; i < E_PER_BANK; ++i) {
-          a_cons[op][i + 0 * E_PER_BANK] = a_op[i + 0 * NB_BANKS * E_PER_BANK];
-        }
-#pragma unroll
-        for (int i = 0; i < E_PER_BANK; ++i) {
-          a_cons[op][i + 1 * E_PER_BANK] = a_op[i + 1 * NB_BANKS * E_PER_BANK];
-        }
+        // A: lane-sequential read, 8 bytes at offset lane_id * 8.
+        fp8 *a_op = A_shared + op * OP_M * OP_K + lane_id * 8;
+        a_cons[op] = *reinterpret_cast<const fp8x8 *>(a_op);
 
-        // Per-op offset: op * OP_N * OP_K = op * 1024 bytes.
-        // Lane-sequential read: lane_id's 16 bytes at offset lane_id * 16.
+        // B: lane-sequential read, 16 bytes at offset lane_id * 16.
         fp8 *b_op = B_shared + op * OP_N * OP_K + lane_id * 16;
         b_cons[op] = *reinterpret_cast<const fp8x16 *>(b_op);
       }
