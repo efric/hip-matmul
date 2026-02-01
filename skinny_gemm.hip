@@ -524,21 +524,15 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
     const fp8 *b_src = B + b_curr_ad * K + b_curr_ld;
 
     // =========================================================================
-    // B LDS buffer pointer.
-    // LDS layout for one 16x64 tile is divided into two slices:
-    //   Slice 0 (K 0..31): cols 0-15 for K 0-15, cols 16-31 for K 16-31
-    //   Slice 1 (K 32..63): cols 0-15 for K 32-47, cols 16-31 for K 48-63
-    // Each slice: 4 lines x 32 columns x 4 bytes = 512 bytes.
+    // B LDS buffer layout: lane-sequential for contiguous consumer reads.
+    // Each SMFMAC op consumes 1024 bytes (16 lanes × 64 K elements).
+    // Lane L reads 16 contiguous bytes at offset L*16 within the op's tile.
+    // Consumer lane mapping: lane L reads B[N=(L%16), K=(L/16)*16..(L/16)*16+15]
     //
-    // Buffer pointer formula (OP_K=64):
-    //   b_curr_ad * E_PER_BANK              -> N column offset (0, 4, 8, ...,
-    //   (b_curr_ld / 32) * 512              -> sub-bank offset (0 or 512)
-    //   (b_curr_ld % 32 >= 16) ? 64 : 0     -> K chunk within sub-bank
+    // Producer thread lane_id loads: N=b_curr_ad, K=b_curr_ld+[0..15]
+    // Maps to consumer_lane = b_curr_ad + (lane_id % 4) * 16
     // =========================================================================
-    fp8 *b_buf_base = B_shared;
-    b_buf_base += b_curr_ad * E_PER_BANK;
-    b_buf_base += (b_curr_ld / 32) * NB_BANKS * E_PER_BANK * 4;
-    b_buf_base += (b_curr_ld % 32 >= 16) ? 16 * E_PER_BANK : 0;
+    const int b_consumer_lane = b_curr_ad + (lane_id % 4) * 16;
 
     // A tile producer registers: A_LOADS 16-byte loads.
     // Each load covers K=16 for one thread; 8 threads per row cover K=128.
@@ -549,20 +543,13 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
     // B tile producer registers (B_LOADS loads x 16 bytes each).
     fp8_4 b_reg[B_LOADS][E_PER_THREAD / 4];
 
-    // Consumer-side buffer pointers.
-    // Logically, A has four 512 byte LDS sub-banks and B has four 1024
-    // sub-banks ones. For one SMFMAC call:
+    // A consumer-side buffer pointer.
     // A: even lanes read lines 0-1, odd lanes read lines 2-3 of one 512 byte
     // sub-bank.
-    // B: lanes 0-31 read slice 0, lanes 32-63 slice 1 of one 1024 byte
-    // sub-bank.
+    // B: lane-sequential layout, lane L reads at offset L*16 (contiguous).
     fp8 *a_cons_base = A_shared;
     a_cons_base += (lane_id / 2) * E_PER_BANK;
     a_cons_base += (lane_id % 2) * E_PER_BANK * 2 * NB_BANKS;
-
-    fp8 *b_cons_base = B_shared;
-    b_cons_base += (lane_id % 32) * E_PER_BANK;
-    b_cons_base += (lane_id / 32) * E_PER_BANK * 4 * NB_BANKS;
 
     // Consumer registers for SMFMAC.
     fp8x8 a_cons[OPS];  // 4 x 8 = 32 bytes for A.
@@ -674,21 +661,12 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
                      : "v"(b_src_k));
       }
 
-      // Store B tile to LDS (dense, no swizzle).
-      fp8 *b_buf = b_buf_base;
+      // Store B tile to LDS (lane-sequential layout for contiguous consumer reads).
       asm volatile("s_waitcnt vmcnt(0)");
 #pragma unroll
       for (int load = 0; load < OPS; ++load) {
-        const fp8 *b_bytes = reinterpret_cast<const fp8 *>(b_reg[load]);
-#pragma unroll
-        for (int slice = 0; slice < E_PER_THREAD / E_PER_BANK; ++slice) {
-#pragma unroll
-          for (int elem = 0; elem < E_PER_BANK; ++elem) {
-            b_buf[slice * (NB_BANKS * E_PER_BANK) + elem] =
-                b_bytes[E_PER_BANK * slice + elem];
-          }
-        }
-        b_buf += WARP_SIZE * E_PER_THREAD;
+        fp8 *b_dst = B_shared + load * OP_N * OP_K + b_consumer_lane * 16;
+        *reinterpret_cast<fp8_4x4 *>(b_dst) = b_reg[load];
       }
       __syncthreads();
 
@@ -708,15 +686,9 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
         }
 
         // Per-op offset: op * OP_N * OP_K = op * 1024 bytes.
-        fp8 *b_op = b_cons_base + op * OP_N * OP_K;
-#pragma unroll
-        for (int slice = 0; slice < 4; ++slice) {
-#pragma unroll
-          for (int i = 0; i < E_PER_BANK; ++i) {
-            b_cons[op][i + slice * E_PER_BANK] =
-                b_op[i + slice * NB_BANKS * E_PER_BANK];
-          }
-        }
+        // Lane-sequential read: lane_id's 16 bytes at offset lane_id * 16.
+        fp8 *b_op = B_shared + op * OP_N * OP_K + lane_id * 16;
+        b_cons[op] = *reinterpret_cast<const fp8x16 *>(b_op);
       }
 
 #pragma unroll
