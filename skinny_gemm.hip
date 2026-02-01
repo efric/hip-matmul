@@ -517,7 +517,6 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
     // Each load covers K=16 for one thread; 8 threads per row cover K=128.
     // For WARPTILE_K = 64*OPS, each thread needs A_LOADS = OPS/2 loads.
     fp8_4 a_reg[A_LOADS][E_PER_THREAD / 4];
-    fp8_4 swap_reg[E_PER_THREAD / 4];
 
     // B tile producer registers (B_LOADS loads x 16 bytes each).
     fp8_4 b_reg[B_LOADS][E_PER_THREAD / 4];
@@ -577,33 +576,36 @@ struct SparseTrickFP8Kernel : SkinnyGemmKernel {
       //   row = lane_id / 8                     (0-7)
       //   even_lane = 16 * k_chunk + 2 * row
       //   odd_lane  = even_lane + 1
+// Optimized swizzle using v_perm_b32 (4 instructions vs 8 for v_pack+v_swap).
+// v_perm_b32 D, S0, S1, SEL forms 64-bit input {S0,S1} where S0=MSB, S1=LSB.
+// Selectors:
+//   0x01000504: D[7:0]=in[4], D[15:8]=in[5], D[23:16]=in[0], D[31:24]=in[1]
+//               → extracts K0,K1,K4,K5 from {K0-K3, K4-K7}
+//   0x03020706: D[7:0]=in[6], D[15:8]=in[7], D[23:16]=in[2], D[31:24]=in[3]
+//               → extracts K2,K3,K6,K7 from {K0-K3, K4-K7}
+// Output order matches v_swap destinations for ds_write_b128 coalescing:
+//   out[0] = K0,K1,K4,K5   (was a_reg[0] after swap with swap_reg[0])
+//   out[1] = K8,K9,K12,K13 (was a_reg[1] after swap with swap_reg[2])
+//   out[2] = K2,K3,K6,K7   (was a_reg[2] after swap with swap_reg[1])
+//   out[3] = K10,K11,K14,K15 (was a_reg[3] after swap with swap_reg[3])
 #define SWIZZLE_AND_STORE_A(load_idx, vmcnt_val)                              \
-      asm volatile("s_waitcnt vmcnt(" #vmcnt_val ")\n\t"                       \
-                   "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"               \
-                   "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"               \
-                   "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"               \
-                   "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"               \
-                   "v_swap_b32 %0, %4\n\t"                                     \
-                   "v_swap_b32 %1, %6\n\t"                                     \
-                   "v_swap_b32 %2, %5\n\t"                                     \
-                   "v_swap_b32 %3, %7"                                         \
-                   : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),  \
-                     "=v"(swap_reg[3])                                         \
-                   : "v"(a_reg[load_idx][0]), "v"(a_reg[load_idx][1]),         \
-                     "v"(a_reg[load_idx][2]), "v"(a_reg[load_idx][3]));        \
       {                                                                        \
+        fp8_4 out[4];                                                          \
+        asm volatile("s_waitcnt vmcnt(" #vmcnt_val ")\n\t"                     \
+                     "v_perm_b32 %0, %4, %5, 0x01000504\n\t"                   \
+                     "v_perm_b32 %1, %6, %7, 0x01000504\n\t"                   \
+                     "v_perm_b32 %2, %4, %5, 0x03020706\n\t"                   \
+                     "v_perm_b32 %3, %6, %7, 0x03020706"                       \
+                     : "=v"(out[0]), "=v"(out[1]), "=v"(out[2]), "=v"(out[3])  \
+                     : "v"(a_reg[load_idx][0]), "v"(a_reg[load_idx][1]),       \
+                       "v"(a_reg[load_idx][2]), "v"(a_reg[load_idx][3]));      \
         int op_within_load = (lane_id % 8) / 4;                                \
         int k_chunk = (lane_id % 8) % 4;                                       \
         int row = lane_id / 8;                                                 \
         int even_lane = 16 * k_chunk + 2 * row;                                \
         int op = (load_idx) * 2 + op_within_load;                              \
-        fp8 *base = A_shared + op * OP_M * OP_K;                               \
-        fp8_4 *even_dst = reinterpret_cast<fp8_4 *>(base + even_lane * 8);     \
-        fp8_4 *odd_dst = reinterpret_cast<fp8_4 *>(base + (even_lane + 1) * 8);\
-        even_dst[0] = a_reg[load_idx][0];                                      \
-        even_dst[1] = a_reg[load_idx][2];                                      \
-        odd_dst[0] = a_reg[load_idx][1];                                       \
-        odd_dst[1] = a_reg[load_idx][3];                                       \
+        fp8 *base = A_shared + op * OP_M * OP_K + even_lane * 8;               \
+        *reinterpret_cast<fp8_4x4 *>(base) = *reinterpret_cast<fp8_4x4 *>(out);\
       }
 
       // Process each A load. vmcnt values count down from total A loads.
@@ -1087,16 +1089,12 @@ static_assert(validate_swizzle_pattern(),
               "Swizzle must be valid permutation of 0-15");
 
 // ============================================================================
-// Test: Swizzle (v_pack + v_swap sequence)
+// Test: Swizzle (v_perm_b32 sequence)
 // ============================================================================
 
-// Swizzle test is independent of OPS - tests the v_pack + v_swap sequence.
+// Swizzle test is independent of OPS - tests the v_perm_b32 byte permutation.
 // Each thread processes 16 bytes using the production swizzle pattern.
-//
-// The v_swap_b32 instruction swaps both operands. Production code relies on
-// reg0 being modified as a side effect (input-only constraint but actually
-// read-modify-write). For the test, we use explicit output variables to make
-// the data flow clear and avoid undefined behavior per GCC inline asm semantics.
+// Validates that the permutation produces SWIZZLE_PATTERN output.
 __global__ void test_swizzle_kernel(const fp8 *input, fp8 *output) {
   int lane_id = threadIdx.x;
   if (lane_id >= WARP_SIZE)
@@ -1104,31 +1102,23 @@ __global__ void test_swizzle_kernel(const fp8 *input, fp8 *output) {
 
   const fp8 *src = input + lane_id * E_PER_THREAD;
   fp8_4 reg0[4];
-  fp8_4 swizzled[4] = {}; // Zero-init; receives swapped values
 
   asm volatile("global_load_dwordx4 %0, %1, off" : "=v"(reg0) : "v"(src));
 
-  // Swizzle: v_pack interleaves bytes, v_swap places result in swizzled[]
-  // v_pack creates: swap_reg[0]={b0,b1,b4,b5}, swap_reg[1]={b2,b3,b6,b7}, etc.
-  // v_swap then exchanges swap_reg[i] <-> reg0[j], putting packed data into
-  // what were the input registers.
-  //
-  // We use "+v" (read-write) constraints for the swap destinations so the
-  // compiler knows both operands of v_swap are modified.
-  fp8_4 swap_reg[4];
+  // Swizzle using v_perm_b32 (same as production SWIZZLE_AND_STORE_A macro).
+  // v_perm_b32 D, S0, S1, SEL forms 64-bit input {S0,S1} where S0=MSB, S1=LSB.
+  // Selectors:
+  //   0x01000504: extracts K0,K1,K4,K5 from {K0-K3, K4-K7}
+  //   0x03020706: extracts K2,K3,K6,K7 from {K0-K3, K4-K7}
+  fp8_4 swizzled[4];
   asm volatile(
       "s_waitcnt vmcnt(0)\n\t"
-      "v_pack_b32_f16 %0, %8, %9, op_sel:[0,0]\n\t"  // swap_reg[0] = {b0,b1,b4,b5}
-      "v_pack_b32_f16 %1, %8, %9, op_sel:[1,1]\n\t"  // swap_reg[1] = {b2,b3,b6,b7}
-      "v_pack_b32_f16 %2, %10, %11, op_sel:[0,0]\n\t" // swap_reg[2] = {b8,b9,b12,b13}
-      "v_pack_b32_f16 %3, %10, %11, op_sel:[1,1]\n\t" // swap_reg[3] = {b10,b11,b14,b15}
-      "v_swap_b32 %4, %0\n\t"  // swizzled[0] <-> swap_reg[0]
-      "v_swap_b32 %5, %2\n\t"  // swizzled[1] <-> swap_reg[2]
-      "v_swap_b32 %6, %1\n\t"  // swizzled[2] <-> swap_reg[1]
-      "v_swap_b32 %7, %3\n\t"  // swizzled[3] <-> swap_reg[3]
-      : "=&v"(swap_reg[0]), "=&v"(swap_reg[1]), "=&v"(swap_reg[2]),
-        "=&v"(swap_reg[3]), "+v"(swizzled[0]), "+v"(swizzled[1]),
-        "+v"(swizzled[2]), "+v"(swizzled[3])
+      "v_perm_b32 %0, %4, %5, 0x01000504\n\t"  // swizzled[0] = K0,K1,K4,K5
+      "v_perm_b32 %1, %4, %5, 0x03020706\n\t"  // swizzled[1] = K2,K3,K6,K7
+      "v_perm_b32 %2, %6, %7, 0x01000504\n\t"  // swizzled[2] = K8,K9,K12,K13
+      "v_perm_b32 %3, %6, %7, 0x03020706"      // swizzled[3] = K10,K11,K14,K15
+      : "=v"(swizzled[0]), "=v"(swizzled[1]),
+        "=v"(swizzled[2]), "=v"(swizzled[3])
       : "v"(reg0[0]), "v"(reg0[1]), "v"(reg0[2]), "v"(reg0[3]));
 
   // Store swizzled output
@@ -1248,27 +1238,27 @@ __global__ void test_lds_roundtrip_kernel(const fp8 *input, fp8 *output) {
                  : "v"(src + ht * HALF_TILE_K));
   }
 
-  // Swizzle and store each half-tile
+  // Swizzle and store each half-tile using v_perm_b32 (same as production).
+  // Output order matches the old v_swap destinations for this test's strided stores:
+  //   out[0] = K0,K1,K4,K5   → line 0
+  //   out[1] = K8,K9,K12,K13 → line 1
+  //   out[2] = K2,K3,K6,K7   → line 2
+  //   out[3] = K10,K11,K14,K15 → line 3
 #pragma unroll
   for (int ht = 0; ht < NUM_HALF_TILES; ++ht) {
-    fp8_4 swap_reg[4];
+    fp8_4 out[4];
     asm volatile("s_waitcnt vmcnt(0)\n\t"
-                 "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"
-                 "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"
-                 "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"
-                 "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"
-                 "v_swap_b32 %0, %4\n\t"
-                 "v_swap_b32 %1, %6\n\t"
-                 "v_swap_b32 %2, %5\n\t"
-                 "v_swap_b32 %3, %7"
-                 : "=v"(swap_reg[0]), "=v"(swap_reg[1]), "=v"(swap_reg[2]),
-                   "=v"(swap_reg[3])
+                 "v_perm_b32 %0, %4, %5, 0x01000504\n\t"  // K0,K1,K4,K5
+                 "v_perm_b32 %1, %6, %7, 0x01000504\n\t"  // K8,K9,K12,K13
+                 "v_perm_b32 %2, %4, %5, 0x03020706\n\t"  // K2,K3,K6,K7
+                 "v_perm_b32 %3, %6, %7, 0x03020706"      // K10,K11,K14,K15
+                 : "=v"(out[0]), "=v"(out[1]), "=v"(out[2]), "=v"(out[3])
                  : "v"(reg[ht][0]), "v"(reg[ht][1]), "v"(reg[ht][2]),
                    "v"(reg[ht][3]));
 
 #pragma unroll
     for (int line = 0; line < 4; ++line) {
-      A_buffer[line * NB_BANKS + ht * HALF_TILE_DWORDS] = reg[ht][line];
+      A_buffer[line * NB_BANKS + ht * HALF_TILE_DWORDS] = out[line];
     }
   }
 
