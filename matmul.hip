@@ -3425,27 +3425,27 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
   virtual Type C_type() const override { return Type::SI32; }
   virtual int M_tile() const override { return MS * 8; }
   virtual int N_tile() const override { return NS * 16; }
-  virtual int K_tile() const override { return 64; }
+  virtual int K_tile() const override { return 256; }  // 4 SMFMAC ops per K tile
 
   // A_tile_layout: Maps (m, k) to byte offset in global memory.
-  // Global layout is linear row-major: 8 rows × 64 K per M-block.
+  // Global layout is linear row-major: 8 rows × 256 K per M-block.
   // The producer loads from this linear layout, swizzles, and stores to LDS.
-  // Layout: 512 bytes per mo block (8 rows × 64 K), 64 bytes per row.
+  // Layout: 2048 bytes per mo block (8 rows × 256 K), 256 bytes per row.
   virtual tile_layout_func_t A_tile_layout() const override {
     return [](int m, int k) {
       int mi = m % 8;         // Row within SMFMAC block (0-7)
       int mo = m / 8;         // Which SMFMAC block (0 to MS-1)
-      return 512 * mo + 64 * mi + k;
+      return 2048 * mo + 256 * mi + k;
     };
   }
 
   // B_tile_layout: Standard layout for dense B matrix.
-  // Layout: 1024 bytes per no block (16 rows × 64 K), 64 bytes per row.
+  // Layout: 4096 bytes per no block (16 rows × 256 K), 256 bytes per row.
   virtual tile_layout_func_t B_tile_layout() const override {
     return [](int n, int k) {
       int ni = n % 16;
       int no = n / 16;
-      return 1024 * no + 64 * ni + k;
+      return 4096 * no + 256 * ni + k;
     };
   }
 
@@ -3489,12 +3489,14 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
 
     // =======================================================================
     // Shared memory layout:
-    // A: MS × 512 bytes = MS × 8 rows × 64 K (swizzled for sparse trick)
-    // B: NS × 1024 bytes = NS × 16 rows × 64 K (dense)
+    // A: MS × 2048 bytes = MS × 8 rows × 256 K (swizzled for sparse trick)
+    // B: NS × 4096 bytes = NS × 16 rows × 256 K (dense)
+    // K_tile = 256 means 4 SMFMAC ops per K iteration (each consumes 64 K)
     // =======================================================================
-    constexpr int A_TILE_BYTES = MS * 8 * 64;       // MS * 512 bytes
-    constexpr int B_TILE_BYTES = NS * 16 * 64;      // NS * 1024 bytes
+    constexpr int A_TILE_BYTES = MS * 8 * 256;      // MS * 2048 bytes
+    constexpr int B_TILE_BYTES = NS * 16 * 256;     // NS * 4096 bytes
     constexpr int B_TILE_VEC8 = B_TILE_BYTES / 8;   // int8x8_t count
+    constexpr int OPS = 4;                          // 4 SMFMAC ops per K tile
 
     using int8x8_t = int64_t;
 
@@ -3515,65 +3517,80 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       // =====================================================================
       // Load A tile using columnar LDS layout for bank-conflict-free access.
       // Thread layout: 32 threads per M-block × MS M-blocks = 32*MS threads
-      // Per M-block: 8 M rows × 4 K chunks = 32 threads
-      // LDS layout: 4 rows × 32 columns × 4 bytes = 512 bytes per M-block
-      //   Row 0-1: even-K swizzled data (K0,K1,K4,K5 | K8,K9,K12,K13)
-      //   Row 2-3: odd-K swizzled data (K2,K3,K6,K7 | K10,K11,K14,K15)
-      //   Columns: M_row + K_chunk * 8 (interleaved)
+      // Per M-block: 8 M rows × 4 K-chunk-groups = 32 threads
+      // With K_tile=256, each thread loads 4 sets of 16 bytes (64 bytes total)
+      // covering K chunks 0-3, 4-7, 8-11, 12-15 (16 K-chunks of 16 bytes each)
+      //
+      // LDS layout per 64-K sub-bank (512 bytes):
+      //   Row 0: even-K swizzled low  (K0,K1,K4,K5 for 8 M rows)
+      //   Row 1: even-K swizzled high (K8,K9,K12,K13 for 8 M rows)
+      //   Row 2: odd-K swizzled low   (K2,K3,K6,K7 for 8 M rows)
+      //   Row 3: odd-K swizzled high  (K10,K11,K14,K15 for 8 M rows)
+      //   Columns: M_row + K_chunk_within_64 * 8 (interleaved)
       // =====================================================================
 
       // Thread assignment within the tile
       const int a_m_block = tid / 32;            // Which M-block (0 to MS-1)
       const int a_within_block = tid % 32;
       const int a_m_row = a_within_block % 8;    // M row within block (0-7)
-      const int a_k_chunk = a_within_block / 8;  // K chunk (0-3)
+      const int a_k_group = a_within_block / 8;  // K-chunk group (0-3, each covers 64 K)
 
       // Only threads that map to valid M-blocks participate
       if (a_m_block < MS) {
-        // Global load: linear K layout, 16 contiguous bytes
-        const int8_t *a_src = reinterpret_cast<const int8_t *>(A_global) +
-                              k_outer * A_TILE_BYTES +
-                              a_m_block * 512 + a_m_row * 64 + a_k_chunk * 16;
+        // Base address for this thread: M-block * 2048 + M-row * 256 + K-group * 64
+        const int8_t *a_src_base = reinterpret_cast<const int8_t *>(A_global) +
+                                   k_outer * A_TILE_BYTES +
+                                   a_m_block * 2048 + a_m_row * 256 + a_k_group * 64;
 
-        // Load 16 bytes (4 dwords)
-        i8_4 reg[4];
-        const i8_4 *a_src_dw = reinterpret_cast<const i8_4 *>(a_src);
-        reg[0] = a_src_dw[0];
-        reg[1] = a_src_dw[1];
-        reg[2] = a_src_dw[2];
-        reg[3] = a_src_dw[3];
+        // LDS base for this M-block and K-group (512 bytes per 64-K sub-bank)
+        i8_4 *a_dst_base = reinterpret_cast<i8_4 *>(A_shared_bytes) +
+                           a_m_block * 512 + a_k_group * 128;  // 128 dwords = 512 bytes per sub-bank
 
-        // Apply swizzle: K0 K1 K2 K3 K4 K5 K6 K7 K8 K9 K10 K11 K12 K13 K14 K15
-        //             -> K0 K1 K4 K5 | K8 K9 K12 K13 | K2 K3 K6 K7 | K10 K11 K14 K15
-        // Output: reg[0..3] -> swizzled[0..3] stored to rows 0..3
-        asm volatile(
-            "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"  // {K0,K1,K4,K5}
-            "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"  // {K8,K9,K12,K13}
-            "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"  // {K2,K3,K6,K7}
-            "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"  // {K10,K11,K14,K15}
-            "v_swap_b32 %0, %4\n\t"
-            "v_swap_b32 %1, %6\n\t"
-            "v_swap_b32 %2, %5\n\t"
-            "v_swap_b32 %3, %7"
-            : "=v"(reg[0]), "=v"(reg[1]), "=v"(reg[2]), "=v"(reg[3])
-            : "v"(reg[0]), "v"(reg[1]), "v"(reg[2]), "v"(reg[3]));
+        // Load 4 sets of 16 bytes (covering 64 K within this K-group)
+#pragma unroll
+        for (int k_sub = 0; k_sub < 4; ++k_sub) {
+          // Global load: linear K layout, 16 contiguous bytes
+          const i8_4 *a_src_dw = reinterpret_cast<const i8_4 *>(a_src_base + k_sub * 16);
 
-        // Store to columnar LDS layout (scatter to 4 rows)
-        // Column = M_row + K_chunk * 8
-        // Row stride = 128 bytes (32 columns × 4 bytes)
-        const int a_col = a_m_row + a_k_chunk * 8;
-        i8_4 *a_dst = reinterpret_cast<i8_4 *>(A_shared_bytes) +
-                      a_m_block * 128 + a_col;  // 128 dwords = 512 bytes per M-block
-        a_dst[0 * 32] = reg[0];  // Row 0
-        a_dst[1 * 32] = reg[1];  // Row 1
-        a_dst[2 * 32] = reg[2];  // Row 2
-        a_dst[3 * 32] = reg[3];  // Row 3
+          // Load 16 bytes (4 dwords)
+          i8_4 reg[4];
+          reg[0] = a_src_dw[0];
+          reg[1] = a_src_dw[1];
+          reg[2] = a_src_dw[2];
+          reg[3] = a_src_dw[3];
+
+          // Apply swizzle: K0 K1 K2 K3 K4 K5 K6 K7 K8 K9 K10 K11 K12 K13 K14 K15
+          //             -> K0 K1 K4 K5 | K8 K9 K12 K13 | K2 K3 K6 K7 | K10 K11 K14 K15
+          // Output: reg[0..3] -> swizzled[0..3] stored to rows 0..3
+          asm volatile(
+              "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"  // {K0,K1,K4,K5}
+              "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"  // {K8,K9,K12,K13}
+              "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"  // {K2,K3,K6,K7}
+              "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"  // {K10,K11,K14,K15}
+              "v_swap_b32 %0, %4\n\t"
+              "v_swap_b32 %1, %6\n\t"
+              "v_swap_b32 %2, %5\n\t"
+              "v_swap_b32 %3, %7"
+              : "=v"(reg[0]), "=v"(reg[1]), "=v"(reg[2]), "=v"(reg[3])
+              : "v"(reg[0]), "v"(reg[1]), "v"(reg[2]), "v"(reg[3]));
+
+          // Store to columnar LDS layout (scatter to 4 rows)
+          // Column = M_row + k_sub * 8 (within 32-column sub-bank)
+          // Row stride = 32 dwords (128 bytes)
+          const int a_col = a_m_row + k_sub * 8;
+          i8_4 *a_dst = a_dst_base + a_col;
+          a_dst[0 * 32] = reg[0];  // Row 0: even-K low
+          a_dst[1 * 32] = reg[1];  // Row 1: even-K high
+          a_dst[2 * 32] = reg[2];  // Row 2: odd-K low
+          a_dst[3 * 32] = reg[3];  // Row 3: odd-K high
+        }
       }
 
       // =====================================================================
       // Load B tile: simple linear copy to LDS.
-      // LDS layout per N-block: 16 N rows × 64 K bytes = 1024 bytes, row-major
-      // Element at (n_row, k) = n_row * 64 + k
+      // LDS layout per N-block: 16 N rows × 256 K bytes = 4096 bytes, row-major
+      // Each 64-K sub-slice: 16 N rows × 64 K bytes = 1024 bytes
+      // Element at (n_row, k) = n_row * 256 + k
       // =====================================================================
       const int8x8_t *B_src = reinterpret_cast<const int8x8_t *>(
           B_global + k_outer * B_TILE_BYTES);
@@ -3592,56 +3609,88 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       // SMFMAC consumption loop
       // Partition N across 4 warps: warp_id determines which N-block.
       // A is broadcast (all warps use same A for given M-block).
+      // With K_tile=256, we do 4 SMFMAC ops per (m_idx, n_idx) pair.
       // =====================================================================
       for (int m_idx = 0; m_idx < MS; ++m_idx) {
         for (int n_idx = 0; n_idx < NS / 4; ++n_idx) {
           // Calculate actual N-block: 4*n_idx + warp_id
           int n_block = 4 * n_idx + warp_id;
 
-          // ===================================================================
-          // Load A fragment from LDS (8 bytes = 2 VGPRs)
-          // Consumer pointer: even/odd lanes read from different regions
-          // ===================================================================
-          int8_t *a_base = A_shared_bytes + m_idx * 512;  // Offset to M-block
-          // Within the 512-byte M-block:
-          // - First 256 bytes: even-lane K values (K0,K1,K4,K5,K8,K9,K12,K13 for 4 K-chunks)
-          // - Second 256 bytes: odd-lane K values (K2,K3,K6,K7,K10,K11,K14,K15 for 4 K-chunks)
-          // Each lane pair shares the same row data.
-          a_base += (lane_id / 2) * 4;                     // Row pair offset
-          a_base += (lane_id % 2) * 256;                   // Even/odd separation
+          // Inner loop: 4 SMFMAC ops, each consuming 64 K
+#pragma unroll
+          for (int smfma_op = 0; smfma_op < OPS; ++smfma_op) {
+            // =================================================================
+            // Load A fragment from LDS (8 bytes = 2 VGPRs)
+            // Consumer pointer: even/odd lanes read from different regions
+            //
+            // LDS layout per 512-byte sub-bank (one 64-K slice):
+            //   Offset 0-127:   Row 0 (even-K low)  - 32 cols x 4 bytes
+            //   Offset 128-255: Row 1 (even-K high) - 32 cols x 4 bytes
+            //   Offset 256-383: Row 2 (odd-K low)   - 32 cols x 4 bytes
+            //   Offset 384-511: Row 3 (odd-K high)  - 32 cols x 4 bytes
+            //
+            // Each lane pair (even, odd) reads from the same column.
+            // Even lanes read from rows 0-1, odd lanes read from rows 2-3.
+            // The two 4-byte values are 128 bytes apart (32 dwords).
+            // =================================================================
+            int8_t *a_base = A_shared_bytes + m_idx * 2048 + smfma_op * 512;
 
-          i8_4x2 a_reg;
-          i8_4 *a_ptr = reinterpret_cast<i8_4 *>(a_base);
-          a_reg[0] = a_ptr[0 * NB_BANKS];
-          a_reg[1] = a_ptr[1 * NB_BANKS];
+            // Lane assignment within the 512-byte sub-bank:
+            // - lane_id / 2 gives the M row pair (0-31, but only 0-7 are valid per 8-row block)
+            // - lane_id % 2 gives parity (0 = even K indices, 1 = odd K indices)
+            // - Lanes 0-15 cover K=0-15, lanes 16-31 cover K=16-31, etc.
+            const int m_row_pair = (lane_id / 2) % 8;   // 0-7 (M row within 8-row block)
+            const int k_lane_group = lane_id / 16;     // 0-3 (which 16-K chunk)
+            const int parity = lane_id % 2;            // 0 = even K, 1 = odd K
 
-          // ===================================================================
-          // Load B fragment from LDS (16 bytes = 4 VGPRs)
-          // LDS layout: row-major, 16 N rows × 64 K bytes per N-block.
-          // B[k][nj] Lane: 16 * floor(k/16) + nj
-          // So lane_id maps to: nj = lane_id % 16, k_chunk = lane_id / 16
-          // Each lane reads 16 K values (4 dwords) from row nj.
-          // ===================================================================
-          int n_row = lane_id % 16;      // N column (0-15)
-          int k_chunk = lane_id / 16;    // K chunk (0-3)
+            // Column offset: m_row_pair + k_lane_group * 8
+            // Parity offset: 0 for even (rows 0-1), 256 for odd (rows 2-3)
+            int a_col = m_row_pair + k_lane_group * 8;
+            a_base += a_col * 4;           // Column offset (4 bytes per column)
+            a_base += parity * 256;        // Even/odd parity offset
 
-          // Byte offset: n_row * 64 + k_chunk * 16
-          int8_t *b_base = B_shared_bytes + n_block * 1024 +
-                           n_row * 64 + k_chunk * 16;
+            // Load 8 bytes using ds_read2_b32 (two 4-byte values at offset 0 and 128 bytes)
+            // offset1:32 means 32 dwords = 128 bytes
+            i8_4x2 a_reg;
+            asm volatile(
+                "ds_read2_b32 %0, %1 offset0:0 offset1:32"
+                : "=v"(a_reg)
+                : "v"(a_base)
+                : "memory");
 
-          i8_4x4 b_reg;
-          const i8_4 *b_ptr = reinterpret_cast<const i8_4 *>(b_base);
-          b_reg[0] = b_ptr[0];
-          b_reg[1] = b_ptr[1];
-          b_reg[2] = b_ptr[2];
-          b_reg[3] = b_ptr[3];
+            // =================================================================
+            // Load B fragment from LDS (16 bytes = 4 VGPRs)
+            // LDS layout: row-major, 16 N rows × 256 K bytes per N-block.
+            // Each 64-K sub-slice is at offset smfma_op * 1024 within the N-block.
+            // B[k][nj] Lane: 16 * floor(k/16) + nj
+            // So lane_id maps to: nj = lane_id % 16, k_chunk = lane_id / 16
+            // Each lane reads 16 K values (4 dwords) from row nj.
+            // =================================================================
+            int n_row = lane_id % 16;      // N column (0-15)
+            int k_chunk = lane_id / 16;    // K chunk within 64-K slice (0-3)
 
-          // ===================================================================
-          // SMFMAC intrinsic call
-          // cbsz=7, abid=1 matches the FP8 reference configuration
-          // ===================================================================
-          acc[m_idx][n_idx] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
-              a_reg, b_reg, acc[m_idx][n_idx], sparsity_idx, 7, 1);
+            // Byte offset within this smfma_op's 1024-byte B sub-slice:
+            // n_row * 64 + k_chunk * 16
+            int8_t *b_base = B_shared_bytes + n_block * 4096 + smfma_op * 1024 +
+                             n_row * 64 + k_chunk * 16;
+
+            i8_4x4 b_reg;
+            const i8_4 *b_ptr = reinterpret_cast<const i8_4 *>(b_base);
+            b_reg[0] = b_ptr[0];
+            b_reg[1] = b_ptr[1];
+            b_reg[2] = b_ptr[2];
+            b_reg[3] = b_ptr[3];
+
+            // Wait for LDS reads to complete
+            asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+
+            // =================================================================
+            // SMFMAC intrinsic call
+            // cbsz=7, abid=1 matches the FP8 reference configuration
+            // =================================================================
+            acc[m_idx][n_idx] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
+                a_reg, b_reg, acc[m_idx][n_idx], sparsity_idx, 7, 1);
+          }
         }
       }
 
@@ -3666,7 +3715,6 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     // Even lane keeps d0, receives partner's d0 into d1
     // Odd lane receives partner's d1 into d0, keeps d1
     int id_to_recv = 1 - (lane_id % 2);  // Even: recv into [1], Odd: recv into [0]
-    int id_to_send = lane_id % 2;        // Even: send [1]->partner, Odd: send [0]->partner
     int partner = lane_id ^ 1;           // XOR to get partner lane
 
     for (int m_idx = 0; m_idx < MS; ++m_idx) {
@@ -3688,12 +3736,10 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
 
     const int out_m_base = (lane_id / 16) * 2 + (lane_id % 2);
     const int out_n_base = 2 * ((lane_id % 16) / 2);
-    const int n_block = 4 * 0 + warp_id;  // For n_idx=0 iteration
 
     // Global C pointer
     int32_t *C_global = static_cast<int32_t *>(C_data);
     const int C_m_stride = N_outer * NS * 16;  // Stride in M dimension
-    const int C_n_stride = 1;                   // Stride in N dimension
 
     for (int m_idx = 0; m_idx < MS; ++m_idx) {
       for (int n_idx = 0; n_idx < NS / 4; ++n_idx) {
