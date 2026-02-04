@@ -3615,14 +3615,12 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
             a_base += a_col * 4;           // Column offset (4 bytes per column)
             a_base += parity * 256;        // Even/odd parity offset
 
-            // Load 8 bytes using ds_read2_b32 (two 4-byte values at offset 0 and 128 bytes)
-            // offset1:32 means 32 dwords = 128 bytes
+            // Load 8 bytes (two 4-byte values at offset 0 and 128 bytes)
+            // Row 0/2 at offset 0, Row 1/3 at offset 128 bytes (32 dwords)
             i8_4x2 a_reg;
-            asm volatile(
-                "ds_read2_b32 %0, %1 offset0:0 offset1:32"
-                : "=v"(a_reg)
-                : "v"(a_base)
-                : "memory");
+            i8_4 *a_ptr = reinterpret_cast<i8_4 *>(a_base);
+            a_reg[0] = a_ptr[0 * NB_BANKS];   // Row 0 or 2 (offset 0)
+            a_reg[1] = a_ptr[1 * NB_BANKS];   // Row 1 or 3 (offset 128 bytes)
 
             // =================================================================
             // Load B fragment from LDS (16 bytes = 4 VGPRs)
