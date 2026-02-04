@@ -3633,10 +3633,10 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
             int n_row = lane_id % 16;      // N column (0-15)
             int k_chunk = lane_id / 16;    // K chunk within 64-K slice (0-3)
 
-            // Byte offset within this smfma_op's 1024-byte B sub-slice:
-            // n_row * 64 + k_chunk * 16
-            int8_t *b_base = B_shared_bytes + n_block * 4096 + smfma_op * 1024 +
-                             n_row * 64 + k_chunk * 16;
+            // Byte offset: producer stores B as row-major (256 K per N row).
+            // n_row * 256 (N row offset) + smfma_op * 64 (K slice) + k_chunk * 16
+            int8_t *b_base = B_shared_bytes + n_block * 4096 + n_row * 256 +
+                             smfma_op * 64 + k_chunk * 16;
 
             i8_4x4 b_reg;
             const i8_4 *b_ptr = reinterpret_cast<const i8_4 *>(b_base);
@@ -3683,8 +3683,8 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
 
     for (int m_idx = 0; m_idx < MS; ++m_idx) {
       for (int n_idx = 0; n_idx < NS / 4; ++n_idx) {
-        // Read partner's opposite index
-        acc[m_idx][n_idx][id_to_recv] = __shfl(acc[m_idx][n_idx][1 - id_to_recv], partner);
+        // Read partner's same index (matches FP8 reference: acc[id_to_swap] from src_lane)
+        acc[m_idx][n_idx][id_to_recv] = __shfl(acc[m_idx][n_idx][id_to_recv], partner);
       }
     }
 
