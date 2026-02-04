@@ -3415,14 +3415,14 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     };
   }
 
-  // C_tile_layout: Maps (m, n) to byte offset in output.
-  // Output is stored in row-major order: C[m][n] at offset (m * N_tile + n) * 4.
+  // C_tile_layout: Maps (m, n) to element offset in output.
+  // Output is stored in row-major order: C[m][n] at element offset (m * N_tile + n).
   // The store pattern writes to global memory in row-major layout.
   virtual tile_layout_func_t C_tile_layout() const override {
     return [](int m, int n) {
-      // Row-major layout: element (m, n) at byte offset (m * N_tile + n) * sizeof(int32_t)
+      // Row-major layout: element (m, n) at element offset (m * N_tile + n)
       // N_tile = NS * 16
-      return (m * NS * 16 + n) * 4;  // 4 bytes per INT32
+      return m * NS * 16 + n;
     };
   }
 
@@ -3633,10 +3633,10 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
             int n_row = lane_id % 16;      // N column (0-15)
             int k_chunk = lane_id / 16;    // K chunk within 64-K slice (0-3)
 
-            // Byte offset within this smfma_op's 1024-byte B sub-slice:
-            // n_row * 64 + k_chunk * 16
-            int8_t *b_base = B_shared_bytes + n_block * 4096 + smfma_op * 1024 +
-                             n_row * 64 + k_chunk * 16;
+            // Byte offset: producer stores B as row-major (256 K per N row).
+            // n_row * 256 (N row offset) + smfma_op * 64 (K slice) + k_chunk * 16
+            int8_t *b_base = B_shared_bytes + n_block * 4096 + n_row * 256 +
+                             smfma_op * 64 + k_chunk * 16;
 
             i8_4x4 b_reg;
             const i8_4 *b_ptr = reinterpret_cast<const i8_4 *>(b_base);
@@ -3683,8 +3683,8 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
 
     for (int m_idx = 0; m_idx < MS; ++m_idx) {
       for (int n_idx = 0; n_idx < NS / 4; ++n_idx) {
-        // Read partner's opposite index
-        acc[m_idx][n_idx][id_to_recv] = __shfl(acc[m_idx][n_idx][1 - id_to_recv], partner);
+        // Read partner's same index (matches FP8 reference: acc[id_to_swap] from src_lane)
+        acc[m_idx][n_idx][id_to_recv] = __shfl(acc[m_idx][n_idx][id_to_recv], partner);
       }
     }
 
@@ -3701,20 +3701,23 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     const int out_m_base = (lane_id / 16) * 2 + (lane_id % 2);
     const int out_n_base = 2 * ((lane_id % 16) / 2);
 
-    // Global C pointer
-    int32_t *C_global = static_cast<int32_t *>(C_data);
-    const int C_m_stride = N_outer * NS * 16;  // Stride in M dimension
+    // Tile-major output: each tile is stored contiguously.
+    // Tile base: tile_size * (N_outer * m_outer + n_outer)
+    // Element within tile: m_tile * N_tile + n_tile (row-major within tile)
+    constexpr int tile_size = MS * 8 * NS * 16;  // M_tile * N_tile
+    int32_t *C_tile_base = static_cast<int32_t *>(C_data) +
+                           tile_size * (N_outer * m_outer + n_outer);
 
     for (int m_idx = 0; m_idx < MS; ++m_idx) {
       for (int n_idx = 0; n_idx < NS / 4; ++n_idx) {
         int n_block_actual = 4 * n_idx + warp_id;
 
-        // Global M,N coordinates for this tile
-        int global_m = m_outer * MS * 8 + m_idx * 8 + out_m_base;
-        int global_n = n_outer * NS * 16 + n_block_actual * 16 + out_n_base;
+        // Tile-local M,N coordinates
+        int m_tile = m_idx * 8 + out_m_base;
+        int n_tile = n_block_actual * 16 + out_n_base;
 
-        // Write 2 adjacent INT32 values
-        int32_t *c_out = C_global + global_m * C_m_stride + global_n;
+        // Write 2 adjacent INT32 values (row-major within tile)
+        int32_t *c_out = C_tile_base + m_tile * NS * 16 + n_tile;
         c_out[0] = acc[m_idx][n_idx][0];
         c_out[1] = acc[m_idx][n_idx][1];
       }
