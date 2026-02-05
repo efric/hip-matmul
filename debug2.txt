@@ -1,0 +1,333 @@
+ericfeng@SharkMi300X:~/hip-matmul$ M=8 N=13312 K=16384 ./matmul.o
+
+
+
+SMFMAC sparse trick INT8 experiments:
+
+MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>: A:si8, B:si8, C:si32, tile MxNxK=8x64x128, num_threads=256
+  Checking correctness... ========== KERNEL CONFIG ==========
+NS=4, KS=2
+A_tile: 8 rows x 128 K = 1024 bytes (64 vec16)
+B_tile: 4 N-blocks x 2048 bytes/block = 8192 bytes (512 vec16)
+A_shared size: 1024 bytes (2 banks x 512)
+B_shared size: 8192 bytes
+A producer threads: 0-63 (tid < 64)
+K_outer=1
+===================================
+[A_PROD_SETUP] tid=0: a_row_prod=0, a_k_chunk=0, a_bank=0, k_chunk_in_bank=0, a_col_prod=0
+[A_PROD_SETUP] tid=1: a_row_prod=0, a_k_chunk=1, a_bank=0, k_chunk_in_bank=1, a_col_prod=8
+[A_PROD_SETUP] tid=4: a_row_prod=0, a_k_chunk=4, a_bank=1, k_chunk_in_bank=0, a_col_prod=0
+[A_PROD_SETUP] tid=16: a_row_prod=2, a_k_chunk=0, a_bank=0, k_chunk_in_bank=0, a_col_prod=2
+[A_PROD_SETUP] tid=0: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=1: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=4: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=16: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[CONS_SETUP] tid=0 (warp=0, lane=0): a_m_row=0, a_is_odd=0, a_k_range=0, a_col_cons=0
+[CONS_SETUP] tid=1 (warp=0, lane=1): a_m_row=0, a_is_odd=1, a_k_range=0, a_col_cons=0
+[CONS_SETUP] tid=16 (warp=0, lane=16): a_m_row=0, a_is_odd=0, a_k_range=1, a_col_cons=8
+[CONS_SETUP] tid=32 (warp=0, lane=32): a_m_row=0, a_is_odd=0, a_k_range=2, a_col_cons=16
+[CONS_SETUP] tid=0: n_col=0, k_slice=0, sparsity_idx=0x4444
+[CONS_SETUP] tid=1: n_col=1, k_slice=0, sparsity_idx=0xeeee
+[CONS_SETUP] tid=16: n_col=0, k_slice=1, sparsity_idx=0x4444
+[CONS_SETUP] tid=32: n_col=0, k_slice=2, sparsity_idx=0x4444
+[A_PROD_LOAD] tid=0, k_outer=0: global_idx=0 (row=0, k_chunk=0), loaded[0..3]=-1,2,-1,0
+[A_PROD_LOAD] tid=1, k_outer=0: global_idx=1 (row=0, k_chunk=1), loaded[0..3]=2,2,1,-2
+[A_PROD_LOAD] tid=4, k_outer=0: global_idx=4 (row=0, k_chunk=4), loaded[0..3]=1,-1,1,2
+[A_PROD_LOAD] tid=16, k_outer=0: global_idx=16 (row=2, k_chunk=0), loaded[0..3]=2,1,2,-2
+[A_PROD_STORE] tid=0: a_bank=0, bank_base_offset=0, col=0
+[A_PROD_STORE] tid=1: a_bank=0, bank_base_offset=0, col=8
+[A_PROD_STORE] tid=4: a_bank=1, bank_base_offset=128, col=0
+[A_PROD_STORE] tid=16: a_bank=0, bank_base_offset=0, col=2
+[A_PROD_STORE] tid=0: store indices [0, 32, 64, 96] (bytes [0, 128, 256, 384])
+[A_PROD_STORE] tid=1: store indices [8, 40, 72, 104] (bytes [32, 160, 288, 416])
+[A_PROD_STORE] tid=4: store indices [128, 160, 192, 224] (bytes [512, 640, 768, 896])
+[A_PROD_STORE] tid=16: store indices [2, 34, 66, 98] (bytes [8, 136, 264, 392])
+[A_PROD_STORE] tid=0: swizzled regs = [0x01ff02ff, 0x0200ffff, 0xfeff00ff, 0x020100ff]
+[A_PROD_STORE] tid=1: swizzled regs = [0xfe000202, 0x00fe0100, 0x00fefe01, 0x0001fefe]
+[A_PROD_STORE] tid=4: swizzled regs = [0xffffff01, 0xffff00fe, 0x02ff0201, 0xfeff0200]
+[A_PROD_STORE] tid=16: swizzled regs = [0xff020102, 0x020101fe, 0x00fffe02, 0xfefe01ff]
+[A_CONS_LOAD] tid=0, k_bank=0: a_cons_offset=0 (k_bank*512=0 + col*4=0 + odd*256=0)
+[A_CONS_LOAD] tid=1, k_bank=0: a_cons_offset=256 (k_bank*512=0 + col*4=0 + odd*256=256)
+[A_CONS_LOAD] tid=16, k_bank=0: a_cons_offset=32 (k_bank*512=0 + col*4=32 + odd*256=0)
+[A_CONS_LOAD] tid=32, k_bank=0: a_cons_offset=64 (k_bank*512=0 + col*4=64 + odd*256=0)
+[A_CONS_LOAD] tid=0: a_reg = [0x01ff02ff, 0x0200ffff] (bytes 0 and 128)
+[A_CONS_LOAD] tid=1: a_reg = [0xfeff00ff, 0x020100ff] (bytes 256 and 384)
+[A_CONS_LOAD] tid=16: a_reg = [0xfe000202, 0x00fe0100] (bytes 32 and 160)
+[A_CONS_LOAD] tid=32: a_reg = [0xffff0200, 0x01000000] (bytes 64 and 192)
+[B_CONS_LOAD] tid=0, k_bank=0, j=0, n_block=0: b_cons_offset=0
+[B_CONS_LOAD] tid=1, k_bank=0, j=0, n_block=0: b_cons_offset=128
+[B_CONS_LOAD] tid=16, k_bank=0, j=0, n_block=0: b_cons_offset=16
+[B_CONS_LOAD] tid=32, k_bank=0, j=0, n_block=0: b_cons_offset=32
+[B_CONS_LOAD] tid=0: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=0
+[B_CONS_LOAD] tid=1: breakdown: n_block*2048=0 + n_col*128=128 + k_bank*64=0 + k_slice*16=0
+[B_CONS_LOAD] tid=16: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=16
+[B_CONS_LOAD] tid=32: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=32
+[PRE_FUSE] tid=0 (lane=0): acc[0] = [6, 20, 2, 10]
+[PRE_FUSE] tid=1 (lane=1): acc[0] = [5, 10, -31, 14]
+[PRE_FUSE] tid=16 (lane=16): acc[0] = [-20, -15, -17, -25]
+[PRE_FUSE] tid=32 (lane=32): acc[0] = [16, -20, -23, -11]
+[POST_FUSE] tid=0 (lane=0): acc[0] = [26, 12, -, -] (fused d0, d1)
+[POST_FUSE] tid=1 (lane=1): acc[0] = [15, -17, -, -] (fused d0, d1)
+[POST_FUSE] tid=16 (lane=16): acc[0] = [-35, -42, -, -] (fused d0, d1)
+[POST_FUSE] tid=32 (lane=32): acc[0] = [-4, -34, -, -] (fused d0, d1)
+[OUT_STORE] tid=0 (lane=0): m_pair=0, m0=0, m1=1, n_col=0, N_stride=64
+[OUT_STORE] tid=1 (lane=1): m_pair=0, m0=0, m1=1, n_col=1, N_stride=64
+[OUT_STORE] tid=16 (lane=16): m_pair=1, m0=2, m1=3, n_col=0, N_stride=64
+[OUT_STORE] tid=32 (lane=32): m_pair=2, m0=4, m1=5, n_col=0, N_stride=64
+[OUT_STORE] tid=0, j=0: n_block=0, n=0
+[OUT_STORE] tid=1, j=0: n_block=0, n=1
+[OUT_STORE] tid=16, j=0: n_block=0, n=0
+[OUT_STORE] tid=32, j=0: n_block=0, n=0
+[OUT_STORE] tid=0: C_tile[0] = 26 (row 0, col 0)
+[OUT_STORE] tid=1: C_tile[1] = 15 (row 0, col 1)
+[OUT_STORE] tid=16: C_tile[128] = -35 (row 2, col 0)
+[OUT_STORE] tid=32: C_tile[256] = -4 (row 4, col 0)
+[OUT_STORE] tid=0: C_tile[64] = 12 (row 1, col 0)
+[OUT_STORE] tid=1: C_tile[65] = -17 (row 1, col 1)
+[OUT_STORE] tid=16: C_tile[192] = -42 (row 3, col 0)
+[OUT_STORE] tid=32: C_tile[320] = -34 (row 5, col 0)
+========== KERNEL CONFIG ==========
+NS=4, KS=2
+A_tile: 8 rows x 128 K = 1024 bytes (64 vec16)
+B_tile: 4 N-blocks x 2048 bytes/block = 8192 bytes (512 vec16)
+A_shared size: 1024 bytes (2 banks x 512)
+B_shared size: 8192 bytes
+A producer threads: 0-63 (tid < 64)
+K_outer=1
+===================================
+[A_PROD_SETUP] tid=0: a_row_prod=0, a_k_chunk=0, a_bank=0, k_chunk_in_bank=0, a_col_prod=0
+[A_PROD_SETUP] tid=1: a_row_prod=0, a_k_chunk=1, a_bank=0, k_chunk_in_bank=1, a_col_prod=8
+[A_PROD_SETUP] tid=4: a_row_prod=0, a_k_chunk=4, a_bank=1, k_chunk_in_bank=0, a_col_prod=0
+[A_PROD_SETUP] tid=16: a_row_prod=2, a_k_chunk=0, a_bank=0, k_chunk_in_bank=0, a_col_prod=2
+[A_PROD_SETUP] tid=0: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=1: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=4: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=16: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[CONS_SETUP] tid=0 (warp=0, lane=0): a_m_row=0, a_is_odd=0, a_k_range=0, a_col_cons=0
+[CONS_SETUP] tid=1 (warp=0, lane=1): a_m_row=0, a_is_odd=1, a_k_range=0, a_col_cons=0
+[CONS_SETUP] tid=16 (warp=0, lane=16): a_m_row=0, a_is_odd=0, a_k_range=1, a_col_cons=8
+[CONS_SETUP] tid=32 (warp=0, lane=32): a_m_row=0, a_is_odd=0, a_k_range=2, a_col_cons=16
+[CONS_SETUP] tid=0: n_col=0, k_slice=0, sparsity_idx=0x4444
+[CONS_SETUP] tid=1: n_col=1, k_slice=0, sparsity_idx=0xeeee
+[CONS_SETUP] tid=16: n_col=0, k_slice=1, sparsity_idx=0x4444
+[CONS_SETUP] tid=32: n_col=0, k_slice=2, sparsity_idx=0x4444
+[A_PROD_LOAD] tid=0, k_outer=0: global_idx=0 (row=0, k_chunk=0), loaded[0..3]=-1,2,-1,0
+[A_PROD_LOAD] tid=1, k_outer=0: global_idx=1 (row=0, k_chunk=1), loaded[0..3]=2,2,1,-2
+[A_PROD_LOAD] tid=4, k_outer=0: global_idx=4 (row=0, k_chunk=4), loaded[0..3]=1,-1,1,2
+[A_PROD_LOAD] tid=16, k_outer=0: global_idx=16 (row=2, k_chunk=0), loaded[0..3]=2,1,2,-2
+[A_PROD_STORE] tid=0: a_bank=0, bank_base_offset=0, col=0
+[A_PROD_STORE] tid=1: a_bank=0, bank_base_offset=0, col=8
+[A_PROD_STORE] tid=4: a_bank=1, bank_base_offset=128, col=0
+[A_PROD_STORE] tid=16: a_bank=0, bank_base_offset=0, col=2
+[A_PROD_STORE] tid=0: store indices [0, 32, 64, 96] (bytes [0, 128, 256, 384])
+[A_PROD_STORE] tid=1: store indices [8, 40, 72, 104] (bytes [32, 160, 288, 416])
+[A_PROD_STORE] tid=4: store indices [128, 160, 192, 224] (bytes [512, 640, 768, 896])
+[A_PROD_STORE] tid=16: store indices [2, 34, 66, 98] (bytes [8, 136, 264, 392])
+[A_PROD_STORE] tid=0: swizzled regs = [0x01ff02ff, 0x0200ffff, 0xfeff00ff, 0x020100ff]
+[A_PROD_STORE] tid=1: swizzled regs = [0xfe000202, 0x00fe0100, 0x00fefe01, 0x0001fefe]
+[A_PROD_STORE] tid=4: swizzled regs = [0xffffff01, 0xffff00fe, 0x02ff0201, 0xfeff0200]
+[A_PROD_STORE] tid=16: swizzled regs = [0xff020102, 0x020101fe, 0x00fffe02, 0xfefe01ff]
+[A_CONS_LOAD] tid=0, k_bank=0: a_cons_offset=0 (k_bank*512=0 + col*4=0 + odd*256=0)
+[A_CONS_LOAD] tid=1, k_bank=0: a_cons_offset=256 (k_bank*512=0 + col*4=0 + odd*256=256)
+[A_CONS_LOAD] tid=16, k_bank=0: a_cons_offset=32 (k_bank*512=0 + col*4=32 + odd*256=0)
+[A_CONS_LOAD] tid=32, k_bank=0: a_cons_offset=64 (k_bank*512=0 + col*4=64 + odd*256=0)
+[A_CONS_LOAD] tid=0: a_reg = [0x01ff02ff, 0x0200ffff] (bytes 0 and 128)
+[A_CONS_LOAD] tid=1: a_reg = [0xfeff00ff, 0x020100ff] (bytes 256 and 384)
+[A_CONS_LOAD] tid=16: a_reg = [0xfe000202, 0x00fe0100] (bytes 32 and 160)
+[A_CONS_LOAD] tid=32: a_reg = [0xffff0200, 0x01000000] (bytes 64 and 192)
+[B_CONS_LOAD] tid=0, k_bank=0, j=0, n_block=0: b_cons_offset=0
+[B_CONS_LOAD] tid=1, k_bank=0, j=0, n_block=0: b_cons_offset=128
+[B_CONS_LOAD] tid=16, k_bank=0, j=0, n_block=0: b_cons_offset=16
+[B_CONS_LOAD] tid=32, k_bank=0, j=0, n_block=0: b_cons_offset=32
+[B_CONS_LOAD] tid=0: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=0
+[B_CONS_LOAD] tid=1: breakdown: n_block*2048=0 + n_col*128=128 + k_bank*64=0 + k_slice*16=0
+[B_CONS_LOAD] tid=16: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=16
+[B_CONS_LOAD] tid=32: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=32
+[PRE_FUSE] tid=0 (lane=0): acc[0] = [-1, 5, -6, 10]
+[PRE_FUSE] tid=1 (lane=1): acc[0] = [-3, -3, 12, -32]
+[PRE_FUSE] tid=16 (lane=16): acc[0] = [-16, 9, 2, 28]
+[PRE_FUSE] tid=32 (lane=32): acc[0] = [13, 11, -11, 16]
+[POST_FUSE] tid=0 (lane=0): acc[0] = [4, 4, -, -] (fused d0, d1)
+[POST_FUSE] tid=1 (lane=1): acc[0] = [-6, -20, -, -] (fused d0, d1)
+[POST_FUSE] tid=16 (lane=16): acc[0] = [-7, 30, -, -] (fused d0, d1)
+[POST_FUSE] tid=32 (lane=32): acc[0] = [24, 5, -, -] (fused d0, d1)
+[OUT_STORE] tid=0 (lane=0): m_pair=0, m0=0, m1=1, n_col=0, N_stride=64
+[OUT_STORE] tid=1 (lane=1): m_pair=0, m0=0, m1=1, n_col=1, N_stride=64
+[OUT_STORE] tid=16 (lane=16): m_pair=1, m0=2, m1=3, n_col=0, N_stride=64
+[OUT_STORE] tid=32 (lane=32): m_pair=2, m0=4, m1=5, n_col=0, N_stride=64
+[OUT_STORE] tid=0, j=0: n_block=0, n=0
+[OUT_STORE] tid=1, j=0: n_block=0, n=1
+[OUT_STORE] tid=16, j=0: n_block=0, n=0
+[OUT_STORE] tid=32, j=0: n_block=0, n=0
+[OUT_STORE] tid=0: C_tile[0] = 4 (row 0, col 0)
+[OUT_STORE] tid=1: C_tile[1] = -6 (row 0, col 1)
+[OUT_STORE] tid=16: C_tile[128] = -7 (row 2, col 0)
+[OUT_STORE] tid=32: C_tile[256] = 24 (row 4, col 0)
+[OUT_STORE] tid=0: C_tile[64] = 4 (row 1, col 0)
+[OUT_STORE] tid=1: C_tile[65] = -20 (row 1, col 1)
+[OUT_STORE] tid=16: C_tile[192] = 30 (row 3, col 0)
+[OUT_STORE] tid=32: C_tile[320] = 5 (row 5, col 0)
+========== KERNEL CONFIG ==========
+NS=4, KS=2
+A_tile: 8 rows x 128 K = 1024 bytes (64 vec16)
+B_tile: 4 N-blocks x 2048 bytes/block = 8192 bytes (512 vec16)
+A_shared size: 1024 bytes (2 banks x 512)
+B_shared size: 8192 bytes
+A producer threads: 0-63 (tid < 64)
+K_outer=1
+===================================
+[A_PROD_SETUP] tid=0: a_row_prod=0, a_k_chunk=0, a_bank=0, k_chunk_in_bank=0, a_col_prod=0
+[A_PROD_SETUP] tid=1: a_row_prod=0, a_k_chunk=1, a_bank=0, k_chunk_in_bank=1, a_col_prod=8
+[A_PROD_SETUP] tid=4: a_row_prod=0, a_k_chunk=4, a_bank=1, k_chunk_in_bank=0, a_col_prod=0
+[A_PROD_SETUP] tid=16: a_row_prod=2, a_k_chunk=0, a_bank=0, k_chunk_in_bank=0, a_col_prod=2
+[A_PROD_SETUP] tid=0: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=1: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=4: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=16: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[CONS_SETUP] tid=0 (warp=0, lane=0): a_m_row=0, a_is_odd=0, a_k_range=0, a_col_cons=0
+[CONS_SETUP] tid=1 (warp=0, lane=1): a_m_row=0, a_is_odd=1, a_k_range=0, a_col_cons=0
+[CONS_SETUP] tid=16 (warp=0, lane=16): a_m_row=0, a_is_odd=0, a_k_range=1, a_col_cons=8
+[CONS_SETUP] tid=32 (warp=0, lane=32): a_m_row=0, a_is_odd=0, a_k_range=2, a_col_cons=16
+[CONS_SETUP] tid=0: n_col=0, k_slice=0, sparsity_idx=0x4444
+[CONS_SETUP] tid=1: n_col=1, k_slice=0, sparsity_idx=0xeeee
+[CONS_SETUP] tid=16: n_col=0, k_slice=1, sparsity_idx=0x4444
+[CONS_SETUP] tid=32: n_col=0, k_slice=2, sparsity_idx=0x4444
+[A_PROD_LOAD] tid=0, k_outer=0: global_idx=0 (row=0, k_chunk=0), loaded[0..3]=-1,2,-1,0
+[A_PROD_LOAD] tid=1, k_outer=0: global_idx=1 (row=0, k_chunk=1), loaded[0..3]=2,2,1,-2
+[A_PROD_LOAD] tid=4, k_outer=0: global_idx=4 (row=0, k_chunk=4), loaded[0..3]=1,-1,1,2
+[A_PROD_LOAD] tid=16, k_outer=0: global_idx=16 (row=2, k_chunk=0), loaded[0..3]=2,1,2,-2
+[A_PROD_STORE] tid=0: a_bank=0, bank_base_offset=0, col=0
+[A_PROD_STORE] tid=1: a_bank=0, bank_base_offset=0, col=8
+[A_PROD_STORE] tid=4: a_bank=1, bank_base_offset=128, col=0
+[A_PROD_STORE] tid=16: a_bank=0, bank_base_offset=0, col=2
+[A_PROD_STORE] tid=0: store indices [0, 32, 64, 96] (bytes [0, 128, 256, 384])
+[A_PROD_STORE] tid=1: store indices [8, 40, 72, 104] (bytes [32, 160, 288, 416])
+[A_PROD_STORE] tid=4: store indices [128, 160, 192, 224] (bytes [512, 640, 768, 896])
+[A_PROD_STORE] tid=16: store indices [2, 34, 66, 98] (bytes [8, 136, 264, 392])
+[A_PROD_STORE] tid=0: swizzled regs = [0x01ff02ff, 0x0200ffff, 0xfeff00ff, 0x020100ff]
+[A_PROD_STORE] tid=1: swizzled regs = [0xfe000202, 0x00fe0100, 0x00fefe01, 0x0001fefe]
+[A_PROD_STORE] tid=4: swizzled regs = [0xffffff01, 0xffff00fe, 0x02ff0201, 0xfeff0200]
+[A_PROD_STORE] tid=16: swizzled regs = [0xff020102, 0x020101fe, 0x00fffe02, 0xfefe01ff]
+[A_CONS_LOAD] tid=0, k_bank=0: a_cons_offset=0 (k_bank*512=0 + col*4=0 + odd*256=0)
+[A_CONS_LOAD] tid=1, k_bank=0: a_cons_offset=256 (k_bank*512=0 + col*4=0 + odd*256=256)
+[A_CONS_LOAD] tid=16, k_bank=0: a_cons_offset=32 (k_bank*512=0 + col*4=32 + odd*256=0)
+[A_CONS_LOAD] tid=32, k_bank=0: a_cons_offset=64 (k_bank*512=0 + col*4=64 + odd*256=0)
+[A_CONS_LOAD] tid=0: a_reg = [0x01ff02ff, 0x0200ffff] (bytes 0 and 128)
+[A_CONS_LOAD] tid=1: a_reg = [0xfeff00ff, 0x020100ff] (bytes 256 and 384)
+[A_CONS_LOAD] tid=16: a_reg = [0xfe000202, 0x00fe0100] (bytes 32 and 160)
+[A_CONS_LOAD] tid=32: a_reg = [0xffff0200, 0x01000000] (bytes 64 and 192)
+[B_CONS_LOAD] tid=0, k_bank=0, j=0, n_block=0: b_cons_offset=0
+[B_CONS_LOAD] tid=1, k_bank=0, j=0, n_block=0: b_cons_offset=128
+[B_CONS_LOAD] tid=16, k_bank=0, j=0, n_block=0: b_cons_offset=16
+[B_CONS_LOAD] tid=32, k_bank=0, j=0, n_block=0: b_cons_offset=32
+[B_CONS_LOAD] tid=0: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=0
+[B_CONS_LOAD] tid=1: breakdown: n_block*2048=0 + n_col*128=128 + k_bank*64=0 + k_slice*16=0
+[B_CONS_LOAD] tid=16: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=16
+[B_CONS_LOAD] tid=32: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=32
+[PRE_FUSE] tid=0 (lane=0): acc[0] = [6, 20, 2, 10]
+[PRE_FUSE] tid=1 (lane=1): acc[0] = [5, 10, -31, 14]
+[PRE_FUSE] tid=16 (lane=16): acc[0] = [-20, -15, -17, -25]
+[PRE_FUSE] tid=32 (lane=32): acc[0] = [16, -20, -23, -11]
+[POST_FUSE] tid=0 (lane=0): acc[0] = [26, 12, -, -] (fused d0, d1)
+[POST_FUSE] tid=1 (lane=1): acc[0] = [15, -17, -, -] (fused d0, d1)
+[POST_FUSE] tid=16 (lane=16): acc[0] = [-35, -42, -, -] (fused d0, d1)
+[POST_FUSE] tid=32 (lane=32): acc[0] = [-4, -34, -, -] (fused d0, d1)
+[OUT_STORE] tid=0 (lane=0): m_pair=0, m0=0, m1=1, n_col=0, N_stride=64
+[OUT_STORE] tid=1 (lane=1): m_pair=0, m0=0, m1=1, n_col=1, N_stride=64
+[OUT_STORE] tid=16 (lane=16): m_pair=1, m0=2, m1=3, n_col=0, N_stride=64
+[OUT_STORE] tid=32 (lane=32): m_pair=2, m0=4, m1=5, n_col=0, N_stride=64
+[OUT_STORE] tid=0, j=0: n_block=0, n=0
+[OUT_STORE] tid=1, j=0: n_block=0, n=1
+[OUT_STORE] tid=16, j=0: n_block=0, n=0
+[OUT_STORE] tid=32, j=0: n_block=0, n=0
+[OUT_STORE] tid=0: C_tile[0] = 26 (row 0, col 0)
+[OUT_STORE] tid=1: C_tile[1] = 15 (row 0, col 1)
+[OUT_STORE] tid=16: C_tile[128] = -35 (row 2, col 0)
+[OUT_STORE] tid=32: C_tile[256] = -4 (row 4, col 0)
+[OUT_STORE] tid=0: C_tile[64] = 12 (row 1, col 0)
+[OUT_STORE] tid=1: C_tile[65] = -17 (row 1, col 1)
+[OUT_STORE] tid=16: C_tile[192] = -42 (row 3, col 0)
+[OUT_STORE] tid=32: C_tile[320] = -34 (row 5, col 0)
+========== KERNEL CONFIG ==========
+NS=4, KS=2
+A_tile: 8 rows x 128 K = 1024 bytes (64 vec16)
+B_tile: 4 N-blocks x 2048 bytes/block = 8192 bytes (512 vec16)
+A_shared size: 1024 bytes (2 banks x 512)
+B_shared size: 8192 bytes
+A producer threads: 0-63 (tid < 64)
+K_outer=2
+===================================
+[A_PROD_SETUP] tid=0: a_row_prod=0, a_k_chunk=0, a_bank=0, k_chunk_in_bank=0, a_col_prod=0
+[A_PROD_SETUP] tid=1: a_row_prod=0, a_k_chunk=1, a_bank=0, k_chunk_in_bank=1, a_col_prod=8
+[A_PROD_SETUP] tid=4: a_row_prod=0, a_k_chunk=4, a_bank=1, k_chunk_in_bank=0, a_col_prod=0
+[A_PROD_SETUP] tid=16: a_row_prod=2, a_k_chunk=0, a_bank=0, k_chunk_in_bank=0, a_col_prod=2
+[A_PROD_SETUP] tid=0: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=1: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=4: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[A_PROD_SETUP] tid=16: A_tile_size_in_vec16=64, KS=2, A_shared_size=1024 bytes
+[CONS_SETUP] tid=0 (warp=0, lane=0): a_m_row=0, a_is_odd=0, a_k_range=0, a_col_cons=0
+[CONS_SETUP] tid=1 (warp=0, lane=1): a_m_row=0, a_is_odd=1, a_k_range=0, a_col_cons=0
+[CONS_SETUP] tid=16 (warp=0, lane=16): a_m_row=0, a_is_odd=0, a_k_range=1, a_col_cons=8
+[CONS_SETUP] tid=32 (warp=0, lane=32): a_m_row=0, a_is_odd=0, a_k_range=2, a_col_cons=16
+[CONS_SETUP] tid=0: n_col=0, k_slice=0, sparsity_idx=0x4444
+[CONS_SETUP] tid=1: n_col=1, k_slice=0, sparsity_idx=0xeeee
+[CONS_SETUP] tid=16: n_col=0, k_slice=1, sparsity_idx=0x4444
+[CONS_SETUP] tid=32: n_col=0, k_slice=2, sparsity_idx=0x4444
+[A_PROD_LOAD] tid=0, k_outer=0: global_idx=0 (row=0, k_chunk=0), loaded[0..3]=-1,2,-1,0
+[A_PROD_LOAD] tid=1, k_outer=0: global_idx=1 (row=0, k_chunk=1), loaded[0..3]=2,2,1,-2
+[A_PROD_LOAD] tid=4, k_outer=0: global_idx=4 (row=0, k_chunk=4), loaded[0..3]=1,-1,1,2
+[A_PROD_LOAD] tid=16, k_outer=0: global_idx=16 (row=2, k_chunk=0), loaded[0..3]=2,1,2,-2
+[A_PROD_STORE] tid=0: a_bank=0, bank_base_offset=0, col=0
+[A_PROD_STORE] tid=1: a_bank=0, bank_base_offset=0, col=8
+[A_PROD_STORE] tid=4: a_bank=1, bank_base_offset=128, col=0
+[A_PROD_STORE] tid=16: a_bank=0, bank_base_offset=0, col=2
+[A_PROD_STORE] tid=0: store indices [0, 32, 64, 96] (bytes [0, 128, 256, 384])
+[A_PROD_STORE] tid=1: store indices [8, 40, 72, 104] (bytes [32, 160, 288, 416])
+[A_PROD_STORE] tid=4: store indices [128, 160, 192, 224] (bytes [512, 640, 768, 896])
+[A_PROD_STORE] tid=16: store indices [2, 34, 66, 98] (bytes [8, 136, 264, 392])
+[A_PROD_STORE] tid=0: swizzled regs = [0x01ff02ff, 0x0200ffff, 0xfeff00ff, 0x020100ff]
+[A_PROD_STORE] tid=1: swizzled regs = [0xfe000202, 0x00fe0100, 0x00fefe01, 0x0001fefe]
+[A_PROD_STORE] tid=4: swizzled regs = [0xffffff01, 0xffff00fe, 0x02ff0201, 0xfeff0200]
+[A_PROD_STORE] tid=16: swizzled regs = [0xff020102, 0x020101fe, 0x00fffe02, 0xfefe01ff]
+[A_CONS_LOAD] tid=0, k_bank=0: a_cons_offset=0 (k_bank*512=0 + col*4=0 + odd*256=0)
+[A_CONS_LOAD] tid=1, k_bank=0: a_cons_offset=256 (k_bank*512=0 + col*4=0 + odd*256=256)
+[A_CONS_LOAD] tid=16, k_bank=0: a_cons_offset=32 (k_bank*512=0 + col*4=32 + odd*256=0)
+[A_CONS_LOAD] tid=32, k_bank=0: a_cons_offset=64 (k_bank*512=0 + col*4=64 + odd*256=0)
+[A_CONS_LOAD] tid=0: a_reg = [0x01ff02ff, 0x0200ffff] (bytes 0 and 128)
+[A_CONS_LOAD] tid=1: a_reg = [0xfeff00ff, 0x020100ff] (bytes 256 and 384)
+[A_CONS_LOAD] tid=16: a_reg = [0xfe000202, 0x00fe0100] (bytes 32 and 160)
+[A_CONS_LOAD] tid=32: a_reg = [0xffff0200, 0x01000000] (bytes 64 and 192)
+[B_CONS_LOAD] tid=0, k_bank=0, j=0, n_block=0: b_cons_offset=0
+[B_CONS_LOAD] tid=1, k_bank=0, j=0, n_block=0: b_cons_offset=128
+[B_CONS_LOAD] tid=16, k_bank=0, j=0, n_block=0: b_cons_offset=16
+[B_CONS_LOAD] tid=32, k_bank=0, j=0, n_block=0: b_cons_offset=32
+[B_CONS_LOAD] tid=0: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=0
+[B_CONS_LOAD] tid=1: breakdown: n_block*2048=0 + n_col*128=128 + k_bank*64=0 + k_slice*16=0
+[B_CONS_LOAD] tid=16: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=16
+[B_CONS_LOAD] tid=32: breakdown: n_block*2048=0 + n_col*128=0 + k_bank*64=0 + k_slice*16=32
+[PRE_FUSE] tid=0 (lane=0): acc[0] = [-24, 14, -21, 22]
+[PRE_FUSE] tid=1 (lane=1): acc[0] = [-10, 31, 6, -34]
+[PRE_FUSE] tid=16 (lane=16): acc[0] = [-25, 20, -2, 14]
+[PRE_FUSE] tid=32 (lane=32): acc[0] = [35, 20, -11, 19]
+[POST_FUSE] tid=0 (lane=0): acc[0] = [-10, 1, -, -] (fused d0, d1)
+[POST_FUSE] tid=1 (lane=1): acc[0] = [21, -28, -, -] (fused d0, d1)
+[POST_FUSE] tid=16 (lane=16): acc[0] = [-5, 12, -, -] (fused d0, d1)
+[POST_FUSE] tid=32 (lane=32): acc[0] = [55, 8, -, -] (fused d0, d1)
+[OUT_STORE] tid=0 (lane=0): m_pair=0, m0=0, m1=1, n_col=0, N_stride=64
+[OUT_STORE] tid=1 (lane=1): m_pair=0, m0=0, m1=1, n_col=1, N_stride=64
+[OUT_STORE] tid=16 (lane=16): m_pair=1, m0=2, m1=3, n_col=0, N_stride=64
+[OUT_STORE] tid=32 (lane=32): m_pair=2, m0=4, m1=5, n_col=0, N_stride=64
+[OUT_STORE] tid=0, j=0: n_block=0, n=0
+[OUT_STORE] tid=1, j=0: n_block=0, n=1
+[OUT_STORE] tid=16, j=0: n_block=0, n=0
+[OUT_STORE] tid=32, j=0: n_block=0, n=0
+[OUT_STORE] tid=0: C_tile[0] = -10 (row 0, col 0)
+[OUT_STORE] tid=1: C_tile[1] = 21 (row 0, col 1)
+[OUT_STORE] tid=16: C_tile[128] = -5 (row 2, col 0)
+[OUT_STORE] tid=32: C_tile[256] = 55 (row 4, col 0)
+[OUT_STORE] tid=0: C_tile[64] = 1 (row 1, col 0)
+[OUT_STORE] tid=1: C_tile[65] = -28 (row 1, col 1)
+[OUT_STORE] tid=16: C_tile[192] = 12 (row 3, col 0)
+[OUT_STORE] tid=32: C_tile[320] = 8 (row 5, col 0)
+matmul numerical error: actual(-10) != expected(-43), at m_outer=0 n_outer=0 m_tile=0 n_tile=0, at matmul.hip:161. Note: outer MxNxK = 1x1x2
+Aborted (core dumped)

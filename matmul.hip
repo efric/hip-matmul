@@ -3748,8 +3748,9 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
               a_reg, b_reg, acc[j], sparsity_idx, 0, 0);
         }
       }
+      __syncthreads();
     }
-    __syncthreads();
+    // __syncthreads();
 
     // Post-processing: Fuse partial sums from even/odd K positions
     //
@@ -4285,9 +4286,9 @@ int main() {
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>());
   // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 4>());
   // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
   // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
 
   // std::printf("\n\n\nStream-K experiments:\n\n");
   // test(
