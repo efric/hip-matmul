@@ -3267,7 +3267,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared
   }
 };
 
-template <int MS, int NS>
+ttemplate <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
     : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
@@ -3314,8 +3314,15 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
     int n_outer = blockIdx.y;
     int tid = threadIdx.x;
 
-    constexpr int A_tile_size_in_vec8 = MS * 16 * 4;
-    constexpr int B_tile_size_in_vec8 = NS * 16 * 4;
+    // M tile = MS * 16 = 128 
+    // Total bytes in A tile (128 x 32)
+    // M_tile x K_tile x sizeof(int8) = 128 * 32 * 1 = 4096 bytes
+    // Each int8x8_t = 8 bytes
+    // So A tile size in int8x8_t = 4096 / 8 = 512
+    // this should really be MS * 
+    // 1 * 16
+    constexpr int A_tile_size_in_vec8 = MS * 16 * 4; // 8 * 16 * 4 = 512
+    constexpr int B_tile_size_in_vec8 = NS * 16 * 4; // 8 * 16 * 4 = 512
 
     const int8x8_t *A_global = static_cast<const int8x8_t *>(A_data) +
                                m_outer * K_outer * A_tile_size_in_vec8;
@@ -3324,12 +3331,13 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
     const int8x8_t *A_global_ptr = A_global + tid;
     const int8x8_t *B_global_ptr = B_global + tid;
 
-    __shared__ int8x8_t A_shared[A_tile_size_in_vec8];
+    // so we have enough shared memory for 8 MFMAs
+    __shared__ int8x8_t A_shared[A_tile_size_in_vec8]; //512 * (64/8) = 4096 bytes / 8 = 512 per MFMA call which is 16 * 32 = correct
     __shared__ int8x8_t B_shared[B_tile_size_in_vec8];
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
-      for (int i = 0; i < A_tile_size_in_vec8; i += 256) {
-        A_shared[i + tid] = A_global_ptr[i];
+      for (int i = 0; i < A_tile_size_in_vec8; i += 256) { 
+        A_shared[i + tid] = A_global_ptr[i]; // 64bits load // 256 * 8 = 2048 bytes total, 2 iterations = 4096
       }
       for (int j = 0; j < B_tile_size_in_vec8; j += 256) {
         B_shared[j + tid] = B_global_ptr[j];
@@ -3338,8 +3346,42 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
       B_global_ptr += B_tile_size_in_vec8;
       __syncthreads();
 
-      for (int i = 0; i < MS; ++i) {
-        for (int j = 0; j < NS / 4; ++j) {
+      // in total would run 16 times/16 MFMAs per tile
+      for (int i = 0; i < MS; ++i) { 
+        for (int j = 0; j < NS / 4; ++j) { 
+            // i = 0 -> 8 gives us 512
+            // j = 0 -> 2 gives us 512
+            /*
+            i = 0
+              tid = 0 -> 64 * 0 + (0 % 64) = 0
+              tid = 1 -> 64 * 0 + (1 % 64) = 1
+              tid = 254 -> 64 * 0 + (254 % 64) = 62
+              tid = 255 -> 64 * 0 + (255 % 64) = 63
+            i = 1
+              tid = 0 -> 64 * 1 + (0 % 64) = 64
+              tid = 1 -> 64 * 1 + (1 % 64) = 65
+              tid = 254 -> 64 * 1 + (254 % 64) = 126
+              tid = 255 -> 64 * 1 + (255 % 64) = 127
+            i = 2
+              tid = 0 -> 64 * 2 + (0 % 64) = 128
+              tid = 1 -> 64 * 2 + (1 % 64) = 129
+              tid = 254 -> 64 * 2 + (254 % 64) = 190
+              tid = 255 -> 64 * 2 + (255 % 64) = 191
+            j = 0
+              tid = 0 -> 256 * 0 + 0 = 0
+              tid = 1 -> 256 * 0 + 1 = 1
+              tid = 254 -> 256 * 0 + 254 = 254
+              tid = 255 -> 256 * 0 + 255 = 255
+            j = 1
+              tid = 0 -> 256 * 1 + 0 = 256
+              tid = 1 -> 256 * 1 + 1 = 257
+              tid = 254 -> 256 * 1 + 254 = 510
+              tid = 255 -> 256 * 1 + 255 = 511
+            */
+            /*
+            j hits 4 MFMAs ( 256 / 64 = 4 subgroups) 
+            // i broadcasts value to j each time
+            */
           acc[i][j] = __builtin_amdgcn_mfma_i32_16x16x32_i8(
               A_shared[64 * i + (tid % 64)], B_shared[256 * j + tid], acc[i][j],
               0, 0, 0);
@@ -3358,30 +3400,15 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
   }
 };
 
-// =============================================================================
-// MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
-//
-// Implements the "sparse trick" for INT8 GEMM using V_SMFMAC_I32_16X16X64_I8.
-// The sparse trick uses fake sparsity indices to compute dense GEMM:
-// - Even lanes (0,2,4,...) receive K values at positions 0,1,4,5,8,9,12,13,...
-// - Odd lanes (1,3,5,...) receive K values at positions 2,3,6,7,10,11,14,15,...
-// - Post-SMFMAC: fuse partial results and shuffle between lane pairs.
-//
-// Output: MS*8 rows × NS*16 columns of INT32 values.
-// =============================================================================
-template <int MS, int NS>
+template <int NS, int KS>
 class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     : public MmtKernel {
-  static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
+  static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
+  // static_assert(KS >= 2 && !(KS % 2));
+  
 
-  // Type aliases for SMFMAC operands
-  using i8_4 = int;                                                   // 4 INT8 packed in 32 bits
-  using i8_4x2 = __attribute__((__vector_size__(2 * sizeof(int)))) int;  // A operand: 8 INT8
-  using i8_4x4 = __attribute__((__vector_size__(4 * sizeof(int)))) int;  // B operand: 16 INT8
-  using i32x4 = __attribute__((__vector_size__(4 * sizeof(int)))) int;   // Accumulator: 4 INT32
-
-  // Sparsity indices for the sparse trick
+   // Sparsity indices for the sparse trick
   static constexpr int SPARSITY_EVEN = 0x00004444;  // Selects positions 0,1 from each group of 4
   static constexpr int SPARSITY_ODD  = 0x0000EEEE;  // Selects positions 2,3 from each group of 4
   static constexpr int NB_BANKS = 32;
@@ -3389,40 +3416,34 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
   virtual Type A_type() const override { return Type::SI8; }
   virtual Type B_type() const override { return Type::SI8; }
   virtual Type C_type() const override { return Type::SI32; }
-  virtual int M_tile() const override { return MS * 8; }
+  virtual int M_tile() const override { return 8; }
   virtual int N_tile() const override { return NS * 16; }
-  virtual int K_tile() const override { return 256; }  // 4 SMFMAC ops per K tile
+  virtual int K_tile() const override { return KS * 64; }  
 
-  // A_tile_layout: Maps (m, k) to byte offset in global memory.
-  // Global layout is linear row-major: 8 rows × 256 K per M-block.
-  // The producer loads from this linear layout, swizzles, and stores to LDS.
-  // Layout: 2048 bytes per mo block (8 rows × 256 K), 256 bytes per row.
   virtual tile_layout_func_t A_tile_layout() const override {
+    // A tile: 8 rows × (KS * 64) K bytes
+    // Row-major layout: A[m][k] at offset m * K_tile + k
     return [](int m, int k) {
-      int mi = m % 8;         // Row within SMFMAC block (0-7)
-      int mo = m / 8;         // Which SMFMAC block (0 to MS-1)
-      return 2048 * mo + 256 * mi + k;
+      return m * (KS * 64) + k;
     };
   }
 
-  // B_tile_layout: Standard layout for dense B matrix.
-  // Layout: 4096 bytes per no block (16 rows × 256 K), 256 bytes per row.
   virtual tile_layout_func_t B_tile_layout() const override {
+    // B tile: NS N-blocks × 16 N-cols × (KS * 64) K bytes
+    // Layout: [n_block][n_col][k] where n = n_block * 16 + n_col
+    // Offset = n_block * (KS * 1024) + n_col * (KS * 64) + k
+    //        = (n / 16) * (KS * 1024) + (n % 16) * (KS * 64) + k
     return [](int n, int k) {
-      int ni = n % 16;
-      int no = n / 16;
-      return 4096 * no + 256 * ni + k;
+      int n_block = n / 16;
+      int n_col = n % 16;
+      return n_block * (KS * 1024) + n_col * (KS * 64) + k;
     };
   }
 
-  // C_tile_layout: Maps (m, n) to element offset in output.
-  // Output is stored in row-major order: C[m][n] at element offset (m * N_tile + n).
-  // The store pattern writes to global memory in row-major layout.
   virtual tile_layout_func_t C_tile_layout() const override {
+    // Row-major layout within the tile: C[m][n] at offset m * N_tile + n
     return [](int m, int n) {
-      // Row-major layout: element (m, n) at element offset (m * N_tile + n)
-      // N_tile = NS * 16
-      return m * NS * 16 + n;
+      return m * (NS * 16) + n;
     };
   }
 
@@ -3432,299 +3453,417 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
   __global__ __launch_bounds__(256) static void run(
       const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
       int /*M_outer*/, int N_outer, int K_outer) {
+    // Vector types for SMFMAC intrinsic
+    // using i8x8 = __attribute__((__vector_size__(8))) int8_t;    // 2 VGPRs for A
+    // using i8x16 = __attribute__((__vector_size__(16))) int8_t;  // 4 VGPRs for B
+    // using i32x4 = __attribute__((__vector_size__(16))) int32_t; // 4 VGPRs for D
 
-    // Type aliases (must redeclare inside device function)
-    using i8_4 = int;
-    using i8_4x2 = __attribute__((__vector_size__(2 * sizeof(int)))) int;
-    using i8_4x4 = __attribute__((__vector_size__(4 * sizeof(int)))) int;
-    using i32x4 = __attribute__((__vector_size__(4 * sizeof(int)))) int;
+    // i32x4 acc[NS / 4] = {{0}};
 
-    // Thread/block indices
-    const int m_outer = blockIdx.x;
-    const int n_outer = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int warp_id = tid / 64;     // 0-3
-    const int lane_id = tid % 64;     // 0-63
+    // int m_outer = blockIdx.x;
+    // int n_outer = blockIdx.y;
+    // int tid = threadIdx.x;
+    // int lane_id = tid % 64;
+    // int warp_id = tid / 64;
 
-    // Sparsity index based on lane parity
-    const int sparsity_idx = (lane_id & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
+    // // A tile: 8 rows × 64 K = 512 bytes = 32 int8x16_t elements
+    // constexpr int A_tile_size_in_vec16 = 32;
+    // // B tile: NS × 16 N × 64 K = NS × 1024 bytes = NS × 64 int8x16_t elements
+    // constexpr int B_tile_size_in_vec16 = NS * 64;
 
-    // Accumulator array: MS M-blocks × NS/4 N-block groups
-    // Each element is 4 INT32 values (i32x4)
-    i32x4 acc[MS][NS / 4] = {{0}};
+    // const i8x16 *A_global = static_cast<const i8x16 *>(A_data) +
+    //                         m_outer * K_outer * A_tile_size_in_vec16;
+    // const i8x16 *B_global = static_cast<const i8x16 *>(B_data) +
+    //                         n_outer * K_outer * B_tile_size_in_vec16;
+    // const i8x16 *B_global_ptr = B_global + tid;
 
-    // =======================================================================
-    // Shared memory layout:
-    // A: MS × 2048 bytes = MS × 8 rows × 256 K (swizzled for sparse trick)
-    // B: NS × 4096 bytes = NS × 16 rows × 256 K (dense)
-    // K_tile = 256 means 4 SMFMAC ops per K iteration (each consumes 64 K)
-    // =======================================================================
-    constexpr int A_TILE_BYTES = MS * 8 * 256;      // MS * 2048 bytes
-    constexpr int B_TILE_BYTES = NS * 16 * 256;     // NS * 4096 bytes
-    constexpr int B_TILE_VEC8 = B_TILE_BYTES / 8;   // int8x8_t count
-    constexpr int OPS = 4;                          // 4 SMFMAC ops per K tile
+    // __shared__ int8_t A_shared[512];  // 8 rows × 64 K
+    // __shared__ i8x16 B_shared[B_tile_size_in_vec16];
 
-    using int8x8_t = int64_t;
+    // // =========================================================================
+    // // A Producer Setup (only threads 0-31 participate)
+    // // =========================================================================
+    // // Thread assignment: each of 32 threads loads 16 bytes
+    // //   row = tid / 4 (0-7)
+    // //   k_chunk = tid % 4 (0-3, each covers K 0-15, 16-31, 32-47, 48-63)
+    // int a_row = tid / 4;            // 0-7 (which row of A)
+    // int a_k_chunk = tid % 4;        // 0-3 (which 16-byte K segment)
+    // int a_sub_bank = a_k_chunk / 2; // 0 (K 0-31) or 1 (K 32-63)
+    // int a_col = a_row + (a_k_chunk % 2) * 8; // 0-15
 
-    __shared__ int8_t A_shared_bytes[A_TILE_BYTES];
-    __shared__ int8_t B_shared_bytes[B_TILE_BYTES];
+    // int32_t *A_lds = reinterpret_cast<int32_t *>(A_shared);
+    // int32_t *a_store_base = A_lds + a_sub_bank * 64; // 64 int32s per sub-bank (256 bytes)
 
-    // Global memory pointers
-    const int8_t *A_global = static_cast<const int8_t *>(A_data) +
-                             m_outer * K_outer * A_TILE_BYTES;
-    const int8_t *B_global = static_cast<const int8_t *>(B_data) +
-                             n_outer * K_outer * B_TILE_BYTES;
+    // // =========================================================================
+    // // A Consumer Setup
+    // // =========================================================================
+    // // Sparse trick lane mapping:
+    // //   m_row = (lane_id % 16) / 2  → M row 0-7 (even/odd pairs share same row)
+    // //   is_odd = lane_id % 2        → 0 = even K positions, 1 = odd K positions
+    // //   k_range = lane_id / 16      → 0-3 for K ranges 0-15, 16-31, 32-47, 48-63
+    // int a_m_row = (lane_id % 16) / 2;    // M row 0-7
+    // int a_is_odd = lane_id % 2;          // 0 = even K, 1 = odd K
+    // int a_k_range = lane_id / 16;        // 0-3 for K ranges
 
-    // =======================================================================
-    // K-loop: iterate over K tiles
-    // =======================================================================
+    // int a_cons_sub_bank = a_k_range / 2;           // 0 or 1
+    // int a_cons_k_chunk = a_k_range % 2;            // 0 or 1 within sub-bank
+    // int a_cons_col = a_m_row + a_cons_k_chunk * 8; // 0-15
+
+    // int8_t *a_cons_base = A_shared;
+    // a_cons_base += a_cons_sub_bank * 256;              // Sub-bank offset (256 bytes each)
+    // a_cons_base += a_cons_col * 4;                     // Column offset (4 bytes per column)
+    // a_cons_base += a_is_odd * 2 * NB_BANKS * 4;        // Line offset: even→line 0, odd→line 2
+
+    // int sparsity_idx = (lane_id & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
+
+    // // =========================================================================
+    // // Main K-outer Loop
+    // // =========================================================================
+    // for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+    //   // -----------------------------------------------------------------------
+    //   // Part 1: A Tile Producer - Global Load + Swizzle + LDS Store
+    //   // -----------------------------------------------------------------------
+    //   const i8x16 *A_tile_base = A_global + k_outer * A_tile_size_in_vec16;
+
+    //   if (tid < 32) {
+    //     // Load 16 bytes from global memory
+    //     // A is stored row-major: row has 64 bytes = 4 vec16 elements
+    //     i8x16 a_loaded = A_tile_base[a_row * 4 + a_k_chunk];
+
+    //     // Swizzle: reorder so even K positions are in first 8 bytes, odd in last 8
+    //     // Input:  reg[0]=K0,K1,K2,K3  reg[1]=K4,K5,K6,K7  reg[2]=K8,K9,K10,K11  reg[3]=K12,K13,K14,K15
+    //     // Output: reg[0]=K0,K1,K4,K5  reg[1]=K8,K9,K12,K13  reg[2]=K2,K3,K6,K7  reg[3]=K10,K11,K14,K15
+    //     int32_t reg0 = reinterpret_cast<int32_t *>(&a_loaded)[0];
+    //     int32_t reg1 = reinterpret_cast<int32_t *>(&a_loaded)[1];
+    //     int32_t reg2 = reinterpret_cast<int32_t *>(&a_loaded)[2];
+    //     int32_t reg3 = reinterpret_cast<int32_t *>(&a_loaded)[3];
+
+    //     asm volatile(
+    //         "v_pack_b32_f16 %0, %4, %5 op_sel:[0,0]\n\t"  // swap[0] = lo(reg0) | lo(reg1)<<16
+    //         "v_pack_b32_f16 %1, %6, %7 op_sel:[0,0]\n\t"  // swap[1] = lo(reg2) | lo(reg3)<<16
+    //         "v_pack_b32_f16 %2, %4, %5 op_sel:[1,1]\n\t"  // swap[2] = hi(reg0) | hi(reg1)<<16
+    //         "v_pack_b32_f16 %3, %6, %7 op_sel:[1,1]\n\t"  // swap[3] = hi(reg2) | hi(reg3)<<16
+    //         : "=v"(reg0), "=v"(reg1), "=v"(reg2), "=v"(reg3)
+    //         : "v"(reinterpret_cast<int32_t *>(&a_loaded)[0]),
+    //           "v"(reinterpret_cast<int32_t *>(&a_loaded)[1]),
+    //           "v"(reinterpret_cast<int32_t *>(&a_loaded)[2]),
+    //           "v"(reinterpret_cast<int32_t *>(&a_loaded)[3]));
+
+    //     // After swizzle:
+    //     //   reg0, reg1 contain even K positions (lines 0-1)
+    //     //   reg2, reg3 contain odd K positions (lines 2-3)
+
+    //     // Store to LDS with proper layout
+    //     // LDS layout: 2 sub-banks × 4 lines × 16 columns × 4 bytes
+    //     a_store_base[0 * NB_BANKS + a_col] = reg0;  // Line 0: even K bytes 0-3
+    //     a_store_base[1 * NB_BANKS + a_col] = reg1;  // Line 1: even K bytes 4-7
+    //     a_store_base[2 * NB_BANKS + a_col] = reg2;  // Line 2: odd K bytes 0-3
+    //     a_store_base[3 * NB_BANKS + a_col] = reg3;  // Line 3: odd K bytes 4-7
+    //   }
+    //   // checks out manually
+
+    //   // -----------------------------------------------------------------------
+    //   // Part 2: B Tile Producer - Global Load to LDS
+    //   // -----------------------------------------------------------------------
+    //   // All 256 threads participate
+    //   // B tile: NS × 1024 bytes = NS × 64 vec16 elements
+    //   #pragma unroll
+    //   for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
+    //     B_shared[i + tid] = B_global_ptr[i];
+    //   }
+    //   B_global_ptr += B_tile_size_in_vec16;
+
+    //   __syncthreads();
+
+    //   // -----------------------------------------------------------------------
+    //   // Part 5: SMFMAC Loop
+    //   // -----------------------------------------------------------------------
+    //   // A consumer load (8 bytes = 2 VGPRs) - same for all wavefronts (broadcast)
+    //   i8x8 a_reg;
+    //   int32_t *a_ptr = reinterpret_cast<int32_t *>(a_cons_base);
+    //   reinterpret_cast<int32_t *>(&a_reg)[0] = a_ptr[0];           // Line 0 (or 2 for odd)
+    //   reinterpret_cast<int32_t *>(&a_reg)[1] = a_ptr[NB_BANKS];    // Line 1 (or 3 for odd)
+
+    //   #pragma unroll
+    //   for (int j = 0; j < NS / 4; ++j) {
+    //     int n_block = j * 4 + warp_id;
+
+    //     // B consumer load (16 bytes = 4 VGPRs) - distributed per wavefront
+    //     // B is stored linearly in LDS: 64 vec16 elements per N-block (1024 bytes)
+    //     // Each lane reads 16 INT8 values: 4 values from each of 4 K-slices
+    //     // B_shared layout: [n_block][k/16][n_col] where each element is 4 bytes
+    //     i8x16 b_reg = B_shared[n_block * 64 + lane_id];
+
+    //     // SMFMAC call
+    //     // cbsz=0, abid=0: select bits [15:0] of sparsity index
+    //     acc[j] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
+    //         a_reg, b_reg, acc[j], sparsity_idx, 0, 0);
+    //   }
+
+    //   __syncthreads();
+    // }
+
+    // Vector types for SMFMAC intrinsic
+    using i8x8 = __attribute__((__vector_size__(8))) int8_t;    // 2 VGPRs for A
+    using i8x16 = __attribute__((__vector_size__(16))) int8_t;  // 4 VGPRs for B
+    using i32x4 = __attribute__((__vector_size__(16))) int32_t; // 4 VGPRs for D
+
+    i32x4 acc[NS / 4] = {{0}};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int tid = threadIdx.x;
+    int lane_id = tid % 64;
+    int warp_id = tid / 64;
+
+    // =========================================================================
+    // Tile Sizes
+    // =========================================================================
+    // A tile: 8 rows × (KS × 64) K bytes = KS × 512 bytes
+    // In vec16: 8 rows × (KS × 4) chunks = KS × 32 elements
+    constexpr int A_tile_size_in_vec16 = 8 * KS * 4;
+    // B tile: NS N-blocks × (KS × 64) K × 16 N = NS × KS × 1024 bytes
+    // In vec16: NS × KS × 64 elements
+    constexpr int B_tile_size_in_vec16 = NS * KS * 64;
+
+    const i8x16 *A_global = static_cast<const i8x16 *>(A_data) +
+                            m_outer * K_outer * A_tile_size_in_vec16;
+    const i8x16 *B_global = static_cast<const i8x16 *>(B_data) +
+                            n_outer * K_outer * B_tile_size_in_vec16;
+    const i8x16 *B_global_ptr = B_global + tid;
+
+    // A_shared: KS banks × 512 bytes each = KS × 512 bytes
+    __shared__ int8_t A_shared[KS * 512]; // 1024
+    __shared__ i8x16 B_shared[B_tile_size_in_vec16]; //2048
+
+    // =========================================================================
+    // A Producer Setup (64 threads participate)
+    // =========================================================================
+    // Thread layout for KS=2 (8×128 tile):
+    //   K        0   16   32   48   64   80   96  112
+    //   row 0:  t0   t1   t2   t3   t4   t5   t6   t7
+    //   row 1:  t8   t9   t10  t11  t12  t13  t14  t15
+    //   ...
+    //   row 7:  t56  t57  t58  t59  t60  t61  t62  t63
+    //
+    // Formulas:
+    //   a_row = tid / (KS * 4)           -> 0-7 (8 rows)
+    //   a_k_chunk = tid % (KS * 4)       -> 0 to (KS*4-1)
+    //   a_bank = a_k_chunk / 4           -> 0 to (KS-1), selects 64-K bank
+    //   k_chunk_in_bank = a_k_chunk % 4  -> 0-3 within the bank
+    //   a_col = a_row + k_chunk_in_bank * 8  -> 0-31
+    int a_row_prod = tid / (KS * 4); // a_row
+    int a_k_chunk = tid % (KS * 4); // a_col
+    int a_bank = a_k_chunk / (KS * 2);
+    int k_chunk_in_bank = a_k_chunk % 4;
+    int a_col_prod = a_row_prod + k_chunk_in_bank * 8;
+
+    int32_t *A_lds = reinterpret_cast<int32_t *>(A_shared);
+
+    // =========================================================================
+    // A Consumer Setup (64 lanes)
+    // =========================================================================
+    // Lane mapping:
+    //   a_m_row = (lane_id % 16) / 2  -> M row 0-7 (pairs share row)
+    //   a_is_odd = lane_id % 2        -> Even/odd for K positions
+    //   a_k_range = lane_id / 16      -> K range 0-3 within one bank
+    //   a_col = a_m_row + a_k_range * 8  -> 0-31
+    int a_m_row = (lane_id % 16) / 2;
+    int a_is_odd = lane_id % 2;
+    int a_k_range = lane_id / 16;
+    int a_col_cons = a_m_row + a_k_range * 8;
+
+    // =========================================================================
+    // B Consumer Setup (64 lanes)
+    // =========================================================================
+    // Lane mapping:
+    //   n_col = lane_id % 16   -> N column 0-15
+    //   k_slice = lane_id / 16 -> K slice 0-3 (each 16 K values)
+    int n_col = lane_id % 16;
+    int k_slice = lane_id / 16;
+
+    int sparsity_idx = (lane_id & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
+
+    // =========================================================================
+    // Main K-outer Loop
+    // =========================================================================
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      const i8x16 *A_tile_base = A_global + k_outer * A_tile_size_in_vec16;
 
       // =====================================================================
-      // Load A tile using columnar LDS layout for bank-conflict-free access.
-      // Thread layout: 32 threads per M-block × MS M-blocks = 32*MS threads
-      // Per M-block: 8 M rows × 4 K-chunk-groups = 32 threads
-      // With K_tile=256, each thread loads 4 sets of 16 bytes (64 bytes total)
-      // covering K chunks 0-3, 4-7, 8-11, 12-15 (16 K-chunks of 16 bytes each)
+      // A Producer: Global Load + Swizzle + LDS Store
+      // =====================================================================
+      // 64 threads load 8×(KS×64) bytes = KS×512 bytes total
+      // Each thread loads 16 bytes (one i8x16)
       //
-      // LDS layout per 64-K sub-bank (512 bytes):
-      //   Row 0: even-K swizzled low  (K0,K1,K4,K5 for 8 M rows)
-      //   Row 1: even-K swizzled high (K8,K9,K12,K13 for 8 M rows)
-      //   Row 2: odd-K swizzled low   (K2,K3,K6,K7 for 8 M rows)
-      //   Row 3: odd-K swizzled high  (K10,K11,K14,K15 for 8 M rows)
-      //   Columns: M_row + K_chunk_within_64 * 8 (interleaved)
-      // =====================================================================
+      // Global load index: A_tile_base[a_row * (KS * 4) + a_k_chunk]
+      // Justification:
+      //   - A is row-major: 8 rows × (KS × 64) K bytes
+      //   - Each row = (KS × 64) bytes = (KS × 4) vec16 elements
+      //   - a_row * (KS * 4) = start of row in vec16 units
+      //   - + a_k_chunk = which 16-byte chunk within the row
+      if (tid < A_tile_size_in_vec16) {
+        //a_row_prod = tid / (KS * 4); 
+        i8x16 a_loaded = A_tile_base[a_row_prod * (KS * 4) + a_k_chunk];
 
-      // Thread assignment within the tile
-      const int a_m_block = tid / 32;            // Which M-block (0 to MS-1)
-      const int a_within_block = tid % 32;
-      const int a_m_row = a_within_block % 8;    // M row within block (0-7)
-      const int a_k_group = a_within_block / 8;  // K-chunk group (0-3, each covers 64 K)
+        // Swizzle: reorder so even K positions are in first 8 bytes, odd in last 8
+        // Input:  reg[0]=K0,K1,K2,K3  reg[1]=K4,K5,K6,K7
+        //         reg[2]=K8,K9,K10,K11  reg[3]=K12,K13,K14,K15
+        // Output: reg[0]=K0,K1,K4,K5  reg[1]=K8,K9,K12,K13
+        //         reg[2]=K2,K3,K6,K7  reg[3]=K10,K11,K14,K15
+        int32_t reg0 = reinterpret_cast<int32_t *>(&a_loaded)[0];
+        int32_t reg1 = reinterpret_cast<int32_t *>(&a_loaded)[1];
+        int32_t reg2 = reinterpret_cast<int32_t *>(&a_loaded)[2];
+        int32_t reg3 = reinterpret_cast<int32_t *>(&a_loaded)[3];
 
-      // Only threads that map to valid M-blocks participate
-      if (a_m_block < MS) {
-        // Base address for this thread: M-block * 2048 + M-row * 256 + K-group * 64
-        const int8_t *a_src_base = reinterpret_cast<const int8_t *>(A_global) +
-                                   k_outer * A_TILE_BYTES +
-                                   a_m_block * 2048 + a_m_row * 256 + a_k_group * 64;
+        asm volatile(
+            "v_pack_b32_f16 %0, %4, %5 op_sel:[0,0]\n\t"  // reg0 = lo(in0) | lo(in1)<<16
+            "v_pack_b32_f16 %1, %6, %7 op_sel:[0,0]\n\t"  // reg1 = lo(in2) | lo(in3)<<16
+            "v_pack_b32_f16 %2, %4, %5 op_sel:[1,1]\n\t"  // reg2 = hi(in0) | hi(in1)<<16
+            "v_pack_b32_f16 %3, %6, %7 op_sel:[1,1]\n\t"  // reg3 = hi(in2) | hi(in3)<<16
+            : "=v"(reg0), "=v"(reg1), "=v"(reg2), "=v"(reg3)
+            : "v"(reinterpret_cast<int32_t *>(&a_loaded)[0]),
+              "v"(reinterpret_cast<int32_t *>(&a_loaded)[1]),
+              "v"(reinterpret_cast<int32_t *>(&a_loaded)[2]),
+              "v"(reinterpret_cast<int32_t *>(&a_loaded)[3]));
 
-        // LDS base for this M-block and K-group (512 bytes per 64-K sub-bank)
-        i8_4 *a_dst_base = reinterpret_cast<i8_4 *>(A_shared_bytes) +
-                           a_m_block * 512 + a_k_group * 128;  // 128 dwords = 512 bytes per sub-bank
-
-        // Load 4 sets of 16 bytes (covering 64 K within this K-group)
-#pragma unroll
-        for (int k_sub = 0; k_sub < 4; ++k_sub) {
-          // Global load: linear K layout, 16 contiguous bytes
-          const i8_4 *a_src_dw = reinterpret_cast<const i8_4 *>(a_src_base + k_sub * 16);
-
-          // Load 16 bytes (4 dwords)
-          i8_4 reg[4];
-          reg[0] = a_src_dw[0];
-          reg[1] = a_src_dw[1];
-          reg[2] = a_src_dw[2];
-          reg[3] = a_src_dw[3];
-
-          // Apply swizzle: K0 K1 K2 K3 K4 K5 K6 K7 K8 K9 K10 K11 K12 K13 K14 K15
-          //             -> K0 K1 K4 K5 | K8 K9 K12 K13 | K2 K3 K6 K7 | K10 K11 K14 K15
-          // Output: reg[0..3] -> swizzled[0..3] stored to rows 0..3
-          asm volatile(
-              "v_pack_b32_f16 %0, %4, %5, op_sel:[0,0]\n\t"  // {K0,K1,K4,K5}
-              "v_pack_b32_f16 %1, %4, %5, op_sel:[1,1]\n\t"  // {K8,K9,K12,K13}
-              "v_pack_b32_f16 %2, %6, %7, op_sel:[0,0]\n\t"  // {K2,K3,K6,K7}
-              "v_pack_b32_f16 %3, %6, %7, op_sel:[1,1]\n\t"  // {K10,K11,K14,K15}
-              "v_swap_b32 %0, %4\n\t"
-              "v_swap_b32 %1, %6\n\t"
-              "v_swap_b32 %2, %5\n\t"
-              "v_swap_b32 %3, %7"
-              : "=v"(reg[0]), "=v"(reg[1]), "=v"(reg[2]), "=v"(reg[3])
-              : "v"(reg[0]), "v"(reg[1]), "v"(reg[2]), "v"(reg[3]));
-
-          // Store to columnar LDS layout (scatter to 4 rows)
-          // Column = M_row + k_sub * 8 (within 32-column sub-bank)
-          // Row stride = 32 dwords (128 bytes)
-          const int a_col = a_m_row + k_sub * 8;
-          i8_4 *a_dst = a_dst_base + a_col;
-          a_dst[0 * 32] = reg[0];  // Row 0: even-K low
-          a_dst[1 * 32] = reg[1];  // Row 1: even-K high
-          a_dst[2 * 32] = reg[2];  // Row 2: odd-K low
-          a_dst[3 * 32] = reg[3];  // Row 3: odd-K high
-        }
+        // Store to LDS
+        // LDS layout: KS banks × 4 lines × 32 columns × 4 bytes
+        // bank_base = A_lds + a_bank * 128 (128 int32s = 512 bytes per bank)
+        int32_t *bank_base = A_lds + a_bank * 128;
+        bank_base[0 * NB_BANKS + a_col_prod] = reg0;  // Line 0: even K bytes 0-3
+        bank_base[1 * NB_BANKS + a_col_prod] = reg1;  // Line 1: even K bytes 4-7
+        bank_base[2 * NB_BANKS + a_col_prod] = reg2;  // Line 2: odd K bytes 0-3
+        bank_base[3 * NB_BANKS + a_col_prod] = reg3;  // Line 3: odd K bytes 4-7
       }
+      // manually checked out and it's fine.
 
       // =====================================================================
-      // Load B tile: simple linear copy to LDS.
-      // LDS layout per N-block: 16 N rows × 256 K bytes = 4096 bytes, row-major
-      // Each 64-K sub-slice: 16 N rows × 64 K bytes = 1024 bytes
-      // Element at (n_row, k) = n_row * 256 + k
+      // B Producer: Global Load to LDS
       // =====================================================================
-      const int8x8_t *B_src = reinterpret_cast<const int8x8_t *>(
-          B_global + k_outer * B_TILE_BYTES);
-      int8x8_t *B_dst = reinterpret_cast<int8x8_t *>(B_shared_bytes);
-
-#pragma unroll
-      for (int j = 0; j < B_TILE_VEC8; j += 256) {
-        if (j + tid < B_TILE_VEC8) {
-          B_dst[j + tid] = B_src[j + tid];
-        }
+      // All 256 threads participate
+      // B tile: NS × KS × 1024 bytes = NS × KS × 64 vec16 elements
+      #pragma unroll
+      for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
+        B_shared[i + tid] = B_global_ptr[i];
       }
+      B_global_ptr += B_tile_size_in_vec16;
 
       __syncthreads();
 
       // =====================================================================
-      // SMFMAC consumption loop
-      // Partition N across 4 warps: warp_id determines which N-block.
-      // A is broadcast (all warps use same A for given M-block).
-      // With K_tile=256, we do 4 SMFMAC ops per (m_idx, n_idx) pair.
+      // SMFMAC Loop: KS banks × (NS/4) N-block iterations
       // =====================================================================
-      for (int m_idx = 0; m_idx < MS; ++m_idx) {
-        for (int n_idx = 0; n_idx < NS / 4; ++n_idx) {
-          // Calculate actual N-block: 4*n_idx + warp_id
-          int n_block = 4 * n_idx + warp_id;
+      for (int k_bank = 0; k_bank < KS; ++k_bank) {
+        // A consumer load (8 bytes = 2 VGPRs) - same for all 4 wavefronts (broadcast)
+        // Pointer formula:
+        //   a_cons = A_shared + k_bank * 512 + a_col_cons * 4 + a_is_odd * 256
+        // Justification:
+        //   - k_bank * 512: bank offset (512 bytes per bank)
+        //   - a_col_cons * 4: column offset (4 bytes per column)
+        //   - a_is_odd * 256: line offset (lines 0-1 vs 2-3, 256 = 2 lines × 128 bytes/line)
+        int8_t *a_cons = A_shared + k_bank * 512 + a_col_cons * 4 + a_is_odd * 256;
+        int32_t *a_ptr = reinterpret_cast<int32_t *>(a_cons);
+        i8x8 a_reg = {a_ptr[0], a_ptr[NB_BANKS]};
+        // reinterpret_cast<int32_t *>(&a_reg)[0] = a_ptr[0];        // Line 0 or 2
+        // reinterpret_cast<int32_t *>(&a_reg)[1] = a_ptr[NB_BANKS]; // Line 1 or 3
 
-          // Inner loop: 4 SMFMAC ops, each consuming 64 K
-#pragma unroll
-          for (int smfma_op = 0; smfma_op < OPS; ++smfma_op) {
-            // =================================================================
-            // Load A fragment from LDS (8 bytes = 2 VGPRs)
-            // Consumer pointer: even/odd lanes read from different regions
-            //
-            // LDS layout per 512-byte sub-bank (one 64-K slice):
-            //   Offset 0-127:   Row 0 (even-K low)  - 32 cols x 4 bytes
-            //   Offset 128-255: Row 1 (even-K high) - 32 cols x 4 bytes
-            //   Offset 256-383: Row 2 (odd-K low)   - 32 cols x 4 bytes
-            //   Offset 384-511: Row 3 (odd-K high)  - 32 cols x 4 bytes
-            //
-            // Each lane pair (even, odd) reads from the same column.
-            // Even lanes read from rows 0-1, odd lanes read from rows 2-3.
-            // The two 4-byte values are 128 bytes apart (32 dwords).
-            // =================================================================
-            int8_t *a_base = A_shared_bytes + m_idx * 2048 + smfma_op * 512;
+        for (int j = 0; j < NS / 4; ++j) {
+          int n_block = j * 4 + warp_id;
 
-            // Lane assignment within the 512-byte sub-bank:
-            // - lane_id / 2 gives the M row pair (0-31, but only 0-7 are valid per 8-row block)
-            // - lane_id % 2 gives parity (0 = even K indices, 1 = odd K indices)
-            // - Lanes 0-15 cover K=0-15, lanes 16-31 cover K=16-31, etc.
-            const int m_row_pair = (lane_id / 2) % 8;   // 0-7 (M row within 8-row block)
-            const int k_lane_group = lane_id / 16;     // 0-3 (which 16-K chunk)
-            const int parity = lane_id % 2;            // 0 = even K, 1 = odd K
+          // B consumer load (16 bytes = 4 VGPRs) - distributed per wavefront
+          // B layout assumption: [n_block][n_col][k] (N-major for contiguous K access)
+          // Pointer formula:
+          //   b_cons = B_shared + n_block * (KS * 1024) + n_col * (KS * 64) + k_bank * 64 + k_slice * 16
+          // Justification:
+          //   - n_block * (KS * 1024): per N-block offset
+          //   - n_col * (KS * 64): per N-column offset (each column has KS×64 K values)
+          //   - k_bank * 64: which 64-K chunk within the N-column
+          //   - k_slice * 16: which 16-K slice within the 64-K chunk
+          int8_t *b_cons = reinterpret_cast<int8_t *>(B_shared)
+                         + n_block * (KS * 1024)
+                         + n_col * (KS * 64)
+                         + k_bank * 64
+                         + k_slice * 16;
+          i8x16 b_reg = *reinterpret_cast<i8x16 *>(b_cons);
 
-            // Column offset: m_row_pair + k_lane_group * 8
-            // Parity offset: 0 for even (rows 0-1), 256 for odd (rows 2-3)
-            int a_col = m_row_pair + k_lane_group * 8;
-            a_base += a_col * 4;           // Column offset (4 bytes per column)
-            a_base += parity * 256;        // Even/odd parity offset
-
-            // Load 8 bytes (two 4-byte values at offset 0 and 128 bytes)
-            // Row 0/2 at offset 0, Row 1/3 at offset 128 bytes (32 dwords)
-            i8_4x2 a_reg;
-            i8_4 *a_ptr = reinterpret_cast<i8_4 *>(a_base);
-            a_reg[0] = a_ptr[0 * NB_BANKS];   // Row 0 or 2 (offset 0)
-            a_reg[1] = a_ptr[1 * NB_BANKS];   // Row 1 or 3 (offset 128 bytes)
-
-            // =================================================================
-            // Load B fragment from LDS (16 bytes = 4 VGPRs)
-            // LDS layout: row-major, 16 N rows × 256 K bytes per N-block.
-            // Each 64-K sub-slice is at offset smfma_op * 1024 within the N-block.
-            // B[k][nj] Lane: 16 * floor(k/16) + nj
-            // So lane_id maps to: nj = lane_id % 16, k_chunk = lane_id / 16
-            // Each lane reads 16 K values (4 dwords) from row nj.
-            // =================================================================
-            int n_row = lane_id % 16;      // N column (0-15)
-            int k_chunk = lane_id / 16;    // K chunk within 64-K slice (0-3)
-
-            // Byte offset: producer stores B as row-major (256 K per N row).
-            // n_row * 256 (N row offset) + smfma_op * 64 (K slice) + k_chunk * 16
-            int8_t *b_base = B_shared_bytes + n_block * 4096 + n_row * 256 +
-                             smfma_op * 64 + k_chunk * 16;
-
-            i8_4x4 b_reg;
-            const i8_4 *b_ptr = reinterpret_cast<const i8_4 *>(b_base);
-            b_reg[0] = b_ptr[0];
-            b_reg[1] = b_ptr[1];
-            b_reg[2] = b_ptr[2];
-            b_reg[3] = b_ptr[3];
-
-            // Wait for LDS reads to complete
-            asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-
-            // =================================================================
-            // SMFMAC intrinsic call
-            // cbsz=7, abid=1 matches the FP8 reference configuration
-            // =================================================================
-            acc[m_idx][n_idx] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
-                a_reg, b_reg, acc[m_idx][n_idx], sparsity_idx, 7, 1);
-          }
+          // SMFMAC call
+          // cbsz=0, abid=0: select bits [15:0] of sparsity index
+          acc[j] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
+              a_reg, b_reg, acc[j], sparsity_idx, 0, 0);
         }
       }
+    }
+    __syncthreads();
 
-      __syncthreads();
-    } // end K-loop
-
-    // =======================================================================
-    // Post-processing: Fuse partial results and shuffle between lane pairs
-    // =======================================================================
-
-    // Fuse: D[0] += D[1], D[1] = D[2] + D[3]
-    for (int m_idx = 0; m_idx < MS; ++m_idx) {
-      for (int n_idx = 0; n_idx < NS / 4; ++n_idx) {
-        acc[m_idx][n_idx][0] = acc[m_idx][n_idx][0] + acc[m_idx][n_idx][1];
-        acc[m_idx][n_idx][1] = acc[m_idx][n_idx][2] + acc[m_idx][n_idx][3];
-      }
+    // Post-processing: Fuse partial sums from even/odd K positions
+    //
+    // With sparse trick, the SMFMAC computes:
+    //   D[0][col] = physical_row_0 * B[col] using EVEN K positions (sparsity 0x4444)
+    //   D[1][col] = physical_row_0 * B[col] using ODD K positions (sparsity 0xEEEE)
+    //   D[2][col] = physical_row_1 * B[col] using EVEN K positions
+    //   D[3][col] = physical_row_1 * B[col] using ODD K positions
+    //
+    // After fuse:
+    //   d0 = D[0] + D[1] = complete result for physical_row_0, this lane's column
+    //   d1 = D[2] + D[3] = complete result for physical_row_1, this lane's column
+    //
+    // For direct int32 row-major store, NO shuffle is needed.
+    // Each lane already has complete results for its column.
+    // The reference implementation's shuffle is specific to their packed half2
+    // atomic accumulation pattern where they need consecutive columns per lane.
+    //
+    // Output layout per lane (within a wavefront, for first 16 lanes handling cols 0-15):
+    //   Lane col: d0 -> output[phys_row_0][col], d1 -> output[phys_row_1][col]
+    for (int j = 0; j < NS / 4; ++j) {
+      int32_t *regD = reinterpret_cast<int32_t *>(&acc[j]);
+      // Fuse: combine even and odd K contributions
+      regD[0] = regD[0] + regD[1];  // d0 = result for physical_row_0
+      regD[1] = regD[2] + regD[3];  // d1 = result for physical_row_1
     }
 
-    // Shuffle between even/odd lane pairs to transpose the 2×2 output tile.
-    // Before shuffle: even.d0=(M0,N0), even.d1=(M1,N0), odd.d0=(M0,N1), odd.d1=(M1,N1)
-    // After shuffle:  even.d0=(M0,N0), even.d1=(M0,N1), odd.d0=(M1,N0), odd.d1=(M1,N1)
-    // Even lane keeps d0, receives partner's d0 into d1
-    // Odd lane receives partner's d1 into d0, keeps d1
-    int id_to_recv = 1 - (lane_id % 2);  // Even: recv into [1], Odd: recv into [0]
-    int partner = lane_id ^ 1;           // XOR to get partner lane
+    // =========================================================================
+    // Output Store
+    // =========================================================================
+    // Output mapping per lane:
+    //   n_col = lane_id % 16       -> column within 16-col N-block (0-15)
+    //   m_pair = lane_id / 16      -> which M row pair (0-3)
+    //     - m_pair=0 -> physical rows 0,1
+    //     - m_pair=1 -> physical rows 2,3
+    //     - m_pair=2 -> physical rows 4,5
+    //     - m_pair=3 -> physical rows 6,7
+    //
+    // Per accumulator acc[j]:
+    //   n_block = j * 4 + warp_id  -> which 16-col N-block
+    //   Full N column = n_block * 16 + n_col
+    //
+    // After fuse:
+    //   regD[0] -> C[m_pair * 2][N]      (even physical row)
+    //   regD[1] -> C[m_pair * 2 + 1][N]  (odd physical row)
+    //
+    // Row-major layout: C[m][n] at offset m * N_stride + n
+    constexpr int N_stride = NS * 16;
+    int n_col = lane_id % 16;
+    int m_pair = lane_id / 16;
+    int m0 = m_pair * 2;
+    int m1 = m_pair * 2 + 1;
 
-    for (int m_idx = 0; m_idx < MS; ++m_idx) {
-      for (int n_idx = 0; n_idx < NS / 4; ++n_idx) {
-        // Read partner's same index (matches FP8 reference: acc[id_to_swap] from src_lane)
-        acc[m_idx][n_idx][id_to_recv] = __shfl(acc[m_idx][n_idx][id_to_recv], partner);
-      }
-    }
+    // Calculate base pointer for this tile
+    // Tile layout: tiles are stored consecutively, each tile is 8 * (NS * 16) int32 values
+    constexpr int tile_size = 8 * NS * 16;
+    int32_t *C_tile = static_cast<int32_t *>(C_data) +
+                      tile_size * (N_outer * m_outer + n_outer);
 
-    // =======================================================================
-    // Output: Write INT32 results to global memory
-    // Each lane writes 2 INT32 values (adjacent N columns).
-    // =======================================================================
+    for (int j = 0; j < NS / 4; ++j) {
+      int n_block = j * 4 + warp_id;
+      int n = n_block * 16 + n_col;
 
-    // Compute output coordinates
-    // After shuffle: lane owns M rows and 2 adjacent N columns.
-    // out_m = (lane_id / 16) * 2 + (lane_id % 2)  for 4 groups of 16 lanes
-    // out_n = 2 * ((lane_id % 16) / 2)  gives 0,0,2,2,4,4,...,14,14
-
-    const int out_m_base = (lane_id / 16) * 2 + (lane_id % 2);
-    const int out_n_base = 2 * ((lane_id % 16) / 2);
-
-    // Tile-major output: each tile is stored contiguously.
-    // Tile base: tile_size * (N_outer * m_outer + n_outer)
-    // Element within tile: m_tile * N_tile + n_tile (row-major within tile)
-    constexpr int tile_size = MS * 8 * NS * 16;  // M_tile * N_tile
-    int32_t *C_tile_base = static_cast<int32_t *>(C_data) +
-                           tile_size * (N_outer * m_outer + n_outer);
-
-    for (int m_idx = 0; m_idx < MS; ++m_idx) {
-      for (int n_idx = 0; n_idx < NS / 4; ++n_idx) {
-        int n_block_actual = 4 * n_idx + warp_id;
-
-        // Tile-local M,N coordinates
-        int m_tile = m_idx * 8 + out_m_base;
-        int n_tile = n_block_actual * 16 + out_n_base;
-
-        // Write 2 adjacent INT32 values (row-major within tile)
-        int32_t *c_out = C_tile_base + m_tile * NS * 16 + n_tile;
-        c_out[0] = acc[m_idx][n_idx][0];
-        c_out[1] = acc[m_idx][n_idx][1];
-      }
+      int32_t *regD = reinterpret_cast<int32_t *>(&acc[j]);
+      C_tile[m0 * N_stride + n] = regD[0];
+      C_tile[m1 * N_stride + n] = regD[1];
     }
   }
 };
-
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2
@@ -4151,7 +4290,9 @@ int main() {
        8, 8>());
 
   std::printf("\n\n\nSMFMAC sparse trick INT8 experiments:\n\n");
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 8>());
+  // Template: <NS, KS> where K_tile = KS * 64, N_tile = NS * 16
+  // KS=2 matches reference implementation (8×128 A tile)
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
 
   std::printf("\n\n\nStream-K experiments:\n\n");
   test(
