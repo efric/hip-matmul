@@ -3491,21 +3491,22 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     // KS = 2: NS × 128 elements * 16 bytes/element = NS × 2048 bytes
     // KS = 4: NS × 256 elements * 16 bytes/element = NS × 4096 bytes
 
-    // DEBUG: Print kernel configuration (once per block)
-    if (tid == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-      printf("========== KERNEL CONFIG ==========\n");
-      printf("NS=%d, KS=%d\n", NS, KS);
-      printf("A_tile: 8 rows x %d K = %d bytes (%d vec16)\n", KS * 64, KS * 512,
-             A_tile_size_in_vec16);
-      printf("B_tile: %d N-blocks x %d bytes/block = %d bytes (%d vec16)\n", NS,
-             KS * 1024, NS * KS * 1024, B_tile_size_in_vec16);
-      printf("A_shared size: %d bytes (%d banks x 512)\n", KS * 512, KS);
-      printf("B_shared size: %d bytes\n", B_tile_size_in_vec16 * 16);
-      printf("A producer threads: 0-%d (tid < %d)\n", A_tile_size_in_vec16 - 1,
-             A_tile_size_in_vec16);
-      printf("K_outer=%d\n", K_outer);
-      printf("===================================\n");
-    }
+    // // DEBUG: Print kernel configuration (once per block)
+    // if (tid == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+    //   // __syncthreads();
+    //   printf("========== KERNEL CONFIG ==========\n");
+    //   printf("NS=%d, KS=%d\n", NS, KS);
+    //   printf("A_tile: 8 rows x %d K = %d bytes (%d vec16)\n", KS * 64, KS * 512,
+    //          A_tile_size_in_vec16);
+    //   printf("B_tile: %d N-blocks x %d bytes/block = %d bytes (%d vec16)\n", NS,
+    //          KS * 1024, NS * KS * 1024, B_tile_size_in_vec16);
+    //   printf("A_shared size: %d bytes (%d banks x 512)\n", KS * 512, KS);
+    //   printf("B_shared size: %d bytes\n", B_tile_size_in_vec16 * 16);
+    //   printf("A producer threads: 0-%d (tid < %d)\n", A_tile_size_in_vec16 - 1,
+    //          A_tile_size_in_vec16);
+    //   printf("K_outer=%d\n", K_outer);
+    //   printf("===================================\n");
+    // }
 
     // =========================================================================
     // A Producer Setup (64 threads participate)
@@ -3533,17 +3534,18 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
 
     int32_t *A_lds = reinterpret_cast<int32_t *>(A_shared);
 
-    bool is_debug_block = (blockIdx.x == 0 && blockIdx.y == 0);
-    bool is_debug_tid = (tid == 0 || tid == 1 || tid == 4 || tid == 16 ||
-                         tid == 64 || tid == 127);
-    if (is_debug_block && is_debug_tid && tid < A_tile_size_in_vec16) {
-      printf("[A_PROD_SETUP] tid=%d: a_row_prod=%d, a_k_chunk=%d, a_bank=%d, "
-             "k_chunk_in_bank=%d, a_col_prod=%d\n",
-             tid, a_row_prod, a_k_chunk, a_bank, k_chunk_in_bank, a_col_prod);
-      printf("[A_PROD_SETUP] tid=%d: A_tile_size_in_vec16=%d, KS=%d, "
-             "A_shared_size=%d bytes\n",
-             tid, A_tile_size_in_vec16, KS, KS * 512);
-    }
+    // bool is_debug_block = (blockIdx.x == 0 && blockIdx.y == 0);
+    // bool is_debug_tid = (tid == 0 || tid == 1 || tid == 4 || tid == 16 ||
+    //                      tid == 64 || tid == 127);
+    // if (is_debug_block && is_debug_tid && tid < A_tile_size_in_vec16) {
+    //   // __syncthreads();
+    //   printf("[A_PROD_SETUP] tid=%d: a_row_prod=%d, a_k_chunk=%d, a_bank=%d, "
+    //          "k_chunk_in_bank=%d, a_col_prod=%d\n",
+    //          tid, a_row_prod, a_k_chunk, a_bank, k_chunk_in_bank, a_col_prod);
+    //   printf("[A_PROD_SETUP] tid=%d: A_tile_size_in_vec16=%d, KS=%d, "
+    //          "A_shared_size=%d bytes\n",
+    //          tid, A_tile_size_in_vec16, KS, KS * 512);
+    // }
 
     // =========================================================================
     // A Consumer Setup (64 lanes)
@@ -3570,15 +3572,16 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     int sparsity_idx = (lane_id & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
 
     // DEBUG: Print consumer setup for key lanes
-    bool is_debug_lane =
-        (lane_id == 0 || lane_id == 1 || lane_id == 16 || lane_id == 32);
-    if (is_debug_block && is_debug_lane && warp_id == 0) {
-      printf("[CONS_SETUP] tid=%d (warp=%d, lane=%d): a_m_row=%d, a_is_odd=%d, "
-             "a_k_range=%d, a_col_cons=%d\n",
-             tid, warp_id, lane_id, a_m_row, a_is_odd, a_k_range, a_col_cons);
-      printf("[CONS_SETUP] tid=%d: n_col=%d, k_slice=%d, sparsity_idx=0x%04x\n",
-             tid, n_col, k_slice, sparsity_idx);
-    }
+    // bool is_debug_lane =
+    //     (lane_id == 0 || lane_id == 1 || lane_id == 16 || lane_id == 32);
+    // if (is_debug_block && is_debug_lane && warp_id == 0) {
+    //   // __syncthreads();
+    //   printf("[CONS_SETUP] tid=%d (warp=%d, lane=%d): a_m_row=%d, a_is_odd=%d, "
+    //          "a_k_range=%d, a_col_cons=%d\n",
+    //          tid, warp_id, lane_id, a_m_row, a_is_odd, a_k_range, a_col_cons);
+    //   printf("[CONS_SETUP] tid=%d: n_col=%d, k_slice=%d, sparsity_idx=0x%04x\n",
+    //          tid, n_col, k_slice, sparsity_idx);
+    // }
 
     // =========================================================================
     // Main K-outer Loop
@@ -3603,13 +3606,14 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
         auto global_idx = a_row_prod * (KS * 4) + a_k_chunk;
         i8x16 a_loaded = A_tile_base[a_row_prod * (KS * 4) + a_k_chunk];
 
-        if (is_debug_block && is_debug_tid && k_outer == 0) {
-          printf("[A_PROD_LOAD] tid=%d, k_outer=%d: global_idx=%d (row=%d, "
-                 "k_chunk=%d), loaded[0..3]=%d,%d,%d,%d\n",
-                 tid, k_outer, global_idx, a_row_prod, a_k_chunk,
-                 (int32_t)a_loaded[0], (int32_t)a_loaded[1],
-                 (int32_t)a_loaded[2], (int32_t)a_loaded[3]);
-        }
+        // if (is_debug_block && is_debug_tid && k_outer == 0) {
+        //   // __syncthreads();
+        //   printf("[A_PROD_LOAD] tid=%d, k_outer=%d: global_idx=%d (row=%d, "
+        //          "k_chunk=%d), loaded[0..3]=%d,%d,%d,%d\n",
+        //          tid, k_outer, global_idx, a_row_prod, a_k_chunk,
+        //          (int32_t)a_loaded[0], (int32_t)a_loaded[1],
+        //          (int32_t)a_loaded[2], (int32_t)a_loaded[3]);
+        // }
 
         // Swizzle: reorder so even K positions are in first 8 bytes, odd in last 8
         // Input:  reg[0]=K0,K1,K2,K3  reg[1]=K4,K5,K6,K7
@@ -3637,25 +3641,26 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
         // bank_base = A_lds + a_bank * 128 (128 int32s = 512 bytes per bank)
         int32_t *bank_base = A_lds + a_bank * 128;
 
-        if (is_debug_block && is_debug_tid && k_outer == 0) {
-          int lds_offset_base = a_bank * 128;
-          printf(
-              "[A_PROD_STORE] tid=%d: a_bank=%d, bank_base_offset=%d, col=%d\n",
-              tid, a_bank, lds_offset_base, a_col_prod);
-          printf("[A_PROD_STORE] tid=%d: store indices [%d, %d, %d, %d] (bytes "
-                 "[%d, %d, %d, %d])\n",
-                 tid, lds_offset_base + 0 * NB_BANKS + a_col_prod,
-                 lds_offset_base + 1 * NB_BANKS + a_col_prod,
-                 lds_offset_base + 2 * NB_BANKS + a_col_prod,
-                 lds_offset_base + 3 * NB_BANKS + a_col_prod,
-                 (lds_offset_base + 0 * NB_BANKS + a_col_prod) * 4,
-                 (lds_offset_base + 1 * NB_BANKS + a_col_prod) * 4,
-                 (lds_offset_base + 2 * NB_BANKS + a_col_prod) * 4,
-                 (lds_offset_base + 3 * NB_BANKS + a_col_prod) * 4);
-          printf("[A_PROD_STORE] tid=%d: swizzled regs = [0x%08x, 0x%08x, "
-                 "0x%08x, 0x%08x]\n",
-                 tid, reg0, reg1, reg2, reg3);
-        }
+        // if (is_debug_block && is_debug_tid && k_outer == 0) {
+        //   int lds_offset_base = a_bank * 128;
+          // __syncthreads();
+        //   printf(
+        //       "[A_PROD_STORE] tid=%d: a_bank=%d, bank_base_offset=%d, col=%d\n",
+        //       tid, a_bank, lds_offset_base, a_col_prod);
+        //   printf("[A_PROD_STORE] tid=%d: store indices [%d, %d, %d, %d] (bytes "
+        //          "[%d, %d, %d, %d])\n",
+        //          tid, lds_offset_base + 0 * NB_BANKS + a_col_prod,
+        //          lds_offset_base + 1 * NB_BANKS + a_col_prod,
+        //          lds_offset_base + 2 * NB_BANKS + a_col_prod,
+        //          lds_offset_base + 3 * NB_BANKS + a_col_prod,
+        //          (lds_offset_base + 0 * NB_BANKS + a_col_prod) * 4,
+        //          (lds_offset_base + 1 * NB_BANKS + a_col_prod) * 4,
+        //          (lds_offset_base + 2 * NB_BANKS + a_col_prod) * 4,
+        //          (lds_offset_base + 3 * NB_BANKS + a_col_prod) * 4);
+        //   printf("[A_PROD_STORE] tid=%d: swizzled regs = [0x%08x, 0x%08x, "
+        //          "0x%08x, 0x%08x]\n",
+        //          tid, reg0, reg1, reg2, reg3);
+        // }
 
         bank_base[0 * NB_BANKS + a_col_prod] = reg0;  // Line 0: even K bytes 0-3
         bank_base[1 * NB_BANKS + a_col_prod] = reg1;  // Line 1: even K bytes 4-7
@@ -3669,7 +3674,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       // =====================================================================
       // All 256 threads participate
       // B tile: NS × KS × 1024 bytes = NS × KS × 64 vec16 elements
-      #pragma unroll
+      // #pragma unroll
       for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
         B_shared[i + tid] = B_global_ptr[i];
       }
@@ -3696,19 +3701,19 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
         reinterpret_cast<int32_t *>(&a_reg)[1] = a_ptr[NB_BANKS]; // Line 1 or 3
 
         // DEBUG: Print A consumer load for first k_bank iteration
-        if (is_debug_block && is_debug_lane && warp_id == 0 && k_outer == 0 &&
-            k_bank == 0) {
-          int a_cons_offset = k_bank * 512 + a_col_cons * 4 + a_is_odd * 256;
-          printf("[A_CONS_LOAD] tid=%d, k_bank=%d: a_cons_offset=%d "
-                 "(k_bank*512=%d + col*4=%d + odd*256=%d)\n",
-                 tid, k_bank, a_cons_offset, k_bank * 512, a_col_cons * 4,
-                 a_is_odd * 256);
-          printf("[A_CONS_LOAD] tid=%d: a_reg = [0x%08x, 0x%08x] (bytes %d and "
-                 "%d)\n",
-                 tid, reinterpret_cast<int32_t *>(&a_reg)[0],
-                 reinterpret_cast<int32_t *>(&a_reg)[1], a_cons_offset,
-                 a_cons_offset + NB_BANKS * 4);
-        }
+        // if (is_debug_block && is_debug_lane && warp_id == 0 && k_outer == 0 &&
+        //     k_bank == 0) {
+        //   int a_cons_offset = k_bank * 512 + a_col_cons * 4 + a_is_odd * 256;
+        //   printf("[A_CONS_LOAD] tid=%d, k_bank=%d: a_cons_offset=%d "
+        //          "(k_bank*512=%d + col*4=%d + odd*256=%d)\n",
+        //          tid, k_bank, a_cons_offset, k_bank * 512, a_col_cons * 4,
+        //          a_is_odd * 256);
+        //   printf("[A_CONS_LOAD] tid=%d: a_reg = [0x%08x, 0x%08x] (bytes %d and "
+        //          "%d)\n",
+        //          tid, reinterpret_cast<int32_t *>(&a_reg)[0],
+        //          reinterpret_cast<int32_t *>(&a_reg)[1], a_cons_offset,
+        //          a_cons_offset + NB_BANKS * 4);
+        // }
 
         for (int j = 0; j < NS / 4; ++j) {
           int n_block = j * 4 + warp_id;
@@ -3731,22 +3736,23 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
 
           int b_cons_offset = n_block * (KS * 1024) + n_col * (KS * 64) +
                               k_bank * 64 + k_slice * 16;
-          if (is_debug_block && is_debug_lane && warp_id == 0 && k_outer == 0 &&
-              k_bank == 0 && j == 0) {
-            printf("[B_CONS_LOAD] tid=%d, k_bank=%d, j=%d, n_block=%d: "
-                   "b_cons_offset=%d\n",
-                   tid, k_bank, j, n_block, b_cons_offset);
-            printf("[B_CONS_LOAD] tid=%d: breakdown: n_block*%d=%d + "
-                   "n_col*%d=%d + k_bank*64=%d + k_slice*16=%d\n",
-                   tid, KS * 1024, n_block * (KS * 1024), KS * 64,
-                   n_col * (KS * 64), k_bank * 64, k_slice * 16);
-          }
+          // if (is_debug_block && is_debug_lane && warp_id == 0 && k_outer == 0 &&
+          //     k_bank == 0 && j == 0) {
+          //   printf("[B_CONS_LOAD] tid=%d, k_bank=%d, j=%d, n_block=%d: "
+          //          "b_cons_offset=%d\n",
+          //          tid, k_bank, j, n_block, b_cons_offset);
+          //   printf("[B_CONS_LOAD] tid=%d: breakdown: n_block*%d=%d + "
+          //          "n_col*%d=%d + k_bank*64=%d + k_slice*16=%d\n",
+          //          tid, KS * 1024, n_block * (KS * 1024), KS * 64,
+          //          n_col * (KS * 64), k_bank * 64, k_slice * 16);
+          // }
 
           // SMFMAC call
           // cbsz=0, abid=0: select bits [15:0] of sparsity index
           acc[j] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
               a_reg, b_reg, acc[j], sparsity_idx, 0, 0);
         }
+        // __syncthreads();
       }
       __syncthreads();
     }
@@ -3772,11 +3778,12 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     // Output layout per lane (within a wavefront, for first 16 lanes handling cols 0-15):
     //   Lane col: d0 -> output[phys_row_0][col], d1 -> output[phys_row_1][col]
 
-    if (is_debug_block && is_debug_lane && warp_id == 0) {
-      int32_t *regD0 = reinterpret_cast<int32_t *>(&acc[0]);
-      printf("[PRE_FUSE] tid=%d (lane=%d): acc[0] = [%d, %d, %d, %d]\n", tid,
-             lane_id, regD0[0], regD0[1], regD0[2], regD0[3]);
-    }
+    // if (is_debug_block && is_debug_lane && warp_id == 0) {
+    //   // __syncthreads();
+    //   int32_t *regD0 = reinterpret_cast<int32_t *>(&acc[0]);
+    //   printf("[PRE_FUSE] tid=%d (lane=%d): acc[0] = [%d, %d, %d, %d]\n", tid,
+    //          lane_id, regD0[0], regD0[1], regD0[2], regD0[3]);
+    // }
 
     for (int j = 0; j < NS / 4; ++j) {
       int32_t *regD = reinterpret_cast<int32_t *>(&acc[j]);
@@ -3786,12 +3793,13 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     }
 
     // DEBUG: Print post-fuse accumulator values
-    if (is_debug_block && is_debug_lane && warp_id == 0) {
-      int32_t *regD0 = reinterpret_cast<int32_t *>(&acc[0]);
-      printf("[POST_FUSE] tid=%d (lane=%d): acc[0] = [%d, %d, -, -] (fused d0, "
-             "d1)\n",
-             tid, lane_id, regD0[0], regD0[1]);
-    }
+    // if (is_debug_block && is_debug_lane && warp_id == 0) {
+    //   // __syncthreads();
+    //   int32_t *regD0 = reinterpret_cast<int32_t *>(&acc[0]);
+    //   printf("[POST_FUSE] tid=%d (lane=%d): acc[0] = [%d, %d, -, -] (fused d0, "
+    //          "d1)\n",
+    //          tid, lane_id, regD0[0], regD0[1]);
+    // }
 
     // =========================================================================
     // Output Store
@@ -3825,11 +3833,12 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     int32_t *C_tile = static_cast<int32_t *>(C_data) +
                       tile_size * (N_outer * m_outer + n_outer);
 
-    if (is_debug_block && is_debug_lane && warp_id == 0) {
-      printf("[OUT_STORE] tid=%d (lane=%d): m_pair=%d, m0=%d, m1=%d, n_col=%d, "
-             "N_stride=%d\n",
-             tid, lane_id, m_pair, m0, m1, n_col, N_stride);
-    }
+    // if (is_debug_block && is_debug_lane && warp_id == 0) {
+    //   // __syncthreads();
+    //   printf("[OUT_STORE] tid=%d (lane=%d): m_pair=%d, m0=%d, m1=%d, n_col=%d, "
+    //          "N_stride=%d\n",
+    //          tid, lane_id, m_pair, m0, m1, n_col, N_stride);
+    // }
 
     for (int j = 0; j < NS / 4; ++j) {
       int n_block = j * 4 + warp_id;
@@ -3838,16 +3847,17 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       int32_t *regD = reinterpret_cast<int32_t *>(&acc[j]);
 
       // DEBUG: Print output store addresses and values
-      if (is_debug_block && is_debug_lane && warp_id == 0 && j == 0) {
-        int offset0 = m0 * N_stride + n;
-        int offset1 = m1 * N_stride + n;
-        printf("[OUT_STORE] tid=%d, j=%d: n_block=%d, n=%d\n", tid, j, n_block,
-               n);
-        printf("[OUT_STORE] tid=%d: C_tile[%d] = %d (row %d, col %d)\n", tid,
-               offset0, regD[0], m0, n);
-        printf("[OUT_STORE] tid=%d: C_tile[%d] = %d (row %d, col %d)\n", tid,
-               offset1, regD[1], m1, n);
-      }
+      // if (is_debug_block && is_debug_lane && warp_id == 0 && j == 0) {
+      //   // __syncthreads();
+      //   int offset0 = m0 * N_stride + n;
+      //   int offset1 = m1 * N_stride + n;
+      //   printf("[OUT_STORE] tid=%d, j=%d: n_block=%d, n=%d\n", tid, j, n_block,
+      //          n);
+      //   printf("[OUT_STORE] tid=%d: C_tile[%d] = %d (row %d, col %d)\n", tid,
+      //          offset0, regD[0], m0, n);
+      //   printf("[OUT_STORE] tid=%d: C_tile[%d] = %d (row %d, col %d)\n", tid,
+      //          offset1, regD[1], m1, n);
+      // }
       C_tile[m0 * N_stride + n] = regD[0];
       C_tile[m1 * N_stride + n] = regD[1];
     }
@@ -4283,8 +4293,9 @@ int main() {
   std::printf("\n\n\nSMFMAC sparse trick INT8 experiments:\n\n");
   // Template: <NS, KS> where K_tile = KS * 64, N_tile = NS * 16
   // KS=2 matches reference implementation (8×128 A tile)
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 4>());
   // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 8>());
   // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
   // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
