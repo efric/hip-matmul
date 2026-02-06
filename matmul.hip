@@ -3454,6 +3454,10 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     using i8x8 = __attribute__((__vector_size__(8))) int8_t;    // 2 VGPRs for A
     using i8x16 = __attribute__((__vector_size__(16))) int8_t;  // 4 VGPRs for B
     using i32x4 = __attribute__((__vector_size__(16))) int32_t; // 4 VGPRs for D
+    union {
+      i8x8 vec;
+      int32_t i32[2];
+    } a_reg;
 
     i32x4 acc[NS / 4] = {{0}};
 
@@ -3630,7 +3634,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
             "v_pack_b32_f16 %1, %6, %7 op_sel:[0,0]\n\t"  // reg1 = lo(in2) | lo(in3)<<16
             "v_pack_b32_f16 %2, %4, %5 op_sel:[1,1]\n\t"  // reg2 = hi(in0) | hi(in1)<<16
             "v_pack_b32_f16 %3, %6, %7 op_sel:[1,1]\n\t"  // reg3 = hi(in2) | hi(in3)<<16
-            : "=v"(reg0), "=v"(reg1), "=v"(reg2), "=v"(reg3)
+            : "=&v"(reg0), "=&v"(reg1), "=&v"(reg2), "=&v"(reg3)
             : "v"(reinterpret_cast<int32_t *>(&a_loaded)[0]),
               "v"(reinterpret_cast<int32_t *>(&a_loaded)[1]),
               "v"(reinterpret_cast<int32_t *>(&a_loaded)[2]),
@@ -3696,9 +3700,11 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
         int8_t *a_cons = A_shared + k_bank * 512 + a_col_cons * 4 + a_is_odd * 256;
         int32_t *a_ptr = reinterpret_cast<int32_t *>(a_cons);
         // i8x8 a_reg = {a_ptr[0], a_ptr[NB_BANKS]};
-        i8x8 a_reg;
-        reinterpret_cast<int32_t *>(&a_reg)[0] = a_ptr[0];        // Line 0 or 2
-        reinterpret_cast<int32_t *>(&a_reg)[1] = a_ptr[NB_BANKS]; // Line 1 or 3
+        // i8x8 a_reg;
+        // reinterpret_cast<int32_t *>(&a_reg)[0] = a_ptr[0];        // Line 0 or 2
+        // reinterpret_cast<int32_t *>(&a_reg)[1] = a_ptr[NB_BANKS]; // Line 1 or 3
+        a_reg.i32[0] = a_ptr[0];        // Line 0 or 2
+        a_reg.i32[1] = a_ptr[NB_BANKS]; // Line 1 or 3
 
         // DEBUG: Print A consumer load for first k_bank iteration
         // if (is_debug_block && is_debug_lane && warp_id == 0 && k_outer == 0 &&
@@ -3750,7 +3756,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
           // SMFMAC call
           // cbsz=0, abid=0: select bits [15:0] of sparsity index
           acc[j] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
-              a_reg, b_reg, acc[j], sparsity_idx, 0, 0);
+              a_reg.vec, b_reg, acc[j], sparsity_idx, 0, 0);
         }
         // __syncthreads();
       }
@@ -4294,9 +4300,8 @@ int main() {
   // Template: <NS, KS> where K_tile = KS * 64, N_tile = NS * 16
   // KS=2 matches reference implementation (8×128 A tile)
   // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 4>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 8>());
   // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
   // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
   // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
