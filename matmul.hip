@@ -3314,15 +3314,8 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
     int n_outer = blockIdx.y;
     int tid = threadIdx.x;
 
-    // M tile = MS * 16 = 128 
-    // Total bytes in A tile (128 x 32)
-    // M_tile x K_tile x sizeof(int8) = 128 * 32 * 1 = 4096 bytes
-    // Each int8x8_t = 8 bytes
-    // So A tile size in int8x8_t = 4096 / 8 = 512
-    // this should really be MS * 
-    // 1 * 16
-    constexpr int A_tile_size_in_vec8 = MS * 16 * 4; // 8 * 16 * 4 = 512
-    constexpr int B_tile_size_in_vec8 = NS * 16 * 4; // 8 * 16 * 4 = 512
+    constexpr int A_tile_size_in_vec8 = MS * 16 * 4;
+    constexpr int B_tile_size_in_vec8 = NS * 16 * 4;
 
     const int8x8_t *A_global = static_cast<const int8x8_t *>(A_data) +
                                m_outer * K_outer * A_tile_size_in_vec8;
@@ -3331,13 +3324,12 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
     const int8x8_t *A_global_ptr = A_global + tid;
     const int8x8_t *B_global_ptr = B_global + tid;
 
-    // so we have enough shared memory for 8 MFMAs
-    __shared__ int8x8_t A_shared[A_tile_size_in_vec8]; //512 * (64/8) = 4096 bytes / 8 = 512 per MFMA call which is 16 * 32 = correct
+    __shared__ int8x8_t A_shared[A_tile_size_in_vec8];
     __shared__ int8x8_t B_shared[B_tile_size_in_vec8];
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       for (int i = 0; i < A_tile_size_in_vec8; i += 256) { 
-        A_shared[i + tid] = A_global_ptr[i]; // 64bits load // 256 * 8 = 2048 bytes total, 2 iterations = 4096
+        A_shared[i + tid] = A_global_ptr[i];
       }
       for (int j = 0; j < B_tile_size_in_vec8; j += 256) {
         B_shared[j + tid] = B_global_ptr[j];
@@ -3346,42 +3338,8 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
       B_global_ptr += B_tile_size_in_vec8;
       __syncthreads();
 
-      // in total would run 16 times/16 MFMAs per tile
       for (int i = 0; i < MS; ++i) { 
         for (int j = 0; j < NS / 4; ++j) { 
-            // i = 0 -> 8 gives us 512
-            // j = 0 -> 2 gives us 512
-            /*
-            i = 0
-              tid = 0 -> 64 * 0 + (0 % 64) = 0
-              tid = 1 -> 64 * 0 + (1 % 64) = 1
-              tid = 254 -> 64 * 0 + (254 % 64) = 62
-              tid = 255 -> 64 * 0 + (255 % 64) = 63
-            i = 1
-              tid = 0 -> 64 * 1 + (0 % 64) = 64
-              tid = 1 -> 64 * 1 + (1 % 64) = 65
-              tid = 254 -> 64 * 1 + (254 % 64) = 126
-              tid = 255 -> 64 * 1 + (255 % 64) = 127
-            i = 2
-              tid = 0 -> 64 * 2 + (0 % 64) = 128
-              tid = 1 -> 64 * 2 + (1 % 64) = 129
-              tid = 254 -> 64 * 2 + (254 % 64) = 190
-              tid = 255 -> 64 * 2 + (255 % 64) = 191
-            j = 0
-              tid = 0 -> 256 * 0 + 0 = 0
-              tid = 1 -> 256 * 0 + 1 = 1
-              tid = 254 -> 256 * 0 + 254 = 254
-              tid = 255 -> 256 * 0 + 255 = 255
-            j = 1
-              tid = 0 -> 256 * 1 + 0 = 256
-              tid = 1 -> 256 * 1 + 1 = 257
-              tid = 254 -> 256 * 1 + 254 = 510
-              tid = 255 -> 256 * 1 + 255 = 511
-            */
-            /*
-            j hits 4 MFMAs ( 256 / 64 = 4 subgroups) 
-            // i broadcasts value to j each time
-            */
           acc[i][j] = __builtin_amdgcn_mfma_i32_16x16x32_i8(
               A_shared[64 * i + (tid % 64)], B_shared[256 * j + tid], acc[i][j],
               0, 0, 0);
