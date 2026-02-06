@@ -3532,6 +3532,166 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
   }
 };
 
+template <int NS, int KS>
+class MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared
+    : public MmtKernel {
+  static_assert(NS >= 4 && !(NS % 4));
+  static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
+
+  static constexpr int SPARSITY_EVEN = 0x00000044;
+  static constexpr int SPARSITY_ODD = 0x000000EE;
+  static constexpr int NB_BANKS = 32;
+
+  virtual Type A_type() const override { return Type::FP16; }
+  virtual Type B_type() const override { return Type::FP16; }
+  virtual Type C_type() const override { return Type::FP32; }
+  virtual int M_tile() const override { return 8; }
+  virtual int N_tile() const override { return NS * 16; }
+  virtual int K_tile() const override { return KS * 32; }
+
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return m * (KS * 32) + k; };
+  }
+
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int n_block = n / 16;
+      int n_col = n % 16;
+      return n_block * (KS * 512) + n_col * (KS * 32) + k;
+    };
+  }
+
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return m * (NS * 16) + n; };
+  }
+
+  virtual int num_threads() const override { return 256; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
+    using f16x4 =
+        __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
+    using f16x8 =
+        __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
+    using f32x4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+    using i8x16 = __attribute__((__vector_size__(16))) int8_t;
+
+    union {
+      f16x4 vec;
+      int32_t i32[2];
+    } a_reg;
+
+    f32x4 acc[NS / 4] = {{0}};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int tid = threadIdx.x;
+    int lane_id = tid % 64;
+    int warp_id = tid / 64;
+
+    constexpr int A_tile_size_in_vec16 = 8 * KS * 4;
+    constexpr int B_tile_size_in_vec16 = NS * KS * 64;
+
+    const i8x16 *A_global = static_cast<const i8x16 *>(A_data) +
+                            m_outer * K_outer * A_tile_size_in_vec16;
+    const i8x16 *B_global = static_cast<const i8x16 *>(B_data) +
+                            n_outer * K_outer * B_tile_size_in_vec16;
+    const i8x16 *B_global_ptr = B_global + tid;
+
+    __shared__ int8_t A_shared[KS * 512];
+    __shared__ i8x16 B_shared[B_tile_size_in_vec16];
+
+    int a_row_prod = tid / (KS * 4);
+    int a_k_chunk = tid % (KS * 4);
+    int a_bank = a_k_chunk / 4;
+    int k_chunk_in_bank = a_k_chunk % 4;
+    int a_col_prod = a_row_prod + k_chunk_in_bank * 8;
+
+    int32_t *A_lds = reinterpret_cast<int32_t *>(A_shared);
+
+    int a_m_row = (lane_id % 16) / 2;
+    int a_is_odd = lane_id % 2;
+    int a_k_range = lane_id / 16;
+    int a_col_cons = a_m_row + a_k_range * 8;
+
+    int n_col = lane_id % 16;
+    int k_slice = lane_id / 16;
+
+    int sparsity_idx = (lane_id & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      const i8x16 *A_tile_base = A_global + k_outer * A_tile_size_in_vec16;
+
+      if (tid < A_tile_size_in_vec16) {
+        auto global_idx = a_row_prod * (KS * 4) + a_k_chunk;
+        i8x16 a_loaded = A_tile_base[a_row_prod * (KS * 4) + a_k_chunk];
+        int32_t reg0 = reinterpret_cast<int32_t *>(&a_loaded)[0]; // [K0, K1]
+        int32_t reg1 = reinterpret_cast<int32_t *>(&a_loaded)[1]; // [K2, K3]
+        int32_t reg2 = reinterpret_cast<int32_t *>(&a_loaded)[2]; // [K4, K5]
+        int32_t reg3 = reinterpret_cast<int32_t *>(&a_loaded)[3]; // [K6, K7]
+
+        int32_t *bank_base = A_lds + a_bank * 128;
+        bank_base[0 * NB_BANKS + a_col_prod] = reg0; // Line 0: EVEN [K0, K1]
+        bank_base[1 * NB_BANKS + a_col_prod] = reg2; // Line 1: EVEN [K4, K5]
+        bank_base[2 * NB_BANKS + a_col_prod] = reg1; // Line 2: ODD  [K2, K3]
+        bank_base[3 * NB_BANKS + a_col_prod] = reg3; // Line 3: ODD  [K6, K7]
+      }
+
+      for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
+        B_shared[i + tid] = B_global_ptr[i];
+      }
+      B_global_ptr += B_tile_size_in_vec16;
+      __syncthreads();
+
+      for (int k_bank = 0; k_bank < KS; ++k_bank) {
+        int8_t *a_cons =
+            A_shared + k_bank * 512 + a_col_cons * 4 + a_is_odd * 256;
+        int32_t *a_ptr = reinterpret_cast<int32_t *>(a_cons);
+        a_reg.i32[0] = a_ptr[0];
+        a_reg.i32[1] = a_ptr[NB_BANKS];
+
+        for (int j = 0; j < NS / 4; ++j) {
+          int n_block = j * 4 + warp_id;
+
+          int8_t *b_cons = reinterpret_cast<int8_t *>(B_shared) +
+                           n_block * (KS * 1024) + n_col * (KS * 64) +
+                           k_bank * 64 + k_slice * 16;
+          f16x8 b_reg = *reinterpret_cast<f16x8 *>(b_cons);
+
+          acc[j] = __builtin_amdgcn_smfmac_f32_16x16x32_f16(
+              a_reg.vec, b_reg, acc[j], sparsity_idx, 0, 0);
+        }
+      }
+    }
+
+    for (int j = 0; j < NS / 4; ++j) {
+      float *regD = reinterpret_cast<float *>(&acc[j]);
+      regD[0] = regD[0] + regD[1];
+      regD[1] = regD[2] + regD[3];
+    }
+
+    constexpr int N_stride = NS * 16;
+    int m_pair = lane_id / 16;
+    int m0 = m_pair * 2;
+    int m1 = m_pair * 2 + 1;
+
+    constexpr int tile_size = 8 * NS * 16;
+    float *C_tile = static_cast<float *>(C_data) +
+                    tile_size * (N_outer * m_outer + n_outer);
+
+    for (int j = 0; j < NS / 4; ++j) {
+      int n_block = j * 4 + warp_id;
+      int n = n_block * 16 + n_col;
+
+      float *regD = reinterpret_cast<float *>(&acc[j]);
+      C_tile[m0 * N_stride + n] = regD[0];
+      C_tile[m1 * N_stride + n] = regD[1];
+    }
+  }
+};
+
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2
     : public MmtKernel {
@@ -3963,6 +4123,12 @@ int main() {
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<16, 2>());
 
   std::printf("\n\n\nStream-K experiments:\n\n");
   test(
