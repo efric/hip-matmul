@@ -3622,6 +3622,376 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
   }
 };
 
+// ==========================================================================
+// F16 SMFMAC Sparse Trick Kernel: V_SMFMAC_F32_16x16x32_F16
+//
+// This kernel uses the same "sparse trick" as the I8 SMFMAC variant above:
+//   - 8 physical M-rows are mapped onto 16 logical SMFMAC M-rows by pairing
+//     adjacent lanes: even-lane-ID threads handle EVEN K positions, odd-lane-ID
+//     threads handle ODD K positions for the *same* physical row.
+//   - The SMFMAC instruction's built-in 4:2 structured sparsity support
+//     selects the appropriate K positions via compression indices.
+//   - After the SMFMAC loop, partial sums from even/odd K halves are fused
+//     (added) to produce the complete dense result.
+//
+// Key differences from the I8 variant (smfmac_i32_16x16x64_i8):
+//
+//   1. K per SMFMAC: 32 (not 64). But f16=2 bytes vs i8=1 byte, so
+//      byte counts are identical: 32*2 = 64*1 = 64 bytes per K-range.
+//      This means all shared memory sizes, tile sizes in vec16 units,
+//      and byte-level pointer arithmetic remain unchanged.
+//
+//   2. Sparsity indices: 8-bit (0x44/0xEE) not 16-bit (0x4444/0xEEEE).
+//      For V_SMFMAC_F32_16x16x32_F16 with CBSZ=0, ABID=0, the hardware
+//      reads bits[7:0] of the index VGPR. Each 4-bit nibble encodes two
+//      2-bit selectors choosing 2-of-4 K positions in a group.
+//      (For I8, bits[15:0] are read — 4 nibbles for 4 groups of 4.)
+//
+//   3. A swizzle is trivial: no v_pack_b32_f16 assembly needed.
+//      For f16, each 32-bit register holds exactly 2 f16 values, which
+//      are naturally aligned to even/odd K-position boundaries:
+//        Input:  reg[0]=[K0,K1]  reg[1]=[K2,K3]  reg[2]=[K4,K5]  reg[3]=[K6,K7]
+//        EVEN:   reg[0]=[K0,K1], reg[2]=[K4,K5]
+//        ODD:    reg[1]=[K2,K3], reg[3]=[K6,K7]
+//      The "swizzle" is just storing registers in order [0, 2, 1, 3].
+//
+//   4. Accumulator and output are f32 (not i32).
+//
+//   5. Tile layout functions use f16-element offsets:
+//        A: m*(KS*32)+k     (vs m*(KS*64)+k for i8)
+//        B: n_blk*(KS*512)+n_col*(KS*32)+k  (vs n_blk*(KS*1024)+n_col*(KS*64)+k)
+//
+// Register layout (verified via matrix_calculator.py for CDNA3):
+//
+//   A (sparse, 2 VGPRs = f16x4):
+//     Lane i (0..15):  v0 = A[i][0..3], v1 = A[i][4..7]   (K-range 0..7)
+//     Lane i+16:       v0 = A[i][8..11], v1 = A[i][12..15] (K-range 8..15)
+//     Lane i+32:       v0 = A[i][16..19], v1 = A[i][20..23] (K-range 16..23)
+//     Lane i+48:       v0 = A[i][24..27], v1 = A[i][28..31] (K-range 24..31)
+//     Each VGPR holds 2 f16 values; sparsity selects which 2-of-4 they represent.
+//
+//   B (dense, 4 VGPRs = f16x8):
+//     Lane j (0..15):  v0=[B[0][j],B[1][j]], v1=[B[2][j],B[3][j]], ...
+//                      v3=[B[6][j],B[7][j]]  (K 0..7, N-col j)
+//     Lane j+16:       K 8..15, N-col j
+//     Lane j+32:       K 16..23, N-col j
+//     Lane j+48:       K 24..31, N-col j
+//
+//   D (4 VGPRs = f32x4):
+//     Lane j (0..15):  v0=D[0][j], v1=D[1][j], v2=D[2][j], v3=D[3][j]
+//     Lane j+16:       D[4..7][j]
+//     Lane j+32:       D[8..11][j]
+//     Lane j+48:       D[12..15][j]
+//
+//   Compression index (8 bits per lane, CBSZ=0, ABID=0 → bits[7:0]):
+//     bits[3:0]: 2-of-4 selector for K group {k, k+1, k+2, k+3}
+//     bits[7:4]: 2-of-4 selector for K group {k+4, k+5, k+6, k+7}
+//     0x44 = 0100_0100: positions {0,1} from each group (EVEN)
+//     0xEE = 1110_1110: positions {2,3} from each group (ODD)
+// ==========================================================================
+template <int NS, int KS>
+class MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared
+    : public MmtKernel {
+  static_assert(NS >= 4 && !(NS % 4));
+  static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
+
+  // Sparsity indices for the sparse trick (F16: 8-bit compression indices).
+  //
+  // For V_SMFMAC_F32_16x16x32_F16 with CBSZ=0, ABID=0:
+  //   Hardware reads bits[7:0] of the sparsity index register.
+  //   Each 4-bit nibble contains two 2-bit selectors for one group of 4 K-values.
+  //     nibble 0x4 = 01_00 → selects positions {0, 1}
+  //     nibble 0xE = 11_10 → selects positions {2, 3}
+  //
+  // EVEN: both nibbles = 0x4 → 0x44 → selects K0,K1 and K4,K5
+  // ODD:  both nibbles = 0xE → 0xEE → selects K2,K3 and K6,K7
+  static constexpr int SPARSITY_EVEN = 0x00000044;
+  static constexpr int SPARSITY_ODD  = 0x000000EE;
+  static constexpr int NB_BANKS = 32;
+
+  virtual Type A_type() const override { return Type::FP16; }
+  virtual Type B_type() const override { return Type::FP16; }
+  virtual Type C_type() const override { return Type::FP32; }
+  virtual int M_tile() const override { return 8; }
+  virtual int N_tile() const override { return NS * 16; }
+  virtual int K_tile() const override { return KS * 32; }
+
+  virtual tile_layout_func_t A_tile_layout() const override {
+    // A tile: 8 rows × (KS * 32) f16 K-elements, row-major.
+    // Element offset: A[m][k] = m * K_tile + k
+    return [](int m, int k) {
+      return m * (KS * 32) + k;
+    };
+  }
+
+  virtual tile_layout_func_t B_tile_layout() const override {
+    // B tile: NS N-blocks × 16 N-cols × (KS * 32) f16 K-elements.
+    // Layout: [n_block][n_col][k] where n = n_block * 16 + n_col
+    //
+    // Element offset: n_block * (KS * 512) + n_col * (KS * 32) + k
+    //   where KS * 512 = 16 cols × KS × 32 K-elements/col
+    //
+    // In bytes: n_block * (KS * 1024) + n_col * (KS * 64) + k * 2
+    // Note that the byte-level layout is identical to the I8 variant because
+    // 32 f16 × 2 bytes = 64 bytes = 64 i8 × 1 byte per K-range.
+    return [](int n, int k) {
+      int n_block = n / 16;
+      int n_col = n % 16;
+      return n_block * (KS * 512) + n_col * (KS * 32) + k;
+    };
+  }
+
+  virtual tile_layout_func_t C_tile_layout() const override {
+    // Row-major layout within the tile: C[m][n] at offset m * N_tile + n
+    return [](int m, int n) {
+      return m * (NS * 16) + n;
+    };
+  }
+
+  virtual int num_threads() const override { return 256; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
+    // Vector types for V_SMFMAC_F32_16x16x32_F16 operands:
+    //   A: f16x4 = 4 × _Float16 = 8 bytes = 2 VGPRs (sparse compressed input)
+    //   B: f16x8 = 8 × _Float16 = 16 bytes = 4 VGPRs (dense input)
+    //   D: f32x4 = 4 × float = 16 bytes = 4 VGPRs (accumulator)
+    using f16x4 = __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
+    using f16x8 = __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
+    using f32x4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+    // i8x16: 16-byte vector for type-agnostic global/shared memory loads.
+    // The SMFMAC instruction interprets the register contents as f16 regardless
+    // of the pointer type used to load them.
+    using i8x16 = __attribute__((__vector_size__(16))) int8_t;
+
+    // Union for A register: load as int32 words from LDS, pass as f16x4
+    // to the SMFMAC intrinsic.
+    //   i32[0] = v0 = 2 packed f16 values (first half of K-range)
+    //   i32[1] = v1 = 2 packed f16 values (second half of K-range)
+    union {
+      f16x4 vec;
+      int32_t i32[2];
+    } a_reg;
+
+    f32x4 acc[NS / 4] = {{0}};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int tid = threadIdx.x;
+    int lane_id = tid % 64;
+    int warp_id = tid / 64;
+
+    // Tile sizes in 16-byte (vec16) units.
+    //
+    // These are byte-identical to the I8 kernel because:
+    //   A: 8 rows × KS × 32 f16 × 2 bytes = KS × 512 bytes = KS × 32 vec16
+    //   B: NS × 16 cols × KS × 32 f16 × 2 bytes = NS × KS × 1024 bytes
+    //      = NS × KS × 64 vec16
+    constexpr int A_tile_size_in_vec16 = 8 * KS * 4;
+    constexpr int B_tile_size_in_vec16 = NS * KS * 64;
+
+    const i8x16 *A_global = static_cast<const i8x16 *>(A_data) +
+                            m_outer * K_outer * A_tile_size_in_vec16;
+    const i8x16 *B_global = static_cast<const i8x16 *>(B_data) +
+                            n_outer * K_outer * B_tile_size_in_vec16;
+    const i8x16 *B_global_ptr = B_global + tid;
+
+    // Shared memory layout (byte counts identical to I8 kernel):
+    //   A_shared: KS banks × 4 lines × 32 columns × 4 bytes = KS × 512 bytes
+    //     Each bank stores one SMFMAC's worth of A data (32 K-values × 8 rows).
+    //     Lines 0-1: EVEN K data (positions {0,1} and {4,5} from each group of 4)
+    //     Lines 2-3: ODD K data (positions {2,3} and {6,7} from each group of 4)
+    //   B_shared: NS × KS × 64 vec16 = NS × KS × 1024 bytes
+    __shared__ int8_t A_shared[KS * 512];
+    __shared__ i8x16 B_shared[B_tile_size_in_vec16];
+
+    // === A tile producer coordinates ===
+    // Each producer thread loads one vec16 (16 bytes = 8 f16 values) from global
+    // memory and stores 4 swizzled int32 words to A_shared.
+    //
+    // Thread mapping (identical to I8):
+    //   a_row_prod: which of the 8 physical M-rows (0..7)
+    //   a_k_chunk: which 16-byte chunk along K (0..KS*4-1)
+    //   a_bank: which K-bank this chunk belongs to (0..KS-1)
+    //   k_chunk_in_bank: position within the bank (0..3)
+    //   a_col_prod: LDS column index = a_row_prod + k_chunk_in_bank * 8
+    //
+    // Only threads 0..A_tile_size_in_vec16-1 participate in A production.
+    int a_row_prod = tid / (KS * 4);
+    int a_k_chunk = tid % (KS * 4);
+    int a_bank = a_k_chunk / 4;
+    int k_chunk_in_bank = a_k_chunk % 4;
+    int a_col_prod = a_row_prod + k_chunk_in_bank * 8;
+
+    int32_t *A_lds = reinterpret_cast<int32_t *>(A_shared);
+
+    // === A tile consumer coordinates ===
+    // The sparse trick maps pairs of adjacent lanes to the same physical M-row:
+    //   a_m_row = (lane_id % 16) / 2: physical row (0..7)
+    //   a_is_odd = lane_id % 2: 0 for EVEN K, 1 for ODD K
+    //   a_k_range = lane_id / 16: which K-range group (0..3)
+    //
+    // The intrinsic sees 16 logical rows:
+    //   Logical row 2*r+0 = physical row r, EVEN K
+    //   Logical row 2*r+1 = physical row r, ODD K
+    int a_m_row = (lane_id % 16) / 2;
+    int a_is_odd = lane_id % 2;
+    int a_k_range = lane_id / 16;
+    int a_col_cons = a_m_row + a_k_range * 8;
+
+    // B consumer coordinates:
+    //   n_col = lane_id % 16: which N-column within an N-block
+    //   k_slice = lane_id / 16: which 8-K-value slice (0..3)
+    int n_col = lane_id % 16;
+    int k_slice = lane_id / 16;
+
+    // Sparsity index: even-numbered lanes use EVEN, odd-numbered lanes use ODD.
+    int sparsity_idx = (lane_id & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      const i8x16 *A_tile_base = A_global + k_outer * A_tile_size_in_vec16;
+
+      if (tid < A_tile_size_in_vec16) {
+        auto global_idx = a_row_prod * (KS * 4) + a_k_chunk;
+        i8x16 a_loaded = A_tile_base[a_row_prod * (KS * 4) + a_k_chunk];
+
+        // ==================================================================
+        // F16 A swizzle: simple register reorder (NO v_pack assembly needed).
+        //
+        // Each 32-bit register holds exactly 2 packed f16 values.
+        // The 16-byte load yields 8 consecutive f16 K-values in 4 registers:
+        //
+        //   reg[0] = [K0, K1]   (2 f16, positions 0-1 of first group of 4)
+        //   reg[1] = [K2, K3]   (2 f16, positions 2-3 of first group of 4)
+        //   reg[2] = [K4, K5]   (2 f16, positions 0-1 of second group of 4)
+        //   reg[3] = [K6, K7]   (2 f16, positions 2-3 of second group of 4)
+        //
+        // EVEN sparsity (0x44) selects positions {0,1} from each group of 4,
+        // so the hardware expects:
+        //   v0 = [K0, K1] = reg[0]     (from group 0..3)
+        //   v1 = [K4, K5] = reg[2]     (from group 4..7)
+        //
+        // ODD sparsity (0xEE) selects positions {2,3} from each group of 4:
+        //   v0 = [K2, K3] = reg[1]
+        //   v1 = [K6, K7] = reg[3]
+        //
+        // LDS store order: line 0 = reg[0], line 1 = reg[2],
+        //                  line 2 = reg[1], line 3 = reg[3]
+        //
+        // Compare to I8 where v_pack_b32_f16 was needed because each i32
+        // holds 4 i8 values and even/odd separation required extracting
+        // alternating 16-bit halves across registers.
+        // ==================================================================
+        int32_t reg0 = reinterpret_cast<int32_t *>(&a_loaded)[0];  // [K0, K1]
+        int32_t reg1 = reinterpret_cast<int32_t *>(&a_loaded)[1];  // [K2, K3]
+        int32_t reg2 = reinterpret_cast<int32_t *>(&a_loaded)[2];  // [K4, K5]
+        int32_t reg3 = reinterpret_cast<int32_t *>(&a_loaded)[3];  // [K6, K7]
+
+        // Store to LDS with even/odd separation.
+        // LDS layout: KS banks × 4 lines × 32 columns × 4 bytes
+        // bank_base = A_lds + a_bank * 128 (128 int32s = 512 bytes per bank)
+        int32_t *bank_base = A_lds + a_bank * 128;
+
+        bank_base[0 * NB_BANKS + a_col_prod] = reg0;  // Line 0: EVEN [K0, K1]
+        bank_base[1 * NB_BANKS + a_col_prod] = reg2;  // Line 1: EVEN [K4, K5]
+        bank_base[2 * NB_BANKS + a_col_prod] = reg1;  // Line 2: ODD  [K2, K3]
+        bank_base[3 * NB_BANKS + a_col_prod] = reg3;  // Line 3: ODD  [K6, K7]
+      }
+
+      // B tile: NS × KS × 1024 bytes = NS × KS × 64 vec16 elements.
+      // Loaded identically to I8 (same byte count per tile).
+      for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
+        B_shared[i + tid] = B_global_ptr[i];
+      }
+      B_global_ptr += B_tile_size_in_vec16;
+      __syncthreads();
+
+      // SMFMAC Loop: KS banks × (NS/4) N-block iterations
+      for (int k_bank = 0; k_bank < KS; ++k_bank) {
+        // A consumer load (8 bytes = 2 VGPRs = 4 packed f16 values).
+        // Pointer formula (byte-identical to I8):
+        //   k_bank * 512: bank offset (512 bytes per bank)
+        //   a_col_cons * 4: column offset (4 bytes per int32 column)
+        //   a_is_odd * 256: line offset (lines 0-1 for EVEN, lines 2-3 for ODD)
+        //
+        // Loads two int32 words separated by NB_BANKS (one line stride):
+        //   i32[0] = line 0 or 2 → SMFMAC v0 (first 2 f16 of compressed K)
+        //   i32[1] = line 1 or 3 → SMFMAC v1 (second 2 f16 of compressed K)
+        int8_t *a_cons = A_shared + k_bank * 512 + a_col_cons * 4 + a_is_odd * 256;
+        int32_t *a_ptr = reinterpret_cast<int32_t *>(a_cons);
+        a_reg.i32[0] = a_ptr[0];        // Line 0 or 2
+        a_reg.i32[1] = a_ptr[NB_BANKS]; // Line 1 or 3
+
+        for (int j = 0; j < NS / 4; ++j) {
+          int n_block = j * 4 + warp_id;
+
+          // B consumer load (16 bytes = 4 VGPRs = 8 packed f16 values).
+          // Byte-level formula identical to I8:
+          //   n_block * (KS * 1024): per N-block offset
+          //   n_col * (KS * 64): per N-column offset (KS × 32 f16 × 2 = KS × 64 bytes)
+          //   k_bank * 64: which 32-K-value bank (32 × 2 = 64 bytes)
+          //   k_slice * 16: which 8-K-value slice (8 × 2 = 16 bytes)
+          int8_t *b_cons = reinterpret_cast<int8_t *>(B_shared)
+                         + n_block * (KS * 1024)
+                         + n_col * (KS * 64)
+                         + k_bank * 64
+                         + k_slice * 16;
+          f16x8 b_reg = *reinterpret_cast<f16x8 *>(b_cons);
+
+          // V_SMFMAC_F32_16x16x32_F16: sparse f16 matmul with f32 accumulation.
+          // cbsz=0, abid=0: hardware reads bits[7:0] of sparsity_idx.
+          acc[j] = __builtin_amdgcn_smfmac_f32_16x16x32_f16(
+              a_reg.vec, b_reg, acc[j], sparsity_idx, 0, 0);
+        }
+      }
+      __syncthreads(); //is this necessary?
+    }
+
+    // Post-processing: Fuse partial sums from even/odd K positions.
+    //
+    // With the sparse trick, the SMFMAC computes (per lane):
+    //   D[0][col] = physical_row_0 × B[col] using EVEN K positions (sparsity 0x44)
+    //   D[1][col] = physical_row_0 × B[col] using ODD K positions  (sparsity 0xEE)
+    //   D[2][col] = physical_row_1 × B[col] using EVEN K positions
+    //   D[3][col] = physical_row_1 × B[col] using ODD K positions
+    //
+    // After fuse (float addition for f32 accumulators):
+    //   d0 = D[0] + D[1] = complete result for physical_row_0, this lane's column
+    //   d1 = D[2] + D[3] = complete result for physical_row_1, this lane's column
+    for (int j = 0; j < NS / 4; ++j) {
+      float *regD = reinterpret_cast<float *>(&acc[j]);
+      regD[0] = regD[0] + regD[1];
+      regD[1] = regD[2] + regD[3];
+    }
+
+    // C store: write fused results to global memory (row-major, float).
+    //
+    // m_pair = lane_id / 16 determines which pair of physical M-rows:
+    //   m_pair 0 → rows 0,1; m_pair 1 → rows 2,3; etc.
+    // This is because the D layout maps 4 consecutive rows to each 16-lane group,
+    // and the sparse trick pairs them as (even_row, odd_row).
+    constexpr int N_stride = NS * 16;
+    int m_pair = lane_id / 16;
+    int m0 = m_pair * 2;
+    int m1 = m_pair * 2 + 1;
+
+    constexpr int tile_size = 8 * NS * 16;
+    float *C_tile = static_cast<float *>(C_data) +
+                    tile_size * (N_outer * m_outer + n_outer);
+
+    for (int j = 0; j < NS / 4; ++j) {
+      int n_block = j * 4 + warp_id;
+      int n = n_block * 16 + n_col;
+
+      float *regD = reinterpret_cast<float *>(&acc[j]);
+      C_tile[m0 * N_stride + n] = regD[0];
+      C_tile[m1 * N_stride + n] = regD[1];
+    }
+  }
+};
+
 
 
 template <int MS, int NS>
@@ -4055,6 +4425,14 @@ int main() {
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
+
+  std::printf("\n\n\nSMFMAC sparse trick FP16 experiments:\n\n");
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<16, 2>());
 
   std::printf("\n\n\nStream-K experiments:\n\n");
   test(
