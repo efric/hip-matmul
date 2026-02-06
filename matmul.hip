@@ -3623,6 +3623,354 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
 };
 
 // ==========================================================================
+// CDNA4 I8 SMFMAC Sparse Trick Kernel: V_SMFMAC_I32_16X16X128_I8
+//
+// CDNA4 variant of the sparse trick kernel above, targeting the doubled K-depth
+// instruction V_SMFMAC_I32_16X16X128_I8 (opcode 58, gfx950).
+//
+// The sparse trick is unchanged: 8 physical M-rows are mapped onto 16 logical
+// SMFMAC M-rows by pairing adjacent lanes (even/odd) for the same physical row
+// with complementary K positions (K%4 in {0,1} vs K%4 in {2,3}).
+//
+// Key differences from the CDNA3 16x16x64 variant:
+//   - K per SMFMAC: 128 (vs 64). Each SMFMAC covers twice the K range.
+//   - A operand: 4 VGPRs per lane (vs 2). The ISA index layout references
+//     V0-V3, confirmed by A[16][64] compressed storage (ISA manual line 2644).
+//   - B operand: 8 VGPRs per lane (vs 4). The ISA B layout table (line 2648)
+//     shows v0-v7 covering K=0-127 in two non-contiguous 64-element blocks.
+//   - D operand: 4 VGPRs per lane (unchanged, 16x16 output).
+//   - Sparsity index: full 32-bit single set. CBSZ/ABID are ignored for
+//     16x16x128 IU8 variants (ISA manual line 2500).
+//   - Each pass covers TWO non-contiguous K blocks of 16 (e.g., pass 0 handles
+//     K=0-15 AND K=64-79), per the B layout table. This requires the A LDS
+//     layout to store low-K and high-K halves in separate line pairs.
+//
+// ISA reference: amdgpu-isa-manuals/cdna4/README.md
+//   - Section 7.5.1.2 (line 2548): 8-bit A/B matrix layouts
+//   - IU8 B layout table (line 2648): B[128][16] register mapping
+//   - IU8 index layout (line 2673): 16 x 2-bit indices = 32-bit single set
+//   - Line 2500: CBSZ/ABID ignored for 16x16x128 and 32x32x64 IU8 variants
+// ==========================================================================
+template <int NS, int KS>
+class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x128i8_shared
+    : public MmtKernel {
+  static_assert(NS >= 4 && !(NS % 4));
+  // KS <= 4 because A_tile_size_in_vec16 = KS*64 must fit in 256 threads.
+  // KS >= 1 is valid since a single SMFMAC already covers K=128.
+  static_assert(KS >= 1 && KS <= 4);
+
+  // Sparsity indices for the sparse trick (CDNA4: full 32-bit, single set)
+  //
+  // Each 2-bit index selects which position within a group of 4 K-elements
+  // the corresponding compressed byte represents. 16 indices x 2 bits = 32 bits.
+  //
+  // EVEN lanes: select K%4 in {0,1} -> indices [0,1,0,1,...] = 0x44444444
+  //   Bit pattern: 01_00_01_00_01_00_01_00_01_00_01_00_01_00_01_00
+  //
+  // ODD lanes: select K%4 in {2,3} -> indices [2,3,2,3,...] = 0xEEEEEEEE
+  //   Bit pattern: 11_10_11_10_11_10_11_10_11_10_11_10_11_10_11_10
+  //
+  // Compare CDNA3 (16-bit): EVEN=0x00004444, ODD=0x0000EEEE (8 indices in [15:0])
+  static constexpr int SPARSITY_EVEN = 0x44444444;
+  static constexpr int SPARSITY_ODD  = 0xEEEEEEEE;
+  static constexpr int NB_BANKS = 32;
+
+  virtual Type A_type() const override { return Type::SI8; }
+  virtual Type B_type() const override { return Type::SI8; }
+  virtual Type C_type() const override { return Type::SI32; }
+  virtual int M_tile() const override { return 8; }
+  virtual int N_tile() const override { return NS * 16; }
+  virtual int K_tile() const override { return KS * 128; }
+
+  virtual tile_layout_func_t A_tile_layout() const override {
+    // A tile: 8 rows x (KS * 128) K bytes (dense storage, sparse trick applied at LDS level)
+    // Row-major: A[m][k] at element offset m * K_tile + k
+    return [](int m, int k) {
+      return m * (KS * 128) + k;
+    };
+  }
+
+  virtual tile_layout_func_t B_tile_layout() const override {
+    // B tile: NS N-blocks x 16 N-cols x (KS * 128) K bytes
+    // Layout: [n_block][n_col][k] where n = n_block * 16 + n_col
+    // N-block stride = 16 cols * KS * 128 = KS * 2048 elements
+    // N-col stride = KS * 128 elements
+    return [](int n, int k) {
+      int n_block = n / 16;
+      int n_col = n % 16;
+      return n_block * (KS * 2048) + n_col * (KS * 128) + k;
+    };
+  }
+
+  virtual tile_layout_func_t C_tile_layout() const override {
+    // Row-major within tile (unchanged from CDNA3)
+    return [](int m, int n) {
+      return m * (NS * 16) + n;
+    };
+  }
+
+  virtual int num_threads() const override { return 256; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
+
+    // Vector types for V_SMFMAC_I32_16X16X128_I8 operands:
+    //   A: 4 VGPRs = 16 bytes (i32x4). ISA index layout references V0-V3,
+    //      each VGPR holds 4 compressed i8 values. 16 values total per lane.
+    //   B: 8 VGPRs = 32 bytes (i32x8). ISA B layout shows v0-v7 covering
+    //      K=0-127 in two non-contiguous blocks per pass.
+    //   D: 4 VGPRs = 16 bytes (i32x4). 16x16 output, same as CDNA3.
+    using i8x16 = __attribute__((__vector_size__(16))) int8_t;
+    using i32x4 = __attribute__((__vector_size__(16))) int32_t;
+    using i32x8 = __attribute__((__vector_size__(32))) int32_t;
+
+    // A register: 4 VGPRs. V0-V1 hold low-K block data, V2-V3 hold high-K block data.
+    union {
+      i32x4 vec;
+      int32_t i32[4];
+    } a_reg;
+
+    // B register: 8 VGPRs. halves[0] = v0-v3 (low-K), halves[1] = v4-v7 (high-K).
+    union {
+      i32x8 vec;
+      i8x16 halves[2];
+    } b_reg;
+
+    i32x4 acc[NS / 4] = {{0}};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int tid = threadIdx.x;
+    int lane_id = tid % 64;
+    int warp_id = tid / 64;
+
+    // A tile: 8 rows x KS banks x 8 chunks/bank x 16 bytes/chunk = KS * 1024 bytes
+    // Each vec16 chunk is 16 bytes. Total chunks = 8 rows * KS * 8 = KS * 64.
+    constexpr int A_tile_size_in_vec16 = 8 * KS * 8;
+    // B tile: NS blocks x KS banks x 128 vec16 elements = NS * KS * 2048 bytes
+    constexpr int B_tile_size_in_vec16 = NS * KS * 128;
+
+    const i8x16 *A_global = static_cast<const i8x16 *>(A_data) +
+                            m_outer * K_outer * A_tile_size_in_vec16;
+    const i8x16 *B_global = static_cast<const i8x16 *>(B_data) +
+                            n_outer * K_outer * B_tile_size_in_vec16;
+    const i8x16 *B_global_ptr = B_global + tid;
+
+    // Shared memory for A: KS banks x 1024 bytes/bank = KS * 1024 bytes
+    // Each bank: 8 lines x 32 columns x 4 bytes
+    //   Lines 0-1: EVEN K low-half  (V0, V1 data)
+    //   Lines 2-3: EVEN K high-half (V2, V3 data)
+    //   Lines 4-5: ODD K low-half
+    //   Lines 6-7: ODD K high-half
+    __shared__ int8_t A_shared[KS * 1024];
+    __shared__ i8x16 B_shared[B_tile_size_in_vec16];
+
+    // --- Producer coordinates for A ---
+    // Each thread loads one 16-byte chunk (i8x16) from dense A in global memory.
+    // With K=128 per SMFMAC and 8 chunks per bank:
+    //   a_row_prod: which of 8 physical M-rows (0..7)
+    //   a_k_chunk:  which 16-byte chunk along K (0..KS*8-1)
+    //   a_bank:     which K-bank (0..KS-1), one bank per SMFMAC iteration
+    //   k_chunk_in_bank: position within the bank (0..7)
+    //
+    // The mapping k_range = k_chunk_in_bank % 4, k_half = k_chunk_in_bank / 4
+    // reflects the ISA's non-contiguous per-pass K coverage:
+    //   Per the B layout table (ISA line 2648), pass 0 covers K=0-15 AND K=64-79.
+    //   Chunks 0-3 (K=0-63) are the low-K blocks for passes 0-3.
+    //   Chunks 4-7 (K=64-127) are the high-K blocks for passes 0-3.
+    //   So chunk 0 -> pass 0 low, chunk 4 -> pass 0 high,
+    //      chunk 1 -> pass 1 low, chunk 5 -> pass 1 high, etc.
+    int a_row_prod = tid / (KS * 8);
+    int a_k_chunk = tid % (KS * 8);
+    int a_bank = a_k_chunk / 8;
+    int k_chunk_in_bank = a_k_chunk % 8;
+    int k_range = k_chunk_in_bank % 4;  // which pass (0..3)
+    int k_half = k_chunk_in_bank / 4;   // low(0) or high(1) K block
+    int a_col_prod = a_row_prod + k_range * 8;
+
+    int32_t *A_lds = reinterpret_cast<int32_t *>(A_shared);
+
+    // --- Consumer coordinates for A (same pattern as CDNA3) ---
+    // Lane pairing for sparse trick:
+    //   a_m_row: physical M-row (0..7), shared by adjacent even/odd lanes
+    //   a_is_odd: 0 for EVEN K (K%4 in {0,1}), 1 for ODD K (K%4 in {2,3})
+    //   a_k_range: which pass/lane-group (0..3), determines K coverage
+    //   a_col_cons: LDS column encoding both M-row and pass
+    int a_m_row = (lane_id % 16) / 2;
+    int a_is_odd = lane_id % 2;
+    int a_k_range = lane_id / 16;
+    int a_col_cons = a_m_row + a_k_range * 8;
+
+    // B consumer coordinates (same as CDNA3)
+    int n_col = lane_id % 16;
+    int k_slice = lane_id / 16;
+    int sparsity_idx = (lane_id & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      const i8x16 *A_tile_base = A_global + k_outer * A_tile_size_in_vec16;
+
+      // --- Load A tile: swizzle and store to LDS ---
+      // Each thread loads 16 contiguous i8 values from global A, then uses
+      // v_pack_b32_f16 to separate even K positions (K%4 in {0,1}) from odd
+      // (K%4 in {2,3}), storing them to different LDS line groups.
+      //
+      // The swizzle is identical to CDNA3 since the fundamental unit
+      // (16 i8 values -> 4 groups of 4 -> separate EVEN/ODD halves) is unchanged.
+      if (tid < A_tile_size_in_vec16) {
+        i8x16 a_loaded = A_tile_base[a_row_prod * (KS * 8) + a_k_chunk];
+
+        // v_pack_b32_f16 swizzle: separate even/odd K positions
+        // Input:  reg[0]=[K0,K1,K2,K3]  reg[1]=[K4,K5,K6,K7]
+        //         reg[2]=[K8,K9,K10,K11] reg[3]=[K12,K13,K14,K15]
+        // Output: reg0=[K0,K1,K4,K5]   reg1=[K8,K9,K12,K13]   (EVEN: K%4 in {0,1})
+        //         reg2=[K2,K3,K6,K7]   reg3=[K10,K11,K14,K15] (ODD: K%4 in {2,3})
+        int32_t reg0, reg1, reg2, reg3;
+        asm volatile(
+            "v_pack_b32_f16 %0, %4, %5 op_sel:[0,0]\n\t"
+            "v_pack_b32_f16 %1, %6, %7 op_sel:[0,0]\n\t"
+            "v_pack_b32_f16 %2, %4, %5 op_sel:[1,1]\n\t"
+            "v_pack_b32_f16 %3, %6, %7 op_sel:[1,1]\n\t"
+            : "=&v"(reg0), "=&v"(reg1), "=&v"(reg2), "=&v"(reg3)
+            : "v"(reinterpret_cast<int32_t *>(&a_loaded)[0]),
+              "v"(reinterpret_cast<int32_t *>(&a_loaded)[1]),
+              "v"(reinterpret_cast<int32_t *>(&a_loaded)[2]),
+              "v"(reinterpret_cast<int32_t *>(&a_loaded)[3]));
+
+        // Store to LDS: 8 lines per bank (1024 bytes = 256 int32s per bank)
+        //
+        // Line assignment (k_half selects within the EVEN or ODD group):
+        //   k_half=0 (low-K): EVEN -> lines 0,1; ODD -> lines 4,5
+        //   k_half=1 (high-K): EVEN -> lines 2,3; ODD -> lines 6,7
+        //
+        // This ensures the consumer reads 4 consecutive lines for 4 VGPRs:
+        //   EVEN consumer: lines 0,1,2,3 -> V0(low), V1(low), V2(high), V3(high)
+        //   ODD consumer:  lines 4,5,6,7 -> V0(low), V1(low), V2(high), V3(high)
+        int32_t *bank_base = A_lds + a_bank * 256;  // 256 int32 = 1024 bytes per bank
+
+        bank_base[(k_half * 2 + 0) * NB_BANKS + a_col_prod] = reg0;  // EVEN: line 0 or 2
+        bank_base[(k_half * 2 + 1) * NB_BANKS + a_col_prod] = reg1;  // EVEN: line 1 or 3
+        bank_base[(4 + k_half * 2 + 0) * NB_BANKS + a_col_prod] = reg2;  // ODD: line 4 or 6
+        bank_base[(4 + k_half * 2 + 1) * NB_BANKS + a_col_prod] = reg3;  // ODD: line 5 or 7
+      }
+
+      // B tile: NS x KS x 2048 bytes = NS * KS * 128 vec16 elements (dense, no swizzle)
+      for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
+        B_shared[i + tid] = B_global_ptr[i];
+      }
+      B_global_ptr += B_tile_size_in_vec16;
+      __syncthreads();
+
+      // --- SMFMAC Loop: KS banks x (NS/4) N-block iterations ---
+      for (int k_bank = 0; k_bank < KS; ++k_bank) {
+        // A consumer load: 4 VGPRs from 4 consecutive LDS lines
+        //
+        // Pointer formula:
+        //   a_cons = A_shared + k_bank * 1024 + a_col_cons * 4 + a_is_odd * 512
+        //
+        // Justification:
+        //   - k_bank * 1024: bank offset (1024 bytes per bank, doubled from CDNA3's 512)
+        //   - a_col_cons * 4: column offset (4 bytes per int32 column)
+        //   - a_is_odd * 512: selects EVEN (lines 0-3) or ODD (lines 4-7)
+        //     512 = 4 lines * 32 cols * 4 bytes = 4 * 128 bytes
+        //
+        // Reads 4 VGPRs from consecutive lines at stride NB_BANKS (= 32 int32 = 128 bytes):
+        //   a_reg.i32[0] = line 0 (or 4) -> V0 (low-K swizzled data)
+        //   a_reg.i32[1] = line 1 (or 5) -> V1 (low-K swizzled data)
+        //   a_reg.i32[2] = line 2 (or 6) -> V2 (high-K swizzled data)
+        //   a_reg.i32[3] = line 3 (or 7) -> V3 (high-K swizzled data)
+        //
+        // Verification for EVEN lane at k_range=0 (pass 0):
+        //   V0 <- [K0,K1,K4,K5]       (low-K EVEN, from chunk 0)
+        //   V1 <- [K8,K9,K12,K13]     (low-K EVEN, from chunk 0)
+        //   V2 <- [K64,K65,K68,K69]   (high-K EVEN, from chunk 4)
+        //   V3 <- [K72,K73,K76,K77]   (high-K EVEN, from chunk 4)
+        //   Sparsity 0x44444444: each index = [0,1,0,1,...] confirming K%4 in {0,1}
+        //   Matches B pass 0 coverage: K=0-15 and K=64-79
+        int8_t *a_cons = A_shared + k_bank * 1024 + a_col_cons * 4 + a_is_odd * 512;
+        int32_t *a_ptr = reinterpret_cast<int32_t *>(a_cons);
+        a_reg.i32[0] = a_ptr[0 * NB_BANKS];
+        a_reg.i32[1] = a_ptr[1 * NB_BANKS];
+        a_reg.i32[2] = a_ptr[2 * NB_BANKS];
+        a_reg.i32[3] = a_ptr[3 * NB_BANKS];
+
+        for (int j = 0; j < NS / 4; ++j) {
+          int n_block = j * 4 + warp_id;
+
+          // B consumer load: 8 VGPRs via two 16-byte loads
+          //
+          // B is stored K-contiguous per N-column: B[n_block][n_col][k]
+          // Each SMFMAC needs 128 K values per N-column (128 bytes per bank).
+          //
+          // Per the ISA B layout table (line 2648), each pass covers two
+          // non-contiguous 16-K blocks:
+          //   v0-v3 (16 bytes): K in [k_slice*16, k_slice*16+15] (low block, K=0-63)
+          //   v4-v7 (16 bytes): K in [64+k_slice*16, 64+k_slice*16+15] (high block, K=64-127)
+          //
+          // Pointer formula:
+          //   b_cons = B_shared + n_block*(KS*2048) + n_col*(KS*128) + k_bank*128 + k_slice*16
+          //   b_lo = b_cons (16 bytes for v0-v3)
+          //   b_hi = b_cons + 64 (16 bytes for v4-v7, separated by 64 bytes = K=64 boundary)
+          int8_t *b_cons = reinterpret_cast<int8_t *>(B_shared)
+                         + n_block * (KS * 2048)
+                         + n_col * (KS * 128)
+                         + k_bank * 128
+                         + k_slice * 16;
+          b_reg.halves[0] = *reinterpret_cast<i8x16 *>(b_cons);       // v0-v3: low-K block
+          b_reg.halves[1] = *reinterpret_cast<i8x16 *>(b_cons + 64);  // v4-v7: high-K block
+
+          // V_SMFMAC_I32_16X16X128_I8 (opcode 58, gfx950)
+          //   D = A(sparse 16x128) * B(128x16) + D(16x16)
+          //   A: i32x4 (4 VGPRs, 16 compressed i8 values)
+          //   B: i32x8 (8 VGPRs, 32 dense i8 values)
+          //   D: i32x4 (4 VGPRs, 16x16 output accumulated)
+          //   sparsity_idx: int32 (16 x 2-bit indices, single set)
+          //   cbsz=0, abid=0: ignored for 16x16x128 IU8 (ISA line 2500)
+          acc[j] = __builtin_amdgcn_smfmac_i32_16x16x128_i8(
+              a_reg.vec, b_reg.vec, acc[j], sparsity_idx, 0, 0);
+        }
+      }
+      __syncthreads();
+    }
+
+    // Post-processing: Fuse partial sums from even/odd K positions
+    //
+    // With the sparse trick, the SMFMAC output layout is (same as CDNA3):
+    //   D[0][col] = physical_row_0 * B[col] using EVEN K (sparsity 0x44444444)
+    //   D[1][col] = physical_row_0 * B[col] using ODD K  (sparsity 0xEEEEEEEE)
+    //   D[2][col] = physical_row_1 * B[col] using EVEN K
+    //   D[3][col] = physical_row_1 * B[col] using ODD K
+    //
+    // Fuse: add even and odd partial sums for complete dense results
+    for (int j = 0; j < NS / 4; ++j) {
+      int32_t *regD = reinterpret_cast<int32_t *>(&acc[j]);
+      regD[0] = regD[0] + regD[1];  // complete result for physical_row_0
+      regD[1] = regD[2] + regD[3];  // complete result for physical_row_1
+    }
+
+    // C matrix store (identical to CDNA3)
+    constexpr int N_stride = NS * 16;
+    int m_pair = lane_id / 16;
+    int m0 = m_pair * 2;
+    int m1 = m_pair * 2 + 1;
+
+    constexpr int tile_size = 8 * NS * 16;
+    int32_t *C_tile = static_cast<int32_t *>(C_data) +
+                      tile_size * (N_outer * m_outer + n_outer);
+
+    for (int j = 0; j < NS / 4; ++j) {
+      int n_block = j * 4 + warp_id;
+      int n = n_block * 16 + n_col;
+
+      int32_t *regD = reinterpret_cast<int32_t *>(&acc[j]);
+      C_tile[m0 * N_stride + n] = regD[0];
+      C_tile[m1 * N_stride + n] = regD[1];
+    }
+  }
+};
+
+// ==========================================================================
 // F16 SMFMAC Sparse Trick Kernel: V_SMFMAC_F32_16x16x32_F16
 //
 // This kernel uses the same "sparse trick" as the I8 SMFMAC variant above:
@@ -4425,6 +4773,13 @@ int main() {
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
+
+  std::printf("\n\n\nSMFMAC sparse trick INT8 CDNA4 (16x16x128) experiments:\n\n");
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x128i8_shared<4, 1>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x128i8_shared<4, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x128i8_shared<4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x128i8_shared<8, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x128i8_shared<16, 2>());
 
   std::printf("\n\n\nSMFMAC sparse trick FP16 experiments:\n\n");
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 2>());
