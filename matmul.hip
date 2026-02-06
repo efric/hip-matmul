@@ -3328,7 +3328,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
     __shared__ int8x8_t B_shared[B_tile_size_in_vec8];
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
-      for (int i = 0; i < A_tile_size_in_vec8; i += 256) { 
+      for (int i = 0; i < A_tile_size_in_vec8; i += 256) {
         A_shared[i + tid] = A_global_ptr[i];
       }
       for (int j = 0; j < B_tile_size_in_vec8; j += 256) {
@@ -3338,8 +3338,8 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
       B_global_ptr += B_tile_size_in_vec8;
       __syncthreads();
 
-      for (int i = 0; i < MS; ++i) { 
-        for (int j = 0; j < NS / 4; ++j) { 
+      for (int i = 0; i < MS; ++i) {
+        for (int j = 0; j < NS / 4; ++j) {
           acc[i][j] = __builtin_amdgcn_mfma_i32_16x16x32_i8(
               A_shared[64 * i + (tid % 64)], B_shared[256 * j + tid], acc[i][j],
               0, 0, 0);
