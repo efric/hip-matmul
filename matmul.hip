@@ -3400,9 +3400,10 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
   }
 };
 
-template <int NS, int KS>
+template <int MS, int NS, int KS>
 class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     : public MmtKernel {
+  static_assert(MS >= 1);
   static_assert(NS >= 4 && !(NS % 4));
   static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
 
@@ -3416,7 +3417,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
   virtual Type A_type() const override { return Type::SI8; }
   virtual Type B_type() const override { return Type::SI8; }
   virtual Type C_type() const override { return Type::SI32; }
-  virtual int M_tile() const override { return 8; }
+  virtual int M_tile() const override { return MS * 8; }
   virtual int N_tile() const override { return NS * 16; }
   virtual int K_tile() const override { return KS * 64; }
 
@@ -3451,15 +3452,17 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       int32_t i32[2];
     } a_reg;
 
-    i32x4 acc[NS / 4] = {{0}};
+    i32x4 acc[MS][NS / 4] = {{0}};
 
     const int tid = threadIdx.x;
     const int lane = tid % 64;
     const int warp = tid / 64;
 
-    // A tile: 8 rows × KS banks × 4 lines/bank × 32 cols × 4B = KS*512 bytes
+    // A block: 8 rows × KS banks × 4 lines/bank × 32 cols × 4B = KS*512 bytes
+    // A tile: MS blocks = MS * KS * 512 bytes
     // B tile: NS n-blocks × KS k-banks × 64 vec16 elements
-    constexpr int A_TILE_VEC16 = 8 * KS * 4;
+    constexpr int A_BLOCK_VEC16 = 8 * KS * 4;
+    constexpr int A_TILE_VEC16 = MS * A_BLOCK_VEC16;
     constexpr int B_TILE_VEC16 = NS * KS * 64;
 
     const auto *A_base = static_cast<const i8x16 *>(A_data) +
@@ -3468,10 +3471,11 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
                          blockIdx.y * K_outer * B_TILE_VEC16;
     const auto *B_global_ptr = B_base + tid;
 
-    __shared__ int8_t A_smem_raw[KS * 512];
+    __shared__ int8_t A_smem_raw[MS * KS * 512];
     __shared__ i8x16 B_smem[B_TILE_VEC16];
     auto *A_smem = reinterpret_cast<int32_t *>(A_smem_raw);
 
+    // Producer indices for A loading (within a single 8-row block)
     const int a_prod_row = tid / (KS * 4);
     const int a_prod_chunk = tid % (KS * 4);
     const int a_prod_bank = a_prod_chunk / 4;
@@ -3488,32 +3492,35 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     const int sparsity_idx = (lane & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
-      // Load & swizzle A tile into LDS:
+      // Load & swizzle A tile into LDS, one 8-row block at a time.
       // Swizzle separates K positions that will be owned by even/odd threads
       // into distinct LDS lines.
       // Input vec16:
       // [K0,K1,K2,K3] [K4,K5,K6,K7] [K8,K9,K10,K11] [K12,K13,K14,K15]
       // Line 0: K0,K1,K4,K5  Line 1: K8,K9,K12,K13 (even threads)
       // Line 2: K2,K3,K6,K7  Line 3: K10,K11,K14,K15 (odd threads)
-      if (tid < A_TILE_VEC16) {
-        const auto *A_tile = A_base + k_outer * A_TILE_VEC16;
-        i8x16 loaded = A_tile[a_prod_row * (KS * 4) + a_prod_chunk];
+      for (int ms = 0; ms < MS; ++ms) {
+        if (tid < A_BLOCK_VEC16) {
+          const auto *A_tile =
+              A_base + k_outer * A_TILE_VEC16 + ms * A_BLOCK_VEC16;
+          i8x16 loaded = A_tile[a_prod_row * (KS * 4) + a_prod_chunk];
 
-        auto *src = reinterpret_cast<int32_t *>(&loaded);
-        int32_t lo0, lo1, hi0, hi1;
-        asm volatile("v_pack_b32_f16 %0, %4, %5 op_sel:[0,0]\n\t"
-                     "v_pack_b32_f16 %1, %6, %7 op_sel:[0,0]\n\t"
-                     "v_pack_b32_f16 %2, %4, %5 op_sel:[1,1]\n\t"
-                     "v_pack_b32_f16 %3, %6, %7 op_sel:[1,1]\n\t"
-                     : "=&v"(lo0), "=&v"(lo1), "=&v"(hi0), "=&v"(hi1)
-                     : "v"(src[0]), "v"(src[1]), "v"(src[2]), "v"(src[3]));
+          auto *src = reinterpret_cast<int32_t *>(&loaded);
+          int32_t lo0, lo1, hi0, hi1;
+          asm volatile("v_pack_b32_f16 %0, %4, %5 op_sel:[0,0]\n\t"
+                       "v_pack_b32_f16 %1, %6, %7 op_sel:[0,0]\n\t"
+                       "v_pack_b32_f16 %2, %4, %5 op_sel:[1,1]\n\t"
+                       "v_pack_b32_f16 %3, %6, %7 op_sel:[1,1]\n\t"
+                       : "=&v"(lo0), "=&v"(lo1), "=&v"(hi0), "=&v"(hi1)
+                       : "v"(src[0]), "v"(src[1]), "v"(src[2]), "v"(src[3]));
 
-        // Store into bank-interleaved LDS: 4 lines × 32 columns per bank
-        int32_t *bank = A_smem + a_prod_bank * 128;
-        bank[0 * NB_BANKS + a_prod_col] = lo0; // even tid, low
-        bank[1 * NB_BANKS + a_prod_col] = lo1; // even tid, high
-        bank[2 * NB_BANKS + a_prod_col] = hi0; // odd tid, low
-        bank[3 * NB_BANKS + a_prod_col] = hi1; // odd tid, high
+          // Store into bank-interleaved LDS: 4 lines × 32 columns per bank
+          int32_t *bank = A_smem + ms * (KS * 128) + a_prod_bank * 128;
+          bank[0 * NB_BANKS + a_prod_col] = lo0; // even tid, low
+          bank[1 * NB_BANKS + a_prod_col] = lo1; // even tid, high
+          bank[2 * NB_BANKS + a_prod_col] = hi0; // odd tid, low
+          bank[3 * NB_BANKS + a_prod_col] = hi1; // odd tid, high
+        }
       }
 
       for (int i = 0; i < B_TILE_VEC16; i += 256) {
@@ -3524,40 +3531,47 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       __syncthreads();
 
       for (int kb = 0; kb < KS; ++kb) {
-        // Load A from LDS: 8 bytes spanning two lines (even or odd K half)
-        auto *a_ptr = reinterpret_cast<int32_t *>(
-            A_smem_raw + kb * 512 + a_cons_col * 4 + a_cons_is_odd * 256);
-        a_reg.i32[0] = a_ptr[0];
-        a_reg.i32[1] = a_ptr[NB_BANKS];
+        for (int i = 0; i < MS; ++i) {
+          // Load A from LDS for the i-th 8-row block:
+          // 8 bytes spanning two lines (even or odd K half)
+          auto *a_ptr = reinterpret_cast<int32_t *>(
+              A_smem_raw + i * (KS * 512) + kb * 512 + a_cons_col * 4 +
+              a_cons_is_odd * 256);
+          a_reg.i32[0] = a_ptr[0];
+          a_reg.i32[1] = a_ptr[NB_BANKS];
 
-        for (int j = 0; j < NS / 4; ++j) {
-          int n_block = j * 4 + warp;
+          for (int j = 0; j < NS / 4; ++j) {
+            int n_block = j * 4 + warp;
 
-          // Load B from LDS: 16 bytes for this lane's (n_col, k_slice)
-          auto *b_ptr = reinterpret_cast<i8x16 *>(
-              reinterpret_cast<int8_t *>(B_smem) + n_block * (KS * 1024) +
-              b_cons_n_col * (KS * 64) + kb * 64 + b_cons_k_slice * 16);
-          i8x16 b_reg = *b_ptr;
+            // Load B from LDS: 16 bytes for this lane's (n_col, k_slice)
+            auto *b_ptr = reinterpret_cast<i8x16 *>(
+                reinterpret_cast<int8_t *>(B_smem) + n_block * (KS * 1024) +
+                b_cons_n_col * (KS * 64) + kb * 64 + b_cons_k_slice * 16);
+            i8x16 b_reg = *b_ptr;
 
-          acc[j] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
-              a_reg.vec, b_reg, acc[j], sparsity_idx, 0, 0);
+            acc[i][j] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
+                a_reg.vec, b_reg, acc[i][j], sparsity_idx, 0, 0);
+          }
         }
       }
+      __syncthreads();
     }
 
     // Post-processing: fuse even + odd K partial sums
     // SMFMAC with the sparsity trick produces interleaved even/odd results:
-    //   acc[j][0] = row0 × B (even K),  acc[j][1] = row0 × B (odd K)
-    //   acc[j][2] = row1 × B (even K),  acc[j][3] = row1 × B (odd K)
+    //   acc[i][j][0] = row0 × B (even K),  acc[i][j][1] = row0 × B (odd K)
+    //   acc[i][j][2] = row1 × B (even K),  acc[i][j][3] = row1 × B (odd K)
     // Fusing gives the complete dot product per row.
-    for (int j = 0; j < NS / 4; ++j) {
-      auto *d = reinterpret_cast<int32_t *>(&acc[j]);
-      d[0] = d[0] + d[1]; // row0 complete
-      d[1] = d[2] + d[3]; // row1 complete
+    for (int i = 0; i < MS; ++i) {
+      for (int j = 0; j < NS / 4; ++j) {
+        auto *d = reinterpret_cast<int32_t *>(&acc[i][j]);
+        d[0] = d[0] + d[1]; // row0 complete
+        d[1] = d[2] + d[3]; // row1 complete
+      }
     }
 
     constexpr int N_STRIDE = NS * 16;
-    constexpr int TILE_ELEMS = 8 * N_STRIDE;
+    constexpr int TILE_ELEMS = MS * 8 * N_STRIDE;
 
     const int m_pair = lane / 16;
     const int m0 = m_pair * 2;
@@ -3567,11 +3581,13 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     int32_t *C_tile = static_cast<int32_t *>(C_data) +
                       TILE_ELEMS * (N_outer * blockIdx.x + blockIdx.y);
 
-    for (int j = 0; j < NS / 4; ++j) {
-      const int n = (j * 4 + warp) * 16 + n_col_out;
-      auto *d = reinterpret_cast<int32_t *>(&acc[j]);
-      C_tile[m0 * N_STRIDE + n] = d[0];
-      C_tile[m1 * N_STRIDE + n] = d[1];
+    for (int i = 0; i < MS; ++i) {
+      for (int j = 0; j < NS / 4; ++j) {
+        const int n = (j * 4 + warp) * 16 + n_col_out;
+        auto *d = reinterpret_cast<int32_t *>(&acc[i][j]);
+        C_tile[(i * 8 + m0) * N_STRIDE + n] = d[0];
+        C_tile[(i * 8 + m1) * N_STRIDE + n] = d[1];
+      }
     }
   }
 };
@@ -4001,12 +4017,15 @@ int main() {
   //      8, 8>());
 
   std::printf("\n\n\nSMFMAC sparse trick INT8 experiments:\n\n");
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<1, 4, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<1, 4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<1, 4, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<1, 8, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<1, 8, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<1, 16, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<2, 4, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 4, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 8, 2>());
 
   // std::printf("\n\n\nStream-K experiments:\n\n");
   // test(
