@@ -3482,7 +3482,8 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       __syncthreads();
 
       for (int kb = 0; kb < KS; ++kb) {
-        // Load A from LDS: 8 bytes spanning two lines (even or odd K half)
+        // Load A from LDS: 8 bytes spanning two lines (0, 1 for even or 2, 3
+        // for odd)
         auto *a_ptr = reinterpret_cast<int32_t *>(
             A_smem_raw + kb * 512 + a_cons_col * 4 + a_cons_is_odd * 256);
         a_reg.i32[0] = a_ptr[0];
@@ -3503,11 +3504,8 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       }
     }
 
-    // Post-processing: fuse even + odd K partial sums
-    // SMFMAC with the sparsity trick produces interleaved even/odd results:
-    //   acc[j][0] = row0 × B (even K),  acc[j][1] = row0 × B (odd K)
-    //   acc[j][2] = row1 × B (even K),  acc[j][3] = row1 × B (odd K)
-    // Fusing gives the complete dot product per row.
+    // Post-processing: fuse even + odd K partial sums to get the complete dot
+    // product per row
     for (int j = 0; j < NS / 4; ++j) {
       auto *d = reinterpret_cast<int32_t *>(&acc[j]);
       d[0] = d[0] + d[1]; // row0 complete
