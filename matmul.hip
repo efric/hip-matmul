@@ -3467,19 +3467,8 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     int lane_id = tid % 64;
     int warp_id = tid / 64;
 
-    // =========================================================================
-    // Tile Sizes
-    // =========================================================================
-    // A tile: 8 rows × (KS × 64) K bytes = KS × 512 bytes
-    // In vec16: 8 rows × (KS × 4) chunks = KS × 32 elements
     constexpr int A_tile_size_in_vec16 = 8 * KS * 4; 
-    // KS = 2: 8 rows × (2 × 4) = 64 elements * 16 bytes/element = 1024 bytes
-    // KS = 4: 8 rows × (4 × 4) = 128 elements * 16 bytes/element = 2048 bytes
-    // B tile: NS N-blocks × (KS × 64) K × 16 N = NS × KS × 1024 bytes
-    // In vec16: NS × KS × 64 elements
     constexpr int B_tile_size_in_vec16 = NS * KS * 64;
-    // KS = 2: NS × 128 elements * 16 bytes/element = NS × 2048 bytes
-    // KS = 4: NS × 256 elements * 16 bytes/element = NS × 4096 bytes
 
     const i8x16 *A_global = static_cast<const i8x16 *>(A_data) +
                             m_outer * K_outer * A_tile_size_in_vec16;
@@ -3487,81 +3476,28 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
                             n_outer * K_outer * B_tile_size_in_vec16;
     const i8x16 *B_global_ptr = B_global + tid;
 
-    // A_shared: KS banks × 512 bytes each = KS × 512 bytes
-    __shared__ int8_t A_shared[KS * 512]; // 1024
-    // KS = 2: 2 * 512 bytes = 1024 bytes
-    // KS = 4: 4 * 512 bytes = 2048 bytes
-    __shared__ i8x16 B_shared[B_tile_size_in_vec16]; //2048
-    // KS = 2: NS × 128 elements * 16 bytes/element = NS × 2048 bytes
-    // KS = 4: NS × 256 elements * 16 bytes/element = NS × 4096 bytes
+    __shared__ int8_t A_shared[KS * 512];
+    __shared__ i8x16 B_shared[B_tile_size_in_vec16];
 
-    // =========================================================================
-    // A Producer Setup (64 threads participate)
-    // =========================================================================
-    // Thread layout for KS=2 (8×128 tile):
-    //   K        0   16   32   48   64   80   96  112
-    //   row 0:  t0   t1   t2   t3   t4   t5   t6   t7
-    //   row 1:  t8   t9   t10  t11  t12  t13  t14  t15
-    //   ...
-    //   row 7:  t56  t57  t58  t59  t60  t61  t62  t63
-    //
-    // Formulas:
-    //   a_row = tid / (KS * 4)           -> 0-7 (8 rows)
-    //   a_k_chunk = tid % (KS * 4)       -> 0 to (KS*4-1)
-    //   a_bank = a_k_chunk / 4           -> 0 to (KS-1), selects 64-K bank
-    //   k_chunk_in_bank = a_k_chunk % 4  -> 0-3 within the bank
-    //   a_col = a_row + k_chunk_in_bank * 8  -> 0-31
-    int a_row_prod = tid / (KS * 4); // a_row
-    // For KS=2: tid / 8 gives us 0-7 for rows, each row has 8 chunks (4 per bank * 2 banks)
-    // For KS=4: tid / 16 gives us 0-7 for rows, each row has 16 chunks (4 per bank * 4 banks)
-    int a_k_chunk = tid % (KS * 4); // a_col
+    int a_row_prod = tid / (KS * 4);
+    int a_k_chunk = tid % (KS * 4);
     int a_bank = a_k_chunk / 4;
     int k_chunk_in_bank = a_k_chunk % 4;
     int a_col_prod = a_row_prod + k_chunk_in_bank * 8;
 
     int32_t *A_lds = reinterpret_cast<int32_t *>(A_shared);
-
-    // =========================================================================
-    // A Consumer Setup (64 lanes)
-    // =========================================================================
-    // Lane mapping:
-    //   a_m_row = (lane_id % 16) / 2  -> M row 0-7 (pairs share row)
-    //   a_is_odd = lane_id % 2        -> Even/odd for K positions
-    //   a_k_range = lane_id / 16      -> K range 0-3 within one bank
-    //   a_col = a_m_row + a_k_range * 8  -> 0-31
     int a_m_row = (lane_id % 16) / 2;
     int a_is_odd = lane_id % 2;
     int a_k_range = lane_id / 16;
     int a_col_cons = a_m_row + a_k_range * 8;
 
-    // =========================================================================
-    // B Consumer Setup (64 lanes)
-    // =========================================================================
-    // Lane mapping:
-    //   n_col = lane_id % 16   -> N column 0-15
-    //   k_slice = lane_id / 16 -> K slice 0-3 (each 16 K values)
     int n_col = lane_id % 16;
     int k_slice = lane_id / 16;
     int sparsity_idx = (lane_id & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
 
-    // =========================================================================
-    // Main K-outer Loop
-    // =========================================================================
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       const i8x16 *A_tile_base = A_global + k_outer * A_tile_size_in_vec16;
 
-      // =====================================================================
-      // A Producer: Global Load + Swizzle + LDS Store
-      // =====================================================================
-      // 64 threads load 8×(KS×64) bytes = KS×512 bytes total
-      // Each thread loads 16 bytes (one i8x16)
-      //
-      // Global load index: A_tile_base[a_row * (KS * 4) + a_k_chunk]
-      // Justification:
-      //   - A is row-major: 8 rows × (KS × 64) K bytes
-      //   - Each row = (KS × 64) bytes = (KS × 4) vec16 elements
-      //   - a_row * (KS * 4) = start of row in vec16 units
-      //   - + a_k_chunk = which 16-byte chunk within the row
       if (tid < A_tile_size_in_vec16) {
         auto global_idx = a_row_prod * (KS * 4) + a_k_chunk;
         i8x16 a_loaded = A_tile_base[a_row_prod * (KS * 4) + a_k_chunk];
@@ -3598,21 +3534,14 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
         bank_base[3 * NB_BANKS + a_col_prod] = reg3;  // Line 3: odd K bytes 4-7
       }
 
-      // =====================================================================
-      // B Producer: Global Load to LDS
-      // =====================================================================
-      // All 256 threads participate
       // B tile: NS × KS × 1024 bytes = NS × KS × 64 vec16 elements
       for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
         B_shared[i + tid] = B_global_ptr[i];
       }
       B_global_ptr += B_tile_size_in_vec16;
-
       __syncthreads();
 
-      // =====================================================================
       // SMFMAC Loop: KS banks × (NS/4) N-block iterations
-      // =====================================================================
       for (int k_bank = 0; k_bank < KS; ++k_bank) {
         // A consumer load (8 bytes = 2 VGPRs) - same for all 4 wavefronts (broadcast)
         // Pointer formula:
@@ -3653,7 +3582,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
               a_reg.vec, b_reg, acc[j], sparsity_idx, 0, 0);
         }
       }
-      __syncthreads();
+      __syncthreads(); //is this necessary?
     }
 
     // Post-processing: Fuse partial sums from even/odd K positions
@@ -3667,49 +3596,17 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     // After fuse:
     //   d0 = D[0] + D[1] = complete result for physical_row_0, this lane's column
     //   d1 = D[2] + D[3] = complete result for physical_row_1, this lane's column
-    //
-    // For direct int32 row-major store, NO shuffle is needed.
-    // Each lane already has complete results for its column.
-    // The reference implementation's shuffle is specific to their packed half2
-    // atomic accumulation pattern where they need consecutive columns per lane.
-    //
-    // Output layout per lane (within a wavefront, for first 16 lanes handling cols 0-15):
-    //   Lane col: d0 -> output[phys_row_0][col], d1 -> output[phys_row_1][col]
-
     for (int j = 0; j < NS / 4; ++j) {
       int32_t *regD = reinterpret_cast<int32_t *>(&acc[j]);
-      // Fuse: combine even and odd K contributions
-      regD[0] = regD[0] + regD[1];  // d0 = result for physical_row_0
-      regD[1] = regD[2] + regD[3];  // d1 = result for physical_row_1
+      regD[0] = regD[0] + regD[1];
+      regD[1] = regD[2] + regD[3];
     }
 
-    // =========================================================================
-    // Output Store
-    // =========================================================================
-    // Output mapping per lane:
-    //   n_col = lane_id % 16       -> column within 16-col N-block (0-15)
-    //   m_pair = lane_id / 16      -> which M row pair (0-3)
-    //     - m_pair=0 -> physical rows 0,1
-    //     - m_pair=1 -> physical rows 2,3
-    //     - m_pair=2 -> physical rows 4,5
-    //     - m_pair=3 -> physical rows 6,7
-    //
-    // Per accumulator acc[j]:
-    //   n_block = j * 4 + warp_id  -> which 16-col N-block
-    //   Full N column = n_block * 16 + n_col
-    //
-    // After fuse:
-    //   regD[0] -> C[m_pair * 2][N]      (even physical row)
-    //   regD[1] -> C[m_pair * 2 + 1][N]  (odd physical row)
-    //
-    // Row-major layout: C[m][n] at offset m * N_stride + n
     constexpr int N_stride = NS * 16;
     int m_pair = lane_id / 16;
     int m0 = m_pair * 2;
     int m1 = m_pair * 2 + 1;
 
-    // Calculate base pointer for this tile
-    // Tile layout: tiles are stored consecutively, each tile is 8 * (NS * 16) int32 values
     constexpr int tile_size = 8 * NS * 16;
     int32_t *C_tile = static_cast<int32_t *>(C_data) +
                       tile_size * (N_outer * m_outer + n_outer);
@@ -4094,62 +3991,62 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3
 };
 
 int main() {
-  // std::printf("Best-performing kernels for each element types:\n\n");
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3<
-  //      8, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload<
-  //      12, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared<8, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<8, 8>());
-  // test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
+  std::printf("Best-performing kernels for each element types:\n\n");
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3<
+       8, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload<
+       12, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared<8, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<8, 8>());
+  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
 
-  // std::printf("\n\n\nOther kernels:\n\n");
-  // test(MmtKernel_generic<Type::SI8, Type::SI8, Type::SI32, 3, 5, 2>());
-  // test(MmtKernel_generic<Type::FP16, Type::FP16, Type::FP32, 3, 5, 2>());
-  // test(MmtKernel_generic<Type::FP32, Type::FP32, Type::FP32, 3, 5, 2>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared<8, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared<4, 8>());
-  // test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor());
-  // test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC());
-  // test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct());
-  // test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4());
-  // test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4());
-  // test(MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct());
-  // test(MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct());
-  // test(MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 4>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 8>());
-  // test(
-  //     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 12>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 4>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 12>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 4>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 16>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_subgroup2x2<
-  //      8, 8>());
-  // test(
-  //     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_misguidednobankconflicts<
-  //         8, 8>());
-  // test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
-  // test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 16>());
-  // test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
-  // test(
-  //     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_naive<
-  //         8, 8>());
-  // test(
-  //     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_take2<
-  //         8, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared<8, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2<8, 8>());
-  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload<
-  //      8, 8>());
+  std::printf("\n\n\nOther kernels:\n\n");
+  test(MmtKernel_generic<Type::SI8, Type::SI8, Type::SI32, 3, 5, 2>());
+  test(MmtKernel_generic<Type::FP16, Type::FP16, Type::FP32, 3, 5, 2>());
+  test(MmtKernel_generic<Type::FP32, Type::FP32, Type::FP32, 3, 5, 2>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared<8, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared<4, 8>());
+  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor());
+  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC());
+  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct());
+  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4());
+  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4());
+  test(MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct());
+  test(MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct());
+  test(MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 8>());
+  test(
+      MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 12>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 12>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 16>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_subgroup2x2<
+       8, 8>());
+  test(
+      MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_misguidednobankconflicts<
+          8, 8>());
+  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
+  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 16>());
+  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
+  test(
+      MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_naive<
+          8, 8>());
+  test(
+      MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_take2<
+          8, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared<8, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2<8, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload<
+       8, 8>());
 
   std::printf("\n\n\nSMFMAC sparse trick INT8 experiments:\n\n");
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>());
