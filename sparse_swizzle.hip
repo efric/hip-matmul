@@ -106,10 +106,10 @@ __global__ void load_i8x16_asm(const int8_t *__restrict__ in,
   int lo, hi;
   asm volatile(
       "v_cmp_ne_u32_e32 vcc, 0, %[lip]\n\t"
-      "v_cndmask_b32_dpp %[hi], %[plo], %[phi]"
+      "v_cndmask_b32_dpp %[hi], %[plo], %[phi], vcc"
       " quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n\t"
       "s_not_b64 vcc, vcc\n\t"
-      "v_cndmask_b32_dpp %[lo], %[phi], %[plo]"
+      "v_cndmask_b32_dpp %[lo], %[phi], %[plo], vcc"
       " quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"
       : [lo] "=&v" (lo), [hi] "=&v" (hi)
       : [plo] "v" (pack_lo), [phi] "v" (pack_hi), [lip] "v" (lane_in_pair)
