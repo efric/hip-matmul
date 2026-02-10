@@ -3358,6 +3358,10 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
   }
 };
 
+/*
+lane 0: K0 K1 _  _  K4 K5 _  _  K8  K9  _   _  K12 K13 _   _
+lane 1: _  _  K2 K3 _  _  K6 K7 _   _  K10 K11 _   _  K14 K15
+*/
 template <int NS, int KS>
 class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     : public MmtKernel {
@@ -3368,7 +3372,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
   static constexpr int SPARSITY_EVEN =
       0x00004444; // Selects positions 0,1 from each group of 4 8-bit elements
   static constexpr int SPARSITY_ODD =
-      0x0000EEEE; // Selects positions 2,3 from each group of 4 8-bit elements
+      0x0000EEEE; // Selects positions 2,3 from each group of 4 8-bit elements // 1110111011101110
   static constexpr int NB_BANKS = 32;
 
   virtual Type A_type() const override { return Type::SI8; }
@@ -3456,6 +3460,24 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       // Line 0: K0,K1,K4,K5  Line 1: K8,K9,K12,K13 (even threads)
       // Line 2: K2,K3,K6,K7  Line 3: K10,K11,K14,K15 (odd threads)
 
+/*
+// [K0,K1,K2,K3] [K4,K5,K6,K7] | [K8,K9,K10,K11] [K12,K13,K14,K15]
+
+LD local t0: K0 ... K7 -->
+LD local t1 : K8 ... K15 -->
+
+
+nb = shuffle(push K0-K7, pulling K8-K15)
+local + nb --> K0 ... K15
+pack
+
+1: try to remove inline asm
+2: first try naive load to LDS then push swizzle after
+      a: load 64b each thread
+      b: load 128bit each and see effects
+*/
+
+
       /*
           8 bits elements / 32 bits per group / 4 bytes per group
        [K0,K1,K2,K3] [K4,K5,K6,K7] [K8,K9,K10,K11] [K12,K13,K14,K15]
@@ -3509,7 +3531,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
         // for odd)
 
         /*
-        col:      0     1     2     3     4     5     6     7     8     9    10    11    12    13    14    15    16    17    18    19    20    21    22    23    24    25    26    27    28    29    30    31
+col:      0     1     2     3     4     5     6     7     8     9    10    11    12    13    14    15    16    17    18    19    20    21    22    23    24    25    26    27    28    29    30    31
 row 0:   L0    L2    L4    L6    L8   L10   L12   L14   L16   L18   L20   L22   L24   L26   L28   L30   L32   L34   L36   L38   L40   L42   L44   L46   L48   L50   L52   L54   L56   L58   L60   L62
 row 1:   L0    L2    L4    L6    L8   L10   L12   L14   L16   L18   L20   L22   L24   L26   L28   L30   L32   L34   L36   L38   L40   L42   L44   L46   L48   L50   L52   L54   L56   L58   L60   L62
 row 2:   L1    L3    L5    L7    L9   L11   L13   L15   L17   L19   L21   L23   L25   L27   L29   L31   L33   L35   L37   L39   L41   L43   L45   L47   L49   L51   L53   L55   L57   L59   L61   L63
@@ -3520,6 +3542,13 @@ row 3:   L1    L3    L5    L7    L9   L11   L13   L15   L17   L19   L21   L23   
           // base + bank offset + column offset + odd/even offset (256 bytes to jump to the other 2-line group)
         a_reg.i32[0] = a_ptr[0];
         a_reg.i32[1] = a_ptr[NB_BANKS]; //offset by column
+        /*
+        e.g 
+        for even lane:
+        K0, K1, K4, K5, K8, K9, K12, K13 are the non-zero-elements (0x00004444)
+
+
+        */
 
         // n_block = which 16x64 block of B we are working on; each block will be used for one SMFMAC
         for (int j = 0; j < NS / 4; ++j) {
@@ -3587,7 +3616,7 @@ row 3:   L1    L3    L5    L7    L9   L11   L13   L15   L17   L19   L21   L23   
     }
 
     /*
-               n: 0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15
+           n: 0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15
           ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
     m=0   │ L0 │ L1 │ L2 │ L3 │ L4 │ L5 │ L6 │ L7 │ L8 │ L9 │L10 │L11 │L12 │L13 │L14 │L15 │ ← d[0]
     m=1   │ L0 │ L1 │ L2 │ L3 │ L4 │ L5 │ L6 │ L7 │ L8 │ L9 │L10 │L11 │L12 │L13 │L14 │L15 │ ← d[1]
