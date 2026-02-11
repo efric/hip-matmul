@@ -3444,7 +3444,8 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       if (tid < A_TILE_VEC16) {
-        A_smem[tid] = (A_base + k_outer * A_TILE_VEC16)[tid];
+        const i8x16 *A_ptr = A_base + k_outer * A_TILE_VEC16;
+        A_smem[tid] = A_ptr[tid];
       }
 
       for (int i = 0; i < B_TILE_VEC16; i += 256) {
@@ -3599,9 +3600,9 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared
     int sparsity_idx = (lane_id & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
-      const f16x8 *A_tile_base = A_global + k_outer * A_tile_size_in_vec16;
+      const f16x8 *A_ptr = A_global + k_outer * A_tile_size_in_vec16;
       if (tid < A_tile_size_in_vec16) {
-        A_shared[tid] = A_tile_base[tid];
+        A_shared[tid] = A_ptr[tid];
       }
 
       for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
