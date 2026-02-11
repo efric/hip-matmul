@@ -3373,7 +3373,6 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       0x00004444; // Selects positions 0,1 from each group of 4 8-bit elements
   static constexpr int SPARSITY_ODD =
       0x0000EEEE; // Selects positions 2,3 from each group of 4 8-bit elements // 1110111011101110
-  static constexpr int NB_BANKS = 32;
 
   virtual Type A_type() const override { return Type::SI8; }
   virtual Type B_type() const override { return Type::SI8; }
@@ -3409,6 +3408,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     using i8x8 = __attribute__((__vector_size__(8))) int8_t; // A
     using i8x16 = __attribute__((__vector_size__(16))) int8_t; // B
     using i32x4 = __attribute__((__vector_size__(16))) int32_t; // D
+    using u16x4 = __attribute__((__vector_size__(8))) uint16_t;  // DPP deinterleave
 
     union {
       i8x8 vec;
@@ -3421,7 +3421,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     const int lane = tid % 64;
     const int warp = tid / 64;
 
-    // A tile: 8 rows × KS banks × 4 lines/bank × 32 cols × 4B = KS*512 bytes
+    // A tile: naive row-major 8×(KS*64) = KS*512 bytes
     // B tile: NS n-blocks × KS k-banks × 64 vec16 elements
     constexpr int A_TILE_VEC16 = 8 * KS * 4;
     constexpr int B_TILE_VEC16 = NS * KS * 64;
@@ -3434,17 +3434,13 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
 
     __shared__ int8_t A_smem_raw[KS * 512];
     __shared__ i8x16 B_smem[B_TILE_VEC16];
-    auto *A_smem = reinterpret_cast<int32_t *>(A_smem_raw);
-
-    const int a_prod_row = tid / (KS * 4); // 0 - 7 (8 rows)
-    const int a_prod_chunk = tid % (KS * 4); //(0 to KS*4 - 1)
-    const int a_prod_bank = a_prod_chunk / 4; //0 to KS - 1, selects 64K depth bank
-    const int a_prod_col = a_prod_row + (a_prod_chunk % 4) * 8; // 0-31 (4 K chunks * 8 rows)
-
-    const int a_cons_m_pair = (lane % 16) / 2; ////  M row 0-7 (pairs share row)
-    const int a_cons_is_odd = lane % 2;  // Even/odd for K positions
-    const int a_cons_k_half = lane / 16; // K range 0-3 within one bank
-    const int a_cons_col = a_cons_m_pair + a_cons_k_half * 8; //  0-31 (4 K chunks * 8 M rows)
+    const int a_cons_m_pair = (lane % 16) / 2; // M row 0-7 (pairs share row)
+    const int a_cons_is_odd = lane % 2;         // Even/odd for K positions
+    const int a_cons_k_half = lane / 16;        // K range 0-3 within one bank
+    // Base byte offset into naive A LDS for this lane (add kb*64 per iteration)
+    const int a_cons_lds_base = a_cons_m_pair * (KS * 64)
+                              + a_cons_k_half * 16
+                              + a_cons_is_odd * 8;
 
     const int b_cons_n_col = lane % 16;
     const int b_cons_k_slice = lane / 16;
@@ -3452,70 +3448,10 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     const int sparsity_idx = (lane & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
-      // Load & swizzle A tile into LDS:
-      // Swizzle separates K positions that will be owned by even/odd threads
-      // into distinct LDS lines.
-      // Input vec16:
-      // [K0,K1,K2,K3] [K4,K5,K6,K7] [K8,K9,K10,K11] [K12,K13,K14,K15]
-      // Line 0: K0,K1,K4,K5  Line 1: K8,K9,K12,K13 (even threads)
-      // Line 2: K2,K3,K6,K7  Line 3: K10,K11,K14,K15 (odd threads)
-
-/*
-// [K0,K1,K2,K3] [K4,K5,K6,K7] | [K8,K9,K10,K11] [K12,K13,K14,K15]
-
-LD local t0: K0 ... K7 -->
-LD local t1 : K8 ... K15 -->
-
-
-nb = shuffle(push K0-K7, pulling K8-K15)
-local + nb --> K0 ... K15
-pack
-
-1: try to remove inline asm
-2: first try naive load to LDS then push swizzle after
-      a: load 64b each thread
-      b: load 128bit each and see effects
-*/
-
-
-      /*
-          8 bits elements / 32 bits per group / 4 bytes per group
-       [K0,K1,K2,K3] [K4,K5,K6,K7] [K8,K9,K10,K11] [K12,K13,K14,K15]
-       ->
-       K0, K1, K4, K5 | K2, K3, K6, K7 | K8, K9, K12, K13 | K10, K11, K14, K15
-
-
-      across 32 columns -> 512 bytes in total (4 bytes * 4 rows * 32 columns)
-      (there are two of these because we loaded 128 bits per lane / 1024 bytes in total):
-       K0, K1, K4, K5 (intended to be picked up by even tid; e.g 0)
-       K2, K3, K6, K7 (even)
-       K8, K9, K12, K13 (odd)
-       K10, K11, K14, K15 (odd)
-       each 4 byte * 32 = 512 byte formation is sufficient for one SMFMAC
-      */
-
-      // how many threads participate in loading A is a function of
-      // A tile size (512 per SMFMAC call; we do 128 bits load from each thread
-      // so minimum 1024 bytes for 64 threads AKA 2 sub-banks, 2 SMFMAC calls).
+      // Naive A tile store: straight copy from global to LDS
       if (tid < A_TILE_VEC16) {
-        const auto *A_tile = A_base + k_outer * A_TILE_VEC16;
-        i8x16 loaded = A_tile[a_prod_row * (KS * 4) + a_prod_chunk];
-
-        auto *src = reinterpret_cast<int32_t *>(&loaded);
-        int32_t lo0, lo1, hi0, hi1;
-        asm volatile("v_pack_b32_f16 %0, %4, %5 op_sel:[0,0]\n\t" //lo0 = {K0, K1, K4, K5}
-                     "v_pack_b32_f16 %1, %6, %7 op_sel:[0,0]\n\t" //lo1 = {K8, K9, K12, K13}
-                     "v_pack_b32_f16 %2, %4, %5 op_sel:[1,1]\n\t" //hi0 = {K2, K3, K6, K7}
-                     "v_pack_b32_f16 %3, %6, %7 op_sel:[1,1]\n\t" // hi1 = {K10, K11, K14, K15}
-                     : "=&v"(lo0), "=&v"(lo1), "=&v"(hi0), "=&v"(hi1)
-                     : "v"(src[0]), "v"(src[1]), "v"(src[2]), "v"(src[3]));
-
-        // Store into bank-interleaved LDS: 4 lines × 32 columns per bank
-        int32_t *bank = A_smem + a_prod_bank * 128;
-        bank[0 * NB_BANKS + a_prod_col] = lo0; // even tid, low
-        bank[1 * NB_BANKS + a_prod_col] = lo1; // even tid, high
-        bank[2 * NB_BANKS + a_prod_col] = hi0; // odd tid, low
-        bank[3 * NB_BANKS + a_prod_col] = hi1; // odd tid, high
+        auto *A_smem_v16 = reinterpret_cast<i8x16 *>(A_smem_raw);
+        A_smem_v16[tid] = (A_base + k_outer * A_TILE_VEC16)[tid];
       }
 
       // B tile: NS × KS × 1024 bytes = NS × KS × 64 128 bit elements
@@ -3527,28 +3463,32 @@ pack
       __syncthreads();
 
       for (int kb = 0; kb < KS; ++kb) {
-        // Load A from LDS: 8 bytes spanning two lines (0, 1 for even or 2, 3
-        // for odd)
+        // Load 8 bytes from naive LDS layout.
+        // Even lane: bytes 0-7 of 16B K-block.  Odd lane: bytes 8-15.
+        auto *a_ptr = reinterpret_cast<const int2 *>(
+            A_smem_raw + a_cons_lds_base + kb * 64);
+        int2 a_loaded = *a_ptr;
 
-        /*
-col:      0     1     2     3     4     5     6     7     8     9    10    11    12    13    14    15    16    17    18    19    20    21    22    23    24    25    26    27    28    29    30    31
-row 0:   L0    L2    L4    L6    L8   L10   L12   L14   L16   L18   L20   L22   L24   L26   L28   L30   L32   L34   L36   L38   L40   L42   L44   L46   L48   L50   L52   L54   L56   L58   L60   L62
-row 1:   L0    L2    L4    L6    L8   L10   L12   L14   L16   L18   L20   L22   L24   L26   L28   L30   L32   L34   L36   L38   L40   L42   L44   L46   L48   L50   L52   L54   L56   L58   L60   L62
-row 2:   L1    L3    L5    L7    L9   L11   L13   L15   L17   L19   L21   L23   L25   L27   L29   L31   L33   L35   L37   L39   L41   L43   L45   L47   L49   L51   L53   L55   L57   L59   L61   L63
-row 3:   L1    L3    L5    L7    L9   L11   L13   L15   L17   L19   L21   L23   L25   L27   L29   L31   L33   L35   L37   L39   L41   L43   L45   L47   L49   L51   L53   L55   L57   L59   L61   L63
-        */
-        auto *a_ptr = reinterpret_cast<int32_t *>(
-            A_smem_raw + kb * 512 + a_cons_col * 4 + a_cons_is_odd * 256);
-          // base + bank offset + column offset + odd/even offset (256 bytes to jump to the other 2-line group)
-        a_reg.i32[0] = a_ptr[0];
-        a_reg.i32[1] = a_ptr[NB_BANKS]; //offset by column
-        /*
-        e.g 
-        for even lane:
-        K0, K1, K4, K5, K8, K9, K12, K13 are the non-zero-elements (0x00004444)
+        // Deinterleave via v_perm_b32 + DPP quad swap + v_cndmask.
+        // v_perm: {b0,b1,b2,b3,b4,b5,b6,b7}
+        //       -> pack_lo={b0,b1,b4,b5}, pack_hi={b2,b3,b6,b7}
+        auto a_u16 = __builtin_bit_cast(u16x4, a_loaded);
+        int pack_lo = __builtin_bit_cast(int,
+            __builtin_shufflevector(a_u16, a_u16, 0, 2));
+        int pack_hi = __builtin_bit_cast(int,
+            __builtin_shufflevector(a_u16, a_u16, 1, 3));
 
+        // DPP quad_perm:[1,0,3,2] — swap even/odd neighbors
+        constexpr int kQuadPermSwap = 0xB1;
+        int neighbor_lo = __builtin_amdgcn_mov_dpp(
+            pack_lo, kQuadPermSwap, 0xF, 0xF, false);
+        int neighbor_hi = __builtin_amdgcn_mov_dpp(
+            pack_hi, kQuadPermSwap, 0xF, 0xF, false);
 
-        */
+        // Even lane: own pack_lo + neighbor's pack_lo  -> SPARSITY_EVEN
+        // Odd lane:  neighbor's pack_hi + own pack_hi  -> SPARSITY_ODD
+        a_reg.i32[0] = (a_cons_is_odd == 0) ? pack_lo    : neighbor_hi;
+        a_reg.i32[1] = (a_cons_is_odd == 0) ? neighbor_lo : pack_hi;
 
         // n_block = which 16x64 block of B we are working on; each block will be used for one SMFMAC
         for (int j = 0; j < NS / 4; ++j) {
