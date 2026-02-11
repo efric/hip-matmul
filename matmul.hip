@@ -3543,7 +3543,7 @@ row 3:   L1    L3    L5    L7    L9   L11   L13   L15   L17   L19   L21   L23   
         a_reg.i32[0] = a_ptr[0];
         a_reg.i32[1] = a_ptr[NB_BANKS]; //offset by column
         /*
-        e.g 
+        e.g
         for even lane:
         K0, K1, K4, K5, K8, K9, K12, K13 are the non-zero-elements (0x00004444)
 
@@ -3562,7 +3562,7 @@ row 3:   L1    L3    L5    L7    L9   L11   L13   L15   L17   L19   L21   L23   
           // which sub bank + which slice within sub-bank
 
           /**
-          
+
             k_slice=0     k_slice=1     k_slice=2     k_slice=3
            (K 0-15)      (K 16-31)     (K 32-47)     (K 48-63)
          ┌────16B─────┬────16B─────┬────16B─────┬────16B─────┐

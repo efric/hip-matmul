@@ -73,11 +73,11 @@ __global__ void load_i8x16_builtin(const int8_t *__restrict__ in,
   int pack_hi = __builtin_bit_cast(int, __builtin_shufflevector(v, v, 1, 3));
 
   constexpr int kQuadPermSwap = 0xB1;
-  int neighbor_lo = __builtin_amdgcn_mov_dpp(pack_lo, kQuadPermSwap, 0xF, 0xF, false);
-  int neighbor_hi = __builtin_amdgcn_mov_dpp(pack_hi, kQuadPermSwap, 0xF, 0xF, false);
+  int neighbor_lo = __builtin_amdgcn_mov_dpp(pack_lo, kQuadPermSwap, 0xF, 0xF, true);
+  int neighbor_hi = __builtin_amdgcn_mov_dpp(pack_hi, kQuadPermSwap, 0xF, 0xF, true);
 
   int lo = (lane_in_pair == 0) ? pack_lo    : neighbor_hi;
-  int hi = (lane_in_pair == 0) ? neighbor_lo : pack_hi;
+  int hi = (lane_in_pair != 0) ? pack_hi    : neighbor_lo;
 
   *reinterpret_cast<int2 *>(out + tid * kBytesPerThread) = make_int2(lo, hi);
 }
