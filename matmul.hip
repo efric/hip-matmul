@@ -3485,6 +3485,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
           acc[j] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
               a_reg.vec, b_reg, acc[j], sparsity_idx, 0, 0);
         }
+        __syncthreads();
       }
     }
 
@@ -3583,21 +3584,14 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared
                             n_outer * K_outer * B_tile_size_in_vec16;
     const f16x8 *B_global_ptr = B_global + tid;
 
-    __shared__ int8_t A_shared[KS * 512];
+    __shared__ f16x8 A_shared[A_tile_size_in_vec16];
     __shared__ f16x8 B_shared[B_tile_size_in_vec16];
-
-    int a_row_prod = tid / (KS * 4);
-    int a_k_chunk = tid % (KS * 4);
-    int a_bank = a_k_chunk / 4;
-    int k_chunk_in_bank = a_k_chunk % 4;
-    int a_col_prod = a_row_prod + k_chunk_in_bank * 8;
-
-    int32_t *A_lds = reinterpret_cast<int32_t *>(A_shared);
+    auto *A_shared_bytes = reinterpret_cast<int8_t *>(A_shared);
 
     int a_m_row = (lane_id % 16) / 2;
     int a_is_odd = lane_id % 2;
     int a_k_range = lane_id / 16;
-    int a_col_cons = a_m_row + a_k_range * 8;
+    int a_lds_base = a_m_row * (KS * 64) + a_k_range * 16;
 
     int n_col = lane_id % 16;
     int k_slice = lane_id / 16;
@@ -3606,19 +3600,8 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       const f16x8 *A_tile_base = A_global + k_outer * A_tile_size_in_vec16;
-
       if (tid < A_tile_size_in_vec16) {
-        f16x8 a_loaded = A_tile_base[a_row_prod * (KS * 4) + a_k_chunk];
-        int32_t reg0 = reinterpret_cast<int32_t *>(&a_loaded)[0]; // [K0, K1]
-        int32_t reg1 = reinterpret_cast<int32_t *>(&a_loaded)[1]; // [K2, K3]
-        int32_t reg2 = reinterpret_cast<int32_t *>(&a_loaded)[2]; // [K4, K5]
-        int32_t reg3 = reinterpret_cast<int32_t *>(&a_loaded)[3]; // [K6, K7]
-
-        int32_t *bank_base = A_lds + a_bank * 128;
-        bank_base[0 * NB_BANKS + a_col_prod] = reg0; // Line 0: EVEN [K0, K1]
-        bank_base[1 * NB_BANKS + a_col_prod] = reg2; // Line 1: EVEN [K4, K5]
-        bank_base[2 * NB_BANKS + a_col_prod] = reg1; // Line 2: ODD  [K2, K3]
-        bank_base[3 * NB_BANKS + a_col_prod] = reg3; // Line 3: ODD  [K6, K7]
+        A_shared[tid] = A_tile_base[tid];
       }
 
       for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
@@ -3628,11 +3611,11 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared
       __syncthreads();
 
       for (int k_bank = 0; k_bank < KS; ++k_bank) {
-        int8_t *a_cons =
-            A_shared + k_bank * 512 + a_col_cons * 4 + a_is_odd * 256;
-        int32_t *a_ptr = reinterpret_cast<int32_t *>(a_cons);
-        a_reg.i32[0] = a_ptr[0];
-        a_reg.i32[1] = a_ptr[NB_BANKS];
+        auto *a_ptr = reinterpret_cast<f16x8 *>(A_shared_bytes + a_lds_base +
+                                                k_bank * 64);
+        auto *a_i32 = reinterpret_cast<int32_t *>(a_ptr);
+        a_reg.i32[0] = a_is_odd ? a_i32[1] : a_i32[0];
+        a_reg.i32[1] = a_is_odd ? a_i32[3] : a_i32[2];
 
         for (int j = 0; j < NS / 4; ++j) {
           int n_block = j * 4 + warp_id;
@@ -3645,6 +3628,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared
           acc[j] = __builtin_amdgcn_smfmac_f32_16x16x32_f16(
               a_reg.vec, b_reg, acc[j], sparsity_idx, 0, 0);
         }
+        __syncthreads();
       }
     }
 
