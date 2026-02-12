@@ -3377,6 +3377,8 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
 // partial sums over complementary K indices, which are
 // reduced (D[0]+D[1], D[2]+D[3]) to recover the 8 complete
 // dense output rows.
+// Inspired by the implementation described in:
+// https://huggingface.co/blog/mi300kernels
 template <int NS, int KS>
 class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     : public MmtKernel {
