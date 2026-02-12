@@ -3474,26 +3474,22 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       __syncthreads();
 
       for (int kb = 0; kb < KS; ++kb) {
-        // The sparse MFMA intrinsic takes non-zero
-        // elements plus sparsity indices that specify which
-        // 2 of 4 positions are non-zero. For a dense row:
-        //
-        //   K0 K1 K2 K3 K4 K5 ... K12 K13 K14 K15
-        //
-        // We can represent it across an even/odd lane pair as a sparse row by
-        // allowing even tids to hold positions {0,1} and odd tids to hold
-        // {2,3} within each group of 4:
+        // We can represent a dense row across an even/odd lane pair as a sparse
+        // row by allowing even tids to hold positions {0,1} and odd tids to
+        // hold {2,3} within each group of 4:
         //
         //   even: K0 K1 _  _  K4 K5 _  _  ...
         //   odd:  _  _  K2 K3 _  _  K6 K7 ...
         //
-        // From LDS, each lane loads 8 contiguous elements
+        // From LDS, each pair of lanes loads the following:
         //   even: K0 K1 K2 K3 | K4 K5 K6 K7
         //   odd:  K8 K9 K10 K11 | K12 K13 K14 K15
-        // But this must be transformed to align with the sparsity index:
+        // But this must be transformed to align with the sparsity index that
+        // represents:
         //   even: K0 K1 K4 K5 | K8 K9 K12 K13
         //   odd:  K2 K3 K6 K7 | K10 K11 K14 K15
 
+        // Load A from LDS: 8 bytes for this lane's groups
         auto *a_ptr =
             reinterpret_cast<int2 *>(A_smem_bytes + a_lds_base + kb * 64);
         auto a_i16 = __builtin_bit_cast(i16x4, *a_ptr);
