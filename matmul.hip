@@ -8,12 +8,12 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <cxxabi.h>
 #include <optional>
 #include <random>
 #include <typeinfo>
 #include <vector>
-#include <cstring>
 
 typedef void (*mmt_func_t)(const void *, const void *, void *, void *, int, int,
                            int);
@@ -3358,6 +3358,25 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
   }
 };
 
+// The `smfmac` kernels are designed for skinny GEMMs (M=8)
+// by using sparse MFMA intrinsics to perform a fully dense
+// matmul. SMFMAC takes a 4:2-sparse operand A (where we
+// specify which 2 of 4 elements are non-zero via a sparsity
+// index) and a dense operand B. The "sparse trick" exploits
+// this by splitting each dense A row across an even/odd lane
+// pair, each holding half the K elements in a complementary
+// 4:2 pattern:
+//
+//   even: K0 K1 _  _  K4 K5 _  _  K8  K9  _   _  ...
+//   odd:  _  _  K2 K3 _  _  K6 K7 _   _  K10 K11 ...
+//
+// Together, the pair covers all K elements of one dense row.
+// The SMFMAC instruction sees 16 "sparse" rows (from a
+// 16x16x64 output tile) but physically only 8 dense rows
+// exist. After the intrinsic, each even/odd pair holds
+// partial sums over complementary K indices, which are
+// reduced (D[0]+D[1], D[2]+D[3]) to recover the 8 complete
+// dense output rows.
 template <int NS, int KS>
 class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     : public MmtKernel {
@@ -3431,11 +3450,10 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     __shared__ i8x16 B_smem[B_TILE_VEC16];
     auto *A_smem_bytes = reinterpret_cast<int8_t *>(A_smem);
 
-    const int a_cons_m_pair = (lane % 16) / 2;
-    const int a_cons_is_odd = lane % 2;
-    const int a_cons_k_half = lane / 16;
-    const int a_cons_lds_base =
-        a_cons_m_pair * (KS * 64) + a_cons_k_half * 16 + a_cons_is_odd * 8;
+    const int a_m_pair = (lane % 16) / 2;
+    const int odd_lane = lane % 2;
+    const int a_k_half = lane / 16;
+    const int a_lds_base = a_m_pair * (KS * 64) + a_k_half * 16 + odd_lane * 8;
 
     const int b_cons_n_col = lane % 16;
     const int b_cons_k_slice = lane / 16;
@@ -3456,23 +3474,52 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       __syncthreads();
 
       for (int kb = 0; kb < KS; ++kb) {
-        // TODO: explain change.
+        // The sparse MFMA intrinsic takes non-zero
+        // elements plus sparsity indices that specify which
+        // 2 of 4 positions are non-zero. For a dense row:
+        //
+        //   K0 K1 K2 K3 K4 K5 ... K12 K13 K14 K15
+        //
+        // We can represent it across an even/odd lane pair as a sparse row by
+        // allowing even tids to hold positions {0,1} and odd tids to hold
+        // {2,3} within each group of 4:
+        //
+        //   even: K0 K1 _  _  K4 K5 _  _  ...
+        //   odd:  _  _  K2 K3 _  _  K6 K7 ...
+        //
+        // From LDS, each lane loads 8 contiguous elements
+        //   even: K0 K1 K2 K3 | K4 K5 K6 K7
+        //   odd:  K8 K9 K10 K11 | K12 K13 K14 K15
+        // But this must be transformed to align with the sparsity index:
+        //   even: K0 K1 K4 K5 | K8 K9 K12 K13
+        //   odd:  K2 K3 K6 K7 | K10 K11 K14 K15
+
         auto *a_ptr =
-            reinterpret_cast<int2 *>(A_smem_bytes + a_cons_lds_base + kb * 64);
+            reinterpret_cast<int2 *>(A_smem_bytes + a_lds_base + kb * 64);
         auto a_i16 = __builtin_bit_cast(i16x4, *a_ptr);
+        // Shuffle 16-bit halves
+        // even: lo={K0,K1,K4,K5}   hi={K2,K3,K6,K7}
+        // odd:  lo={K8,K9,K12,K13} hi={K10,K11,K14,K15}
         int pack_lo = __builtin_bit_cast(
             int, __builtin_shufflevector(a_i16, a_i16, 0, 2));
         int pack_hi = __builtin_bit_cast(
             int, __builtin_shufflevector(a_i16, a_i16, 1, 3));
 
+        // DPP swap between even/odd neighbors
+        // even gets neighbor's: {K8,K9,K12,K13},
+        //                       {K10,K11,K14,K15}
+        // odd  gets neighbor's: {K0,K1,K4,K5},
+        //                       {K2,K3,K6,K7}
         constexpr int kQuadPermSwap = 0xB1;
         int neighbor_lo =
             __builtin_amdgcn_mov_dpp(pack_lo, kQuadPermSwap, 0xF, 0xF, false);
         int neighbor_hi =
             __builtin_amdgcn_mov_dpp(pack_hi, kQuadPermSwap, 0xF, 0xF, false);
 
-        a_reg.i32[0] = (a_cons_is_odd == 0) ? pack_lo : neighbor_hi;
-        a_reg.i32[1] = (a_cons_is_odd == 0) ? neighbor_lo : pack_hi;
+        // even: {K0,K1,K4,K5,  K8,K9,K12,K13}
+        // odd:  {K2,K3,K6,K7,  K10,K11,K14,K15}
+        a_reg.i32[0] = !odd_lane ? pack_lo : neighbor_hi;
+        a_reg.i32[1] = !odd_lane ? neighbor_lo : pack_hi;
 
         for (int j = 0; j < NS / 4; ++j) {
           int n_block = j * 4 + warp;
@@ -3590,7 +3637,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared
     auto *A_shared_bytes = reinterpret_cast<int8_t *>(A_shared);
 
     int a_m_row = (lane_id % 16) / 2;
-    int a_is_odd = lane_id % 2;
+    int odd_lane = lane_id % 2;
     int a_k_range = lane_id / 16;
     int a_lds_base = a_m_row * (KS * 64) + a_k_range * 16;
 
@@ -3615,8 +3662,10 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared
         auto *a_ptr = reinterpret_cast<f16x8 *>(A_shared_bytes + a_lds_base +
                                                 k_bank * 64);
         auto *a_i32 = reinterpret_cast<int32_t *>(a_ptr);
-        a_reg.i32[0] = a_is_odd ? a_i32[1] : a_i32[0];
-        a_reg.i32[1] = a_is_odd ? a_i32[3] : a_i32[2];
+        // even: {K0, K1,  K4, K5}
+        // odd: {K2, K3,  K6, K7}
+        a_reg.i32[0] = odd_lane ? a_i32[1] : a_i32[0];
+        a_reg.i32[1] = odd_lane ? a_i32[3] : a_i32[2];
 
         for (int j = 0; j < NS / 4; ++j) {
           int n_block = j * 4 + warp_id;
