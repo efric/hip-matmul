@@ -3472,7 +3472,6 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
         B_smem[i + tid] = B_global_ptr[i];
       }
       B_global_ptr += B_TILE_VEC16;
-
       __syncthreads();
 
       for (int kb = 0; kb < KS; ++kb) {
