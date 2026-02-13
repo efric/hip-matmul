@@ -3474,17 +3474,16 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       __syncthreads();
 
       for (int kb = 0; kb < KS; ++kb) {
-          auto *a_ptr = reinterpret_cast<i8x16 *>(A_smem_bytes + a_lds_base + kb * 64);
-          auto *src = reinterpret_cast<int32_t *>(a_ptr);
-          int32_t lo0, lo1, hi0, hi1;
-          asm volatile("v_pack_b32_f16 %0, %4, %5 op_sel:[0,0]\n\t" // //lo0 = {K0, K1, K4, K5}
-                       "v_pack_b32_f16 %1, %6, %7 op_sel:[0,0]\n\t" //lo1 = {K8, K9, K12, K13}
-                       "v_pack_b32_f16 %2, %4, %5 op_sel:[1,1]\n\t" //hi0 = {K2, K3, K6, K7}
-                       "v_pack_b32_f16 %3, %6, %7 op_sel:[1,1]\n\t" // hi1 = {K10, K11, K14, K15}
-                       : "=&v"(lo0), "=&v"(lo1), "=&v"(hi0), "=&v"(hi1)
-                       : "v"(src[0]), "v"(src[1]), "v"(src[2]), "v"(src[3]));
-          a_reg.i32[0] = !odd_lane ? lo0 : hi0;
-          a_reg.i32[1] = !odd_lane ? lo1 : hi1;
+        // Load 16 bytes from LDS, shuffle i16 halves, select by even/odd lane
+        auto *a_ptr = reinterpret_cast<i16x4 *>(A_smem_bytes + a_lds_base + kb * 64);
+        i16x4 a_lo = a_ptr[0];  // {K0K1, K2K3, K4K5, K6K7}
+        i16x4 a_hi = a_ptr[1];  // {K8K9, K10K11, K12K13, K14K15}
+        int lo0 = __builtin_bit_cast(int, __builtin_shufflevector(a_lo, a_lo, 0, 2));  // {K0K1, K4K5}
+        int hi0 = __builtin_bit_cast(int, __builtin_shufflevector(a_lo, a_lo, 1, 3));  // {K2K3, K6K7}
+        int lo1 = __builtin_bit_cast(int, __builtin_shufflevector(a_hi, a_hi, 0, 2));  // {K8K9, K12K13}
+        int hi1 = __builtin_bit_cast(int, __builtin_shufflevector(a_hi, a_hi, 1, 3));  // {K10K11, K14K15}
+        a_reg.i32[0] = !odd_lane ? lo0 : hi0;
+        a_reg.i32[1] = !odd_lane ? lo1 : hi1;
         // We can represent a dense row across an even/odd lane pair as a sparse
         // row by allowing even tids to hold positions {0,1} and odd tids to
         // hold {2,3} within each group of 4:
@@ -4082,84 +4081,84 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3
 };
 
 int main() {
-  std::printf("Best-performing kernels for each element types:\n\n");
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3<
-       8, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload<
-       12, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared<8, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<8, 8>());
-  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
+  // std::printf("Best-performing kernels for each element types:\n\n");
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3<
+  //      8, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload<
+  //      12, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared<8, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<8, 8>());
+  // test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
 
-  std::printf("\n\n\nOther kernels:\n\n");
-  test(MmtKernel_generic<Type::SI8, Type::SI8, Type::SI32, 3, 5, 2>());
-  test(MmtKernel_generic<Type::FP16, Type::FP16, Type::FP32, 3, 5, 2>());
-  test(MmtKernel_generic<Type::FP32, Type::FP32, Type::FP32, 3, 5, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared<8, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared<4, 8>());
-  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor());
-  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC());
-  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct());
-  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4());
-  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4());
-  test(MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct());
-  test(MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct());
-  test(MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 8>());
-  test(
-      MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 12>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 12>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 16>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_subgroup2x2<
-       8, 8>());
-  test(
-      MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_misguidednobankconflicts<
-          8, 8>());
-  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
-  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 16>());
-  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
-  test(
-      MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_naive<
-          8, 8>());
-  test(
-      MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_take2<
-          8, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared<8, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2<8, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload<
-       8, 8>());
+  // std::printf("\n\n\nOther kernels:\n\n");
+  // test(MmtKernel_generic<Type::SI8, Type::SI8, Type::SI32, 3, 5, 2>());
+  // test(MmtKernel_generic<Type::FP16, Type::FP16, Type::FP32, 3, 5, 2>());
+  // test(MmtKernel_generic<Type::FP32, Type::FP32, Type::FP32, 3, 5, 2>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared<8, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared<4, 8>());
+  // test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor());
+  // test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC());
+  // test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct());
+  // test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4());
+  // test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4());
+  // test(MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct());
+  // test(MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct());
+  // test(MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 4>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 8>());
+  // test(
+  //     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 12>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 4>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 12>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 4>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 16>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_subgroup2x2<
+  //      8, 8>());
+  // test(
+  //     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_misguidednobankconflicts<
+  //         8, 8>());
+  // test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
+  // test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 16>());
+  // test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
+  // test(
+  //     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_naive<
+  //         8, 8>());
+  // test(
+  //     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_take2<
+  //         8, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared<8, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2<8, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload<
+  //      8, 8>());
 
   std::printf("\n\n\nSMFMAC sparse trick experiments:\n\n");
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 4>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 4>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<16, 2>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 2>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 4>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 8>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 2>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 4>());
+  // test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<16, 2>());
 
-  std::printf("\n\n\nStream-K experiments:\n\n");
-  test(
-      MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<8,
-                                                                          8>());
-  test(MmtKernel_StreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<
-       8, 8>());
-  test(
-      MmtKernel_HybridStreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<
-          8, 8>());
+  // std::printf("\n\n\nStream-K experiments:\n\n");
+  // test(
+  //     MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<8,
+  //                                                                         8>());
+  // test(MmtKernel_StreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<
+  //      8, 8>());
+  // test(
+  //     MmtKernel_HybridStreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<
+  //         8, 8>());
 }
