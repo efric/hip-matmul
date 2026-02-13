@@ -3453,7 +3453,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     const int a_m_pair = (lane % 16) / 2;
     const int odd_lane = lane % 2;
     const int a_k_half = lane / 16;
-    const int a_lds_base = a_m_pair * (KS * 64) + a_k_half * 16 + odd_lane * 8;
+    const int a_lds_base = a_m_pair * (KS * 64) + a_k_half * 16;
 
     const int b_cons_n_col = lane % 16;
     const int b_cons_k_slice = lane / 16;
@@ -3474,6 +3474,17 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       __syncthreads();
 
       for (int kb = 0; kb < KS; ++kb) {
+          auto *a_ptr = reinterpret_cast<i8x16 *>(A_smem_bytes + a_lds_base + kb * 64);
+          auto *src = reinterpret_cast<int32_t *>(a_ptr);
+          int32_t lo0, lo1, hi0, hi1;
+          asm volatile("v_pack_b32_f16 %0, %4, %5 op_sel:[0,0]\n\t" // //lo0 = {K0, K1, K4, K5}
+                       "v_pack_b32_f16 %1, %6, %7 op_sel:[0,0]\n\t" //lo1 = {K8, K9, K12, K13}
+                       "v_pack_b32_f16 %2, %4, %5 op_sel:[1,1]\n\t" //hi0 = {K2, K3, K6, K7}
+                       "v_pack_b32_f16 %3, %6, %7 op_sel:[1,1]\n\t" // hi1 = {K10, K11, K14, K15}
+                       : "=&v"(lo0), "=&v"(lo1), "=&v"(hi0), "=&v"(hi1)
+                       : "v"(src[0]), "v"(src[1]), "v"(src[2]), "v"(src[3]));
+          a_reg.i32[0] = !odd_lane ? lo0 : hi0;
+          a_reg.i32[1] = !odd_lane ? lo1 : hi1;
         // We can represent a dense row across an even/odd lane pair as a sparse
         // row by allowing even tids to hold positions {0,1} and odd tids to
         // hold {2,3} within each group of 4:
@@ -3490,32 +3501,32 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
         //   odd:  K2 K3 K6 K7 | K10 K11 K14 K15
 
         // Load A from LDS: 8 bytes for this lane's groups
-        auto *a_ptr =
-            reinterpret_cast<int2 *>(A_smem_bytes + a_lds_base + kb * 64);
-        auto a_i16 = __builtin_bit_cast(i16x4, *a_ptr);
-        // Shuffle 16-bit halves
-        // even: lo={K0,K1,K4,K5}   hi={K2,K3,K6,K7}
-        // odd:  lo={K8,K9,K12,K13} hi={K10,K11,K14,K15}
-        int pack_lo = __builtin_bit_cast(
-            int, __builtin_shufflevector(a_i16, a_i16, 0, 2));
-        int pack_hi = __builtin_bit_cast(
-            int, __builtin_shufflevector(a_i16, a_i16, 1, 3));
+        // auto *a_ptr =
+        //     reinterpret_cast<int2 *>(A_smem_bytes + a_lds_base + kb * 64);
+        // auto a_i16 = __builtin_bit_cast(i16x4, *a_ptr);
+        // // Shuffle 16-bit halves
+        // // even: lo={K0,K1,K4,K5}   hi={K2,K3,K6,K7}
+        // // odd:  lo={K8,K9,K12,K13} hi={K10,K11,K14,K15}
+        // int pack_lo = __builtin_bit_cast(
+        //     int, __builtin_shufflevector(a_i16, a_i16, 0, 2));
+        // int pack_hi = __builtin_bit_cast(
+        //     int, __builtin_shufflevector(a_i16, a_i16, 1, 3));
 
-        // DPP swap between even/odd neighbors
-        // even gets neighbor's: {K8,K9,K12,K13},
-        //                       {K10,K11,K14,K15}
-        // odd  gets neighbor's: {K0,K1,K4,K5},
-        //                       {K2,K3,K6,K7}
-        constexpr int kQuadPermSwap = 0xB1;
-        int neighbor_lo =
-            __builtin_amdgcn_mov_dpp(pack_lo, kQuadPermSwap, 0xF, 0xF, false);
-        int neighbor_hi =
-            __builtin_amdgcn_mov_dpp(pack_hi, kQuadPermSwap, 0xF, 0xF, false);
+        // // DPP swap between even/odd neighbors
+        // // even gets neighbor's: {K8,K9,K12,K13},
+        // //                       {K10,K11,K14,K15}
+        // // odd  gets neighbor's: {K0,K1,K4,K5},
+        // //                       {K2,K3,K6,K7}
+        // constexpr int kQuadPermSwap = 0xB1;
+        // int neighbor_lo =
+        //     __builtin_amdgcn_mov_dpp(pack_lo, kQuadPermSwap, 0xF, 0xF, false);
+        // int neighbor_hi =
+        //     __builtin_amdgcn_mov_dpp(pack_hi, kQuadPermSwap, 0xF, 0xF, false);
 
-        // even: {K0,K1,K4,K5,  K8,K9,K12,K13}
-        // odd:  {K2,K3,K6,K7,  K10,K11,K14,K15}
-        a_reg.i32[0] = !odd_lane ? pack_lo : neighbor_hi;
-        a_reg.i32[1] = !odd_lane ? neighbor_lo : pack_hi;
+        // // even: {K0,K1,K4,K5,  K8,K9,K12,K13}
+        // // odd:  {K2,K3,K6,K7,  K10,K11,K14,K15}
+        // a_reg.i32[0] = !odd_lane ? pack_lo : neighbor_hi;
+        // a_reg.i32[1] = !odd_lane ? neighbor_lo : pack_hi;
 
         for (int j = 0; j < NS / 4; ++j) {
           int n_block = j * 4 + warp;
