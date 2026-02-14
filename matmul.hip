@@ -3358,6 +3358,151 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
   }
 };
 
+// M-padded MFMA kernel for skinny GEMMs (M=8->16).
+// Uses the dense mfma_i32_16x16x32_i8 instruction with zero-padding
+// on the A operand for lanes corresponding to M-rows 8-15.
+// This serves as a benchmark comparison against the smfmac sparse
+// trick kernel below, which achieves the same M=8 matmul using
+// smfmac_i32_16x16x64_i8.
+//
+// Lane mapping for mfma_i32_16x16x32_i8:
+//   A operand: lane%16 = M-row (0-15), lane/16 = K-group (0-3), 8 i8 per lane
+//   B operand: lane%16 = N-col (0-15), lane/16 = K-group (0-3), 8 i8 per lane
+//   Output: d[p] = C[4*(lane/16) + p][lane%16], p=0..3
+//
+// For M=8: lanes with lane%16 >= 8 feed A=0 (zero-padding).
+// Output rows 0-7 are real (lane/16 < 2), rows 8-15 are discarded.
+// Since mfma processes K=32 vs smfmac's K=64, the inner loop runs
+// KS*2 iterations (nested kb=0..KS-1, kh=0..1).
+template <int NS, int KS>
+class MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared
+    : public MmtKernel {
+  static_assert(NS >= 4 && !(NS % 4));
+  static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
+
+  virtual Type A_type() const override { return Type::SI8; }
+  virtual Type B_type() const override { return Type::SI8; }
+  virtual Type C_type() const override { return Type::SI32; }
+  virtual int M_tile() const override { return 8; }
+  virtual int N_tile() const override { return NS * 16; }
+  virtual int K_tile() const override { return KS * 64; }
+
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return m * (KS * 64) + k; };
+  }
+
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int n_block = n / 16;
+      int n_col = n % 16;
+      return n_block * (KS * 1024) + n_col * (KS * 64) + k;
+    };
+  }
+
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return m * (NS * 16) + n; };
+  }
+
+  virtual int num_threads() const override { return 256; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
+    using int8x8_t = int64_t;
+    using int32x4_t = __attribute__((__vector_size__(16))) int32_t;
+    using i8x16 = __attribute__((__vector_size__(16))) int8_t;
+
+    int32x4_t acc[NS / 4] = {{0}};
+
+    const int tid = threadIdx.x;
+    const int lane = tid % 64;
+    const int warp = tid / 64;
+
+    // A tile: 8 rows * KS*64 bytes, stored as i8x16 elements
+    // B tile: NS n-blocks * 16 n-cols * KS*64 k-bytes, as i8x16 elements
+    constexpr int A_TILE_VEC16 = 8 * KS * 4;
+    constexpr int B_TILE_VEC16 = NS * KS * 64;
+
+    const auto *A_base = static_cast<const i8x16 *>(A_data) +
+                         blockIdx.x * K_outer * A_TILE_VEC16;
+    const auto *B_base = static_cast<const i8x16 *>(B_data) +
+                         blockIdx.y * K_outer * B_TILE_VEC16;
+    const auto *B_global_ptr = B_base + tid;
+
+    __shared__ i8x16 A_smem[A_TILE_VEC16];
+    __shared__ i8x16 B_smem[B_TILE_VEC16];
+    auto *A_smem_bytes = reinterpret_cast<int8_t *>(A_smem);
+
+    // Lane-to-data mapping for mfma_i32_16x16x32_i8
+    const int a_m_row = lane % 16;
+    const int a_k_group = lane / 16;
+    const int b_n_col = lane % 16;
+    const int b_k_group = lane / 16;
+
+    // Pre-compute A LDS base offset (only dereferenced when a_m_row < 8)
+    const int a_lds_base = a_m_row * (KS * 64) + a_k_group * 8;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      if (tid < A_TILE_VEC16) {
+        const i8x16 *A_ptr = A_base + k_outer * A_TILE_VEC16;
+        A_smem[tid] = A_ptr[tid];
+      }
+
+      for (int i = 0; i < B_TILE_VEC16; i += 256) {
+        B_smem[i + tid] = B_global_ptr[i];
+      }
+      B_global_ptr += B_TILE_VEC16;
+      __syncthreads();
+
+      for (int kb = 0; kb < KS; ++kb) {
+        for (int kh = 0; kh < 2; ++kh) {
+          // Load A: zero-pad for M-rows >= 8 (padding region)
+          int8x8_t a_reg = (a_m_row < 8)
+              ? *reinterpret_cast<int8x8_t *>(
+                    A_smem_bytes + a_lds_base + kb * 64 + kh * 32)
+              : 0;
+
+          for (int j = 0; j < NS / 4; ++j) {
+            int n_block = j * 4 + warp;
+
+            auto *b_ptr = reinterpret_cast<int8x8_t *>(
+                reinterpret_cast<int8_t *>(B_smem) + n_block * (KS * 1024) +
+                b_n_col * (KS * 64) + kb * 64 + kh * 32 + b_k_group * 8);
+            int8x8_t b_reg = *b_ptr;
+
+            acc[j] = __builtin_amdgcn_mfma_i32_16x16x32_i8(
+                a_reg, b_reg, acc[j], 0, 0, 0);
+          }
+        }
+        __syncthreads();
+      }
+    }
+
+    // Output: d[p] = C[4*(lane/16) + p][lane%16]
+    // Only lane/16 < 2 (rows 0-7) contain real results.
+    constexpr int N_STRIDE = NS * 16;
+    constexpr int TILE_ELEMS = 8 * N_STRIDE;
+    const int g = lane / 16;
+    const int n_col_out = lane % 16;
+
+    int32_t *C_tile = static_cast<int32_t *>(C_data) +
+                      TILE_ELEMS * (N_outer * blockIdx.x + blockIdx.y);
+
+    if (g < 2) {
+      const int m_base = g * 4;
+      for (int j = 0; j < NS / 4; ++j) {
+        const int n = (j * 4 + warp) * 16 + n_col_out;
+        auto *d = reinterpret_cast<int32_t *>(&acc[j]);
+        C_tile[(m_base + 0) * N_STRIDE + n] = d[0];
+        C_tile[(m_base + 1) * N_STRIDE + n] = d[1];
+        C_tile[(m_base + 2) * N_STRIDE + n] = d[2];
+        C_tile[(m_base + 3) * N_STRIDE + n] = d[3];
+      }
+    }
+  }
+};
+
 // The `smfmac` kernels are designed for skinny GEMMs (M=8)
 // by using sparse MFMA intrinsics to perform a fully dense
 // matmul. SMFMAC takes a 4:2-sparse operand A (where we
@@ -4124,6 +4269,12 @@ int main() {
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
+  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 2>());
+  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 4>());
+  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 8>());
+  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<8, 2>());
+  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<8, 4>());
+  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<16, 2>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 2>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 4>());
   test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 8>());
