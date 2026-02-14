@@ -3475,7 +3475,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
       __syncthreads();
 
       for (int kb = 0; kb < KS; ++kb) {
-        // Both lanes in a pair load the same 16 bytes from LDS:
+        // Both lanes in a pair load the same 8 bytes from LDS:
         //   all:  K0 K1 K2 K3 | K4 K5 K6 K7 | K8 K9 K10 K11 | K12 K13 K14 K15
         //
         // Viewed as two i16x4 halves (a_lo and a_hi):
