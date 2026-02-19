@@ -3437,7 +3437,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
     const int lane = tid % 64;
     const int warp = tid / 64;
 
-    // A tile: 8 rows × KS banks × 4 lines/bank × 32 cols × 4B = KS*512 bytes
+    // A tile: 8 rows × KS banks × 4 groups of K = KS*512 bytes
     // B tile: NS n-blocks × KS k-banks × 64 vec16 elements
     constexpr int A_TILE_VEC16 = 8 * KS * 4;
     constexpr int B_TILE_VEC16 = NS * KS * 64;
