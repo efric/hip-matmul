@@ -3380,7 +3380,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
 // Inspired by the implementation described in:
 // https://huggingface.co/blog/mi300kernels
 template <int NS, int KS>
-class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
+class MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared
     : public MmtKernel {
   static_assert(NS >= 4 && !(NS % 4));
   static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
@@ -3551,7 +3551,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared
 };
 
 template <int NS, int KS>
-class MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared
+class MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared
     : public MmtKernel {
   static_assert(NS >= 4 && !(NS % 4));
   static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
@@ -3700,7 +3700,7 @@ class MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared
 // trick kernel above, which achieves the same M=8 matmul using
 // smfmac_i32_16x16x64_i8.
 template <int NS, int KS>
-class MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared
+class MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared
     : public MmtKernel {
   static_assert(NS >= 4 && !(NS % 4));
   static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
@@ -3834,7 +3834,7 @@ class MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared
 // Since mfma processes K=16 vs smfmac's K=32, the inner loop runs
 // KS*2 iterations (nested kb=0..KS-1, kh=0..1).
 template <int NS, int KS>
-class MmtKernel_256t_8xNS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared
+class MmtKernel_256t_NSxKS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared
     : public MmtKernel {
   static_assert(NS >= 4 && !(NS % 4));
   static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
@@ -4388,30 +4388,30 @@ int main() {
        8, 8>());
 
   std::printf("\n\n\nSMFMAC sparse trick experiments:\n\n");
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 2>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 4>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 8>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<8, 2>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<8, 4>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<16, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 8>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 2>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 4>());
-  test(MmtKernel_256t_MSxNS_amdgcn_smfmac_f32_16x16x32f16_shared<16, 2>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<4, 2>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<4, 4>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<4, 8>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<8, 2>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<8, 4>());
-  test(MmtKernel_256t_8xNS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<16, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared<4, 8>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 8>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<8, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<8, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<16, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared<4, 8>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared<8, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared<16, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<4, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<4, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<4, 8>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<8, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<8, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<16, 2>());
 
   std::printf("\n\n\nStream-K experiments:\n\n");
   test(
