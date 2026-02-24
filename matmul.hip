@@ -3550,6 +3550,203 @@ class MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared
   }
 };
 
+// B-swizzle variant of the I8 SMFMAC sparse trick kernel.
+// Instead of shuffling A to split even/odd K positions across lane pairs
+// (which wastes 50% of A LDS bandwidth since both lanes load the same 16
+// bytes), this variant keeps A ~natural and shuffles B instead.
+//
+// Each lane in a pair loads UNIQUE 8 bytes from A:
+//   even lane: K0..K7    (8 bytes, sequential)
+//   odd lane:  K8..K15   (8 bytes, sequential)
+//
+// B is BFI-shuffled to cross-mix groups at 16-bit granularity:
+//   b_reg[0] = lo16(B_VGPR0) | hi16(B_VGPR2) = {B0,B1,B10,B11}
+//   b_reg[1] = lo16(B_VGPR2) | hi16(B_VGPR0) = {B8,B9,B2,B3}
+//   b_reg[2] = lo16(B_VGPR1) | hi16(B_VGPR3) = {B4,B5,B14,B15}
+//   b_reg[3] = lo16(B_VGPR3) | hi16(B_VGPR1) = {B12,B13,B6,B7}
+//
+// Alternating sparsity indices select the correct positions:
+//   even lane: 0xE4E4 -> group0:pos{0,1}, group1:pos{2,3}, ...
+//   odd lane:  0x4E4E -> group0:pos{2,3}, group1:pos{0,1}, ...
+//
+// Odd lanes swap lo16/hi16 within each A VGPR (2x v_perm_b32) so that
+// their K8..K15 data aligns with the B positions selected by 0x4E4E.
+//
+// Benefits over baseline:
+//   - 50% less A LDS bandwidth (each lane loads unique 8 bytes vs shared 16)
+//   - No shufflevector or conditional select on A
+// Cost:
+//   - 4 BFI instructions to construct B (was 0 in baseline)
+//   - 2 v_perm_b32 for odd-lane A swap (was 4 shufflevector + 2 select)
+template <int NS, int KS>
+class MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle
+    : public MmtKernel {
+  static_assert(NS >= 4 && !(NS % 4));
+  static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
+
+  // Alternating sparsity indices for the B-swizzle trick
+  static constexpr int SPARSITY_EVEN =
+      0x0000E4E4; // pos{0,1}, pos{2,3}, pos{0,1}, pos{2,3}
+  static constexpr int SPARSITY_ODD =
+      0x00004E4E; // pos{2,3}, pos{0,1}, pos{2,3}, pos{0,1}
+
+  virtual Type A_type() const override { return Type::SI8; }
+  virtual Type B_type() const override { return Type::SI8; }
+  virtual Type C_type() const override { return Type::SI32; }
+  virtual int M_tile() const override { return 8; }
+  virtual int N_tile() const override { return NS * 16; }
+  virtual int K_tile() const override { return KS * 64; }
+
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return m * (KS * 64) + k; };
+  }
+
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int n_block = n / 16;
+      int n_col = n % 16;
+      return n_block * (KS * 1024) + n_col * (KS * 64) + k;
+    };
+  }
+
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return m * (NS * 16) + n; };
+  }
+
+  virtual int num_threads() const override { return 256; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
+    using i8x8 = __attribute__((__vector_size__(8))) int8_t;
+    using i8x16 = __attribute__((__vector_size__(16))) int8_t;
+    using i32x4 = __attribute__((__vector_size__(16))) int32_t;
+
+    union {
+      i8x8 vec;
+      int32_t i32[2];
+    } a_reg;
+
+    i32x4 acc[NS / 4] = {{0}};
+
+    const int tid = threadIdx.x;
+    const int lane = tid % 64;
+    const int warp = tid / 64;
+
+    // A tile: 8 rows × KS banks × 4 groups of K = KS*512 bytes
+    // B tile: NS n-blocks × KS k-banks × 64 vec16 elements
+    constexpr int A_TILE_VEC16 = 8 * KS * 4;
+    constexpr int B_TILE_VEC16 = NS * KS * 64;
+
+    const auto *A_base = static_cast<const i8x16 *>(A_data) +
+                         blockIdx.x * K_outer * A_TILE_VEC16;
+    const auto *B_base = static_cast<const i8x16 *>(B_data) +
+                         blockIdx.y * K_outer * B_TILE_VEC16;
+    const auto *B_global_ptr = B_base + tid;
+
+    __shared__ i8x16 A_smem[A_TILE_VEC16];
+    __shared__ i8x16 B_smem[B_TILE_VEC16];
+    auto *A_smem_bytes = reinterpret_cast<int8_t *>(A_smem);
+
+    const int a_m_pair = (lane % 16) / 2;
+    const int odd_lane = lane % 2;
+    const int a_k_half = lane / 16;
+    // B-swizzle: each lane reads unique 8 bytes (even: K0-K7, odd: K8-K15)
+    const int a_lds_base =
+        a_m_pair * (KS * 64) + a_k_half * 16 + odd_lane * 8;
+
+    const int b_cons_n_col = lane % 16;
+    const int b_cons_k_slice = lane / 16;
+
+    const int sparsity_idx = (lane & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      if (tid < A_TILE_VEC16) {
+        const i8x16 *A_ptr = A_base + k_outer * A_TILE_VEC16;
+        A_smem[tid] = A_ptr[tid];
+      }
+
+      for (int i = 0; i < B_TILE_VEC16; i += 256) {
+        B_smem[i + tid] = B_global_ptr[i];
+      }
+      B_global_ptr += B_TILE_VEC16;
+      __syncthreads();
+
+      for (int kb = 0; kb < KS; ++kb) {
+        // A: load 8 bytes directly (no extraction shuffle needed)
+        // Even lane gets K0..K7, odd lane gets K8..K15
+        auto *a_ptr = reinterpret_cast<int32_t *>(
+            A_smem_bytes + a_lds_base + kb * 64);
+        a_reg.i32[0] = a_ptr[0];
+        a_reg.i32[1] = a_ptr[1];
+
+        // Odd lane: swap lo16/hi16 within each VGPR to align with
+        // sparsity 0x4E4E which reads pos{2,3} first then pos{0,1}
+        if (odd_lane) {
+          a_reg.i32[0] = (((uint32_t)a_reg.i32[0]) >> 16) |
+                         (((uint32_t)a_reg.i32[0]) << 16);
+          a_reg.i32[1] = (((uint32_t)a_reg.i32[1]) >> 16) |
+                         (((uint32_t)a_reg.i32[1]) << 16);
+        }
+
+        for (int j = 0; j < NS / 4; ++j) {
+          int n_block = j * 4 + warp;
+
+          // B: load 16 bytes from LDS (same as baseline)
+          auto *b_i32 = reinterpret_cast<int32_t *>(
+              reinterpret_cast<int8_t *>(B_smem) + n_block * (KS * 1024) +
+              b_cons_n_col * (KS * 64) + kb * 64 + b_cons_k_slice * 16);
+
+          // B shuffle: cross-mix VGPRs 0↔2 and 1↔3 at 16-bit granularity
+          // This places B values so that alternating sparsity indices
+          // select the correct K positions for each lane.
+          constexpr uint32_t LO16 = 0x0000FFFF;
+
+          union {
+            i8x16 vec;
+            int32_t i32[4];
+          } b_reg;
+          b_reg.i32[0] = (b_i32[0] & LO16) | (b_i32[2] & ~LO16);
+          b_reg.i32[1] = (b_i32[2] & LO16) | (b_i32[0] & ~LO16);
+          b_reg.i32[2] = (b_i32[1] & LO16) | (b_i32[3] & ~LO16);
+          b_reg.i32[3] = (b_i32[3] & LO16) | (b_i32[1] & ~LO16);
+
+          acc[j] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
+              a_reg.vec, b_reg.vec, acc[j], sparsity_idx, 0, 0);
+        }
+        __syncthreads();
+      }
+    }
+
+    // Post-processing: fuse even + odd K partial sums to get the complete dot
+    // product per row
+    for (int j = 0; j < NS / 4; ++j) {
+      auto *d = reinterpret_cast<int32_t *>(&acc[j]);
+      d[0] = d[0] + d[1]; // row0 complete
+      d[1] = d[2] + d[3]; // row1 complete
+    }
+
+    constexpr int N_STRIDE = NS * 16;
+    constexpr int TILE_ELEMS = 8 * N_STRIDE;
+
+    const int m_pair = lane / 16;
+    const int m0 = m_pair * 2;
+    const int m1 = m0 + 1;
+    const int n_col_out = lane % 16;
+
+    int32_t *C_tile = static_cast<int32_t *>(C_data) +
+                      TILE_ELEMS * (N_outer * blockIdx.x + blockIdx.y);
+
+    for (int j = 0; j < NS / 4; ++j) {
+      const int n = (j * 4 + warp) * 16 + n_col_out;
+      auto *d = reinterpret_cast<int32_t *>(&acc[j]);
+      C_tile[m0 * N_STRIDE + n] = d[0];
+      C_tile[m1 * N_STRIDE + n] = d[1];
+    }
+  }
+};
+
 template <int NS, int KS>
 class MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared
     : public MmtKernel {
@@ -3667,6 +3864,537 @@ class MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared
       }
     }
 
+    for (int j = 0; j < NS / 4; ++j) {
+      float *regD = reinterpret_cast<float *>(&acc[j]);
+      regD[0] = regD[0] + regD[1];
+      regD[1] = regD[2] + regD[3];
+    }
+
+    constexpr int N_stride = NS * 16;
+    int m_pair = lane_id / 16;
+    int m0 = m_pair * 2;
+    int m1 = m_pair * 2 + 1;
+
+    constexpr int tile_size = 8 * NS * 16;
+    float *C_tile = static_cast<float *>(C_data) +
+                    tile_size * (N_outer * m_outer + n_outer);
+
+    for (int j = 0; j < NS / 4; ++j) {
+      int n_block = j * 4 + warp_id;
+      int n = n_block * 16 + n_col;
+
+      float *regD = reinterpret_cast<float *>(&acc[j]);
+      C_tile[m0 * N_stride + n] = regD[0];
+      C_tile[m1 * N_stride + n] = regD[1];
+    }
+  }
+};
+
+// Unique-lane-data variant of the I8 SMFMAC sparse trick kernel.
+// Instead of even/odd lanes reading the SAME 128-bit A data from LDS,
+// each lane reads UNIQUE data: even lane gets K_lo (K0..K15),
+// odd lane gets K_hi (K16..K31). B loads two 128-bit chunks per lane
+// and mixes them at 16-bit granularity so that sparsity positions 0,1
+// (even lanes) select B values from K_lo and positions 2,3 (odd lanes)
+// select from K_hi. This doubles K_tile (KS * 128 instead of KS * 64)
+// and issues 2 SMFMAC instructions per k_bank per N-block-group.
+//
+// A extraction: standard shufflevector (no BFI needed).
+// B mixing: 16-bit level -- lo16 from blo, hi16 from bhi per VGPR.
+template <int NS, int KS>
+class MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_uniquedata
+    : public MmtKernel {
+  static_assert(NS >= 4 && !(NS % 4));
+  static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
+
+  // Sparsity indices: same as baseline
+  static constexpr int SPARSITY_EVEN =
+      0x00004444; // Selects positions 0,1 from each group of 4 8-bit elements
+  static constexpr int SPARSITY_ODD =
+      0x0000EEEE; // Selects positions 2,3 from each group of 4 8-bit elements
+
+  virtual Type A_type() const override { return Type::SI8; }
+  virtual Type B_type() const override { return Type::SI8; }
+  virtual Type C_type() const override { return Type::SI32; }
+  virtual int M_tile() const override { return 8; }
+  virtual int N_tile() const override { return NS * 16; }
+  virtual int K_tile() const override { return KS * 128; } // 2x baseline
+
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return m * (KS * 128) + k; };
+  }
+
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int n_block = n / 16;
+      int n_col = n % 16;
+      return n_block * (KS * 2048) + n_col * (KS * 128) + k;
+    };
+  }
+
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return m * (NS * 16) + n; };
+  }
+
+  virtual int num_threads() const override { return 256; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
+    using i8x8 = __attribute__((__vector_size__(8))) int8_t;
+    using i8x16 = __attribute__((__vector_size__(16))) int8_t;
+    using i32x4 = __attribute__((__vector_size__(16))) int32_t;
+    using i16x4 = __attribute__((__vector_size__(8))) int16_t;
+
+    union {
+      i8x8 vec;
+      int32_t i32[2];
+    } a_reg;
+
+    i32x4 acc[NS / 4] = {{0}};
+
+    const int tid = threadIdx.x;
+    const int lane = tid % 64;
+    const int warp = tid / 64;
+
+    // A tile: 8 rows x KS*128 bytes = 8*KS*8 vec16 elements
+    // B tile: NS n-blocks x KS k-banks x 128 vec16 elements
+    constexpr int A_TILE_VEC16 = 8 * KS * 8;
+    constexpr int B_TILE_VEC16 = NS * KS * 128;
+
+    const auto *A_base = static_cast<const i8x16 *>(A_data) +
+                         blockIdx.x * K_outer * A_TILE_VEC16;
+    const auto *B_base = static_cast<const i8x16 *>(B_data) +
+                         blockIdx.y * K_outer * B_TILE_VEC16;
+    const auto *B_global_ptr = B_base + tid;
+
+    __shared__ i8x16 A_smem[A_TILE_VEC16];
+    __shared__ i8x16 B_smem[B_TILE_VEC16];
+    auto *A_smem_bytes = reinterpret_cast<int8_t *>(A_smem);
+
+    const int a_m_pair = (lane % 16) / 2;
+    const int odd_lane = lane % 2;
+    const int a_k_half = lane / 16;
+    // Unique data: even/odd lanes read from different 16-byte regions
+    const int a_lds_base =
+        a_m_pair * (KS * 128) + a_k_half * 32 + odd_lane * 16;
+
+    const int b_cons_n_col = lane % 16;
+    const int b_cons_k_slice = lane / 16;
+
+    const int sparsity_idx = (lane & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      // Load A tile: global -> shared
+      const i8x16 *A_ptr = A_base + k_outer * A_TILE_VEC16;
+      for (int i = tid; i < A_TILE_VEC16; i += 256) {
+        A_smem[i] = A_ptr[i];
+      }
+
+      // Load B tile: global -> shared
+      for (int i = 0; i < B_TILE_VEC16; i += 256) {
+        B_smem[i + tid] = B_global_ptr[i];
+      }
+      B_global_ptr += B_TILE_VEC16;
+      __syncthreads();
+
+      for (int kb = 0; kb < KS; ++kb) {
+        // --- A extraction: standard shufflevector (same as baseline) ---
+        // Even lane reads K0..K15 (unique), odd lane reads K16..K31.
+        // Each lane applies the baseline shuffle to extract 8 of 16 bytes.
+        //
+        // Raw 16 bytes viewed as two i16x4:
+        //   a_lo = {K0K1, K2K3, K4K5, K6K7}
+        //   a_hi = {K8K9, K10K11, K12K13, K14K15}
+        //
+        // Shufflevector extracts even/odd i16 elements:
+        //   lo0 = {K0K1, K4K5}  hi0 = {K2K3, K6K7}
+        //   lo1 = {K8K9, K12K13}  hi1 = {K10K11, K14K15}
+        //
+        // For SMFMAC set 1 (sparsity pos 0,1): use lo0, lo1
+        //   a_reg = {K0,K1,K4,K5, K8,K9,K12,K13}
+        // For SMFMAC set 2 (sparsity pos 0,1): use hi0, hi1
+        //   a_reg = {K2,K3,K6,K7, K10,K11,K14,K15}
+        auto *a_ptr =
+            reinterpret_cast<i16x4 *>(A_smem_bytes + a_lds_base + kb * 128);
+        i16x4 a_lo = a_ptr[0];
+        i16x4 a_hi = a_ptr[1];
+
+        int lo0 =
+            __builtin_bit_cast(int, __builtin_shufflevector(a_lo, a_lo, 0, 2));
+        int hi0 =
+            __builtin_bit_cast(int, __builtin_shufflevector(a_lo, a_lo, 1, 3));
+        int lo1 =
+            __builtin_bit_cast(int, __builtin_shufflevector(a_hi, a_hi, 0, 2));
+        int hi1 =
+            __builtin_bit_cast(int, __builtin_shufflevector(a_hi, a_hi, 1, 3));
+
+        for (int j = 0; j < NS / 4; ++j) {
+          int n_block = j * 4 + warp;
+
+          // --- B: two 128-bit loads (K_lo and K_hi) ---
+          // blo = 16 bytes = B[K_lo_0..K_lo_15] for this lane's N column
+          // bhi = 16 bytes = B[K_hi_0..K_hi_15]
+          int b_byte_offset = n_block * (KS * 2048) +
+                              b_cons_n_col * (KS * 128) + kb * 128 +
+                              b_cons_k_slice * 32;
+          auto *blo_i32 = reinterpret_cast<int32_t *>(
+              reinterpret_cast<int8_t *>(B_smem) + b_byte_offset);
+          auto *bhi_i32 = reinterpret_cast<int32_t *>(
+              reinterpret_cast<int8_t *>(B_smem) + b_byte_offset + 16);
+
+          // --- B mixing at 16-bit granularity ---
+          // Each B VGPR (32 bits = 4 i8) holds one group of 4 K positions.
+          // Sparsity pos 0,1 = bytes 0,1 (lo16); pos 2,3 = bytes 2,3 (hi16).
+          // Even lane A needs B[K_lo] at pos 0,1 -> lo16 from blo.
+          // Odd lane A needs B[K_hi] at pos 2,3 -> hi16 from bhi.
+          //
+          // b_reg_1.v[n] = blo[n].lo16 | (bhi[n].lo16 << 16)
+          //   = {B_lo[4n], B_lo[4n+1], B_hi[4n], B_hi[4n+1]}
+          //
+          // b_reg_2.v[n] = (blo[n] >> 16) | (bhi[n] & 0xFFFF0000)
+          //   = {B_lo[4n+2], B_lo[4n+3], B_hi[4n+2], B_hi[4n+3]}
+          union {
+            i8x16 vec;
+            int32_t i32[4];
+          } b_reg_1, b_reg_2;
+
+          constexpr uint32_t LO16 = 0x0000FFFF;
+          constexpr uint32_t HI16 = 0xFFFF0000;
+
+          b_reg_1.i32[0] = (blo_i32[0] & LO16) | (((uint32_t)bhi_i32[0]) << 16);
+          b_reg_1.i32[1] = (blo_i32[1] & LO16) | (((uint32_t)bhi_i32[1]) << 16);
+          b_reg_1.i32[2] = (blo_i32[2] & LO16) | (((uint32_t)bhi_i32[2]) << 16);
+          b_reg_1.i32[3] = (blo_i32[3] & LO16) | (((uint32_t)bhi_i32[3]) << 16);
+
+          b_reg_2.i32[0] = (((uint32_t)blo_i32[0]) >> 16) | (bhi_i32[0] & HI16);
+          b_reg_2.i32[1] = (((uint32_t)blo_i32[1]) >> 16) | (bhi_i32[1] & HI16);
+          b_reg_2.i32[2] = (((uint32_t)blo_i32[2]) >> 16) | (bhi_i32[2] & HI16);
+          b_reg_2.i32[3] = (((uint32_t)blo_i32[3]) >> 16) | (bhi_i32[3] & HI16);
+
+          // SMFMAC 1: A set 1 (pos 0,1 values) x b_reg_1
+          // Even lane: K0*B0 + K1*B1 + K4*B4 + ... + K13*B13
+          // Odd lane: K16*B16 + K17*B17 + ... + K29*B29
+          a_reg.i32[0] = lo0;
+          a_reg.i32[1] = lo1;
+          acc[j] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
+              a_reg.vec, b_reg_1.vec, acc[j], sparsity_idx, 0, 0);
+
+          // SMFMAC 2: A set 2 (pos 2,3 values) x b_reg_2
+          // Even lane: K2*B2 + K3*B3 + K6*B6 + ... + K15*B15
+          // Odd lane: K18*B18 + K19*B19 + ... + K31*B31
+          a_reg.i32[0] = hi0;
+          a_reg.i32[1] = hi1;
+          acc[j] = __builtin_amdgcn_smfmac_i32_16x16x64_i8(
+              a_reg.vec, b_reg_2.vec, acc[j], sparsity_idx, 0, 0);
+        }
+        __syncthreads();
+      }
+    }
+
+    // Post-processing: same 2-way reduction as baseline
+    for (int j = 0; j < NS / 4; ++j) {
+      auto *d = reinterpret_cast<int32_t *>(&acc[j]);
+      d[0] = d[0] + d[1]; // row0 complete
+      d[1] = d[2] + d[3]; // row1 complete
+    }
+
+    constexpr int N_STRIDE = NS * 16;
+    constexpr int TILE_ELEMS = 8 * N_STRIDE;
+
+    const int m_pair = lane / 16;
+    const int m0 = m_pair * 2;
+    const int m1 = m0 + 1;
+    const int n_col_out = lane % 16;
+
+    int32_t *C_tile = static_cast<int32_t *>(C_data) +
+                      TILE_ELEMS * (N_outer * blockIdx.x + blockIdx.y);
+
+    for (int j = 0; j < NS / 4; ++j) {
+      const int n = (j * 4 + warp) * 16 + n_col_out;
+      auto *d = reinterpret_cast<int32_t *>(&acc[j]);
+      C_tile[m0 * N_STRIDE + n] = d[0];
+      C_tile[m1 * N_STRIDE + n] = d[1];
+    }
+  }
+};
+
+// Unique-lane-data variant of the F16 SMFMAC sparse trick kernel.
+// Instead of even/odd lanes reading the SAME 128-bit A data from LDS,
+// each lane reads UNIQUE data: even lane gets K_lo (K0..K7 as f16),
+// odd lane gets K_hi (K8..K15). This doubles K_tile (KS * 64 vs
+// KS * 32) and issues 2 SMFMAC instructions per k_bank per j.
+//
+// The key innovation is a BFI (bit-field-insert) shuffle that
+// interleaves f16 elements from K_lo and K_hi at the 16-bit level
+// within each 32-bit VGPR. This is applied to both A and B operands.
+//
+// Data flow:
+//   1. Each lane loads 128b of unique A data from LDS
+//   2. ds_bpermute exchanges all 4 A VGPRs with partner lane
+//   3. BFI constructs interleaved A regs from local + partner data
+//   4. Each lane loads two 128b B chunks (blo for K_lo, bhi for K_hi)
+//   5. BFI constructs interleaved b_regs from each B chunk
+//   6. SMFMAC 1 covers all K_lo positions, SMFMAC 2 covers all K_hi
+//
+// BFI shuffle for B (and similarly A):
+//   b_reg[0] = (B_VGPR0 & LO) | (B_VGPR2 & HI)
+//   b_reg[1] = (B_VGPR2 & LO) | (B_VGPR0 & HI)
+//   b_reg[2] = (B_VGPR1 & LO) | (B_VGPR3 & HI)
+//   b_reg[3] = (B_VGPR3 & LO) | (B_VGPR1 & HI)
+//   where LO = 0x0000FFFF, HI = 0xFFFF0000
+//
+// Expected assembly:
+//   s_mov_b32 s0, 0x0000ffff
+//   v_bfi_b32 b_reg0, s0, v0, v2
+//   v_bfi_b32 b_reg1, s0, v2, v0
+//   v_bfi_b32 b_reg2, s0, v1, v3
+//   v_bfi_b32 b_reg3, s0, v3, v1
+//
+// Correctness proof (one k_bank, lane group 0):
+//   Even lane loads A[K_lo]: {K0,K1,K2,K3,K4,K5,K6,K7}
+//   Odd lane loads A[K_hi]: {K8,K9,K10,K11,K12,K13,K14,K15}
+//
+//   SMFMAC 1 (B from blo = K_lo B data):
+//     b_reg = BFI(blo) = {{B0,B5},{B4,B1},{B2,B7},{B6,B3}}
+//     Even A (normal BFI on local): {K0,K5, K2,K7}
+//       -> K0*B0 + K5*B5 + K2*B2 + K7*B7
+//     Odd A (swapped BFI on partner=K_lo): {K4,K1, K6,K3}
+//       -> K4*B4 + K1*B1 + K6*B6 + K3*B3
+//     Combined: K0*B0..K7*B7 (all 8 K_lo positions)
+//
+//   SMFMAC 2 (B from bhi = K_hi B data):
+//     b_reg = BFI(bhi) = {{B8,B13},{B12,B9},{B10,B15},{B14,B11}}
+//     Even A (normal BFI on partner=K_hi): {K8,K13, K10,K15}
+//       -> K8*B8 + K13*B13 + K10*B10 + K15*B15
+//     Odd A (swapped BFI on local): {K12,K9, K14,K11}
+//       -> K12*B12 + K9*B9 + K14*B14 + K11*B11
+//     Combined: K8*B8..K15*B15 (all 8 K_hi positions)
+//
+//   Total: all 16 K positions covered exactly once.
+template <int NS, int KS>
+class MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata
+    : public MmtKernel {
+  static_assert(NS >= 4 && !(NS % 4));
+  static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
+
+  static constexpr int SPARSITY_EVEN = 0x00000044;
+  static constexpr int SPARSITY_ODD = 0x000000EE;
+
+  virtual Type A_type() const override { return Type::FP16; }
+  virtual Type B_type() const override { return Type::FP16; }
+  virtual Type C_type() const override { return Type::FP32; }
+  virtual int M_tile() const override { return 8; }
+  virtual int N_tile() const override { return NS * 16; }
+  virtual int K_tile() const override { return KS * 64; } // 2x baseline
+
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return m * (KS * 64) + k; };
+  }
+
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int n_block = n / 16;
+      int n_col = n % 16;
+      return n_block * (KS * 1024) + n_col * (KS * 64) + k;
+    };
+  }
+
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return m * (NS * 16) + n; };
+  }
+
+  virtual int num_threads() const override { return 256; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+
+  // BFI helper: (mask & src1) | (~mask & src2) = lo16(src1) | hi16(src2)
+  // Produces v_bfi_b32 with a constant mask of 0x0000ffff.
+  __device__ static int32_t bfi16(int32_t src1, int32_t src2) {
+    constexpr uint32_t LO = 0x0000FFFF;
+    return (int32_t)((((uint32_t)src1) & LO) | (((uint32_t)src2) & ~LO));
+  }
+
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
+    using f16x4 =
+        __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
+    using f16x8 =
+        __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
+    using f32x4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+
+    union {
+      f16x4 vec;
+      int32_t i32[2];
+    } a_reg;
+
+    f32x4 acc[NS / 4] = {{0}};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int tid = threadIdx.x;
+    int lane_id = tid % 64;
+    int warp_id = tid / 64;
+
+    // A tile: 8 rows x KS*64 f16 values = 8*KS*8 vec16 elements
+    // (each vec16 = 8 f16 = 16 bytes)
+    constexpr int A_tile_size_in_vec16 = 8 * KS * 8;
+    // B tile: NS n-blocks x KS k-banks x 128 vec16 elements
+    constexpr int B_tile_size_in_vec16 = NS * KS * 128;
+
+    const f16x8 *A_global = static_cast<const f16x8 *>(A_data) +
+                            m_outer * K_outer * A_tile_size_in_vec16;
+    const f16x8 *B_global = static_cast<const f16x8 *>(B_data) +
+                            n_outer * K_outer * B_tile_size_in_vec16;
+    const f16x8 *B_global_ptr = B_global + tid;
+
+    __shared__ f16x8 A_shared[A_tile_size_in_vec16];
+    __shared__ f16x8 B_shared[B_tile_size_in_vec16];
+    auto *A_shared_bytes = reinterpret_cast<int8_t *>(A_shared);
+
+    int a_m_row = (lane_id % 16) / 2;
+    int odd_lane = lane_id % 2;
+    int a_k_range = lane_id / 16;
+    // Unique data: even/odd lanes read from different 16-byte regions
+    int a_lds_base = a_m_row * (KS * 128) + a_k_range * 32 + odd_lane * 16;
+
+    int n_col = lane_id % 16;
+    int k_slice = lane_id / 16;
+
+    int sparsity_idx = (lane_id & 1) ? SPARSITY_ODD : SPARSITY_EVEN;
+
+    // ds_bpermute index: partner lane = lane ^ 1, index = partner * 4
+    int partner_idx = (lane_id ^ 1) * 4;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      // Load A tile: global -> shared
+      const f16x8 *A_ptr = A_global + k_outer * A_tile_size_in_vec16;
+      for (int i = tid; i < A_tile_size_in_vec16; i += 256) {
+        A_shared[i] = A_ptr[i];
+      }
+
+      // Load B tile: global -> shared
+      for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
+        B_shared[i + tid] = B_global_ptr[i];
+      }
+      B_global_ptr += B_tile_size_in_vec16;
+      __syncthreads();
+
+      for (int k_bank = 0; k_bank < KS; ++k_bank) {
+        // --- A: load 128b unique data (16 bytes = 8 f16 = 4 int32) ---
+        // Even lane: a_local = {K0,K1, K2,K3, K4,K5, K6,K7}
+        // Odd lane:  a_local = {K8,K9, K10,K11, K12,K13, K14,K15}
+        auto *a_local_ptr = reinterpret_cast<int32_t *>(
+            A_shared_bytes + a_lds_base + k_bank * 128);
+        int32_t a_local[4];
+        a_local[0] = a_local_ptr[0];
+        a_local[1] = a_local_ptr[1];
+        a_local[2] = a_local_ptr[2];
+        a_local[3] = a_local_ptr[3];
+
+        // --- ds_bpermute: exchange A VGPRs with partner lane ---
+        // Even lane gets odd lane's K_hi data, odd lane gets even's K_lo.
+        int32_t a_partner[4];
+        a_partner[0] = __builtin_amdgcn_ds_bpermute(partner_idx, a_local[0]);
+        a_partner[1] = __builtin_amdgcn_ds_bpermute(partner_idx, a_local[1]);
+        a_partner[2] = __builtin_amdgcn_ds_bpermute(partner_idx, a_local[2]);
+        a_partner[3] = __builtin_amdgcn_ds_bpermute(partner_idx, a_local[3]);
+
+        // --- A BFI construction ---
+        // For SMFMAC 1 (K_lo range):
+        //   Even lane uses "normal" BFI on local data:
+        //     a_reg = {lo16(local[0])|hi16(local[2]),
+        //              lo16(local[1])|hi16(local[3])}
+        //           = {K0,K5, K2,K7}
+        //   Odd lane uses "swapped" BFI on partner (=K_lo) data:
+        //     a_reg = {lo16(partner[2])|hi16(partner[0]),
+        //              lo16(partner[3])|hi16(partner[1])}
+        //           = {K4,K1, K6,K3}
+        //
+        // For SMFMAC 2 (K_hi range):
+        //   Even lane uses "normal" BFI on partner (=K_hi) data:
+        //     a_reg = {K8,K13, K10,K15}
+        //   Odd lane uses "swapped" BFI on local data:
+        //     a_reg = {K12,K9, K14,K11}
+        //
+        // Unifying: SMFMAC 1 src = even?local:partner,
+        //           SMFMAC 2 src = even?partner:local
+        // Even lane: normal BFI (src[0],src[2])
+        // Odd lane:  swapped BFI (src[2],src[0])
+        int32_t *a_src1 = odd_lane ? a_partner : a_local;
+        int32_t *a_src2 = odd_lane ? a_local : a_partner;
+
+        // BFI A for SMFMAC 1 (covers K_lo range)
+        int a1_v0 = odd_lane ? bfi16(a_src1[2], a_src1[0])
+                             : bfi16(a_src1[0], a_src1[2]);
+        int a1_v1 = odd_lane ? bfi16(a_src1[3], a_src1[1])
+                             : bfi16(a_src1[1], a_src1[3]);
+
+        // BFI A for SMFMAC 2 (covers K_hi range)
+        int a2_v0 = odd_lane ? bfi16(a_src2[2], a_src2[0])
+                             : bfi16(a_src2[0], a_src2[2]);
+        int a2_v1 = odd_lane ? bfi16(a_src2[3], a_src2[1])
+                             : bfi16(a_src2[1], a_src2[3]);
+
+        for (int j = 0; j < NS / 4; ++j) {
+          int n_block = j * 4 + warp_id;
+
+          // --- B: two 128-bit loads (K_lo and K_hi B data) ---
+          int b_byte_offset = n_block * (KS * 2048) + n_col * (KS * 128) +
+                              k_bank * 128 + k_slice * 32;
+          auto *blo_i32 = reinterpret_cast<int32_t *>(
+              reinterpret_cast<int8_t *>(B_shared) + b_byte_offset);
+          auto *bhi_i32 = reinterpret_cast<int32_t *>(
+              reinterpret_cast<int8_t *>(B_shared) + b_byte_offset + 16);
+
+          // --- B BFI shuffle ---
+          // Each 128-bit B load (4 VGPRs: v0,v1,v2,v3) is shuffled via:
+          //   b_reg[0] = bfi16(v0, v2) = lo16(v0) | hi16(v2)
+          //   b_reg[1] = bfi16(v2, v0) = lo16(v2) | hi16(v0)
+          //   b_reg[2] = bfi16(v1, v3) = lo16(v1) | hi16(v3)
+          //   b_reg[3] = bfi16(v3, v1) = lo16(v3) | hi16(v1)
+          //
+          // For blo = {B0,B1, B2,B3, B4,B5, B6,B7}:
+          //   b_reg_1 = {{B0,B5}, {B4,B1}, {B2,B7}, {B6,B3}}
+          //   Group 0 pos 0,1 = B0,B5; pos 2,3 = B4,B1
+          //   Group 1 pos 0,1 = B2,B7; pos 2,3 = B6,B3
+          //
+          // Even (pos 0,1): K0*B0 + K5*B5 + K2*B2 + K7*B7
+          // Odd (pos 2,3):  K4*B4 + K1*B1 + K6*B6 + K3*B3
+          // Combined: all K_lo products.
+          union {
+            f16x8 vec;
+            int32_t i32[4];
+          } b_reg_1, b_reg_2;
+
+          b_reg_1.i32[0] = bfi16(blo_i32[0], blo_i32[2]);
+          b_reg_1.i32[1] = bfi16(blo_i32[2], blo_i32[0]);
+          b_reg_1.i32[2] = bfi16(blo_i32[1], blo_i32[3]);
+          b_reg_1.i32[3] = bfi16(blo_i32[3], blo_i32[1]);
+
+          b_reg_2.i32[0] = bfi16(bhi_i32[0], bhi_i32[2]);
+          b_reg_2.i32[1] = bfi16(bhi_i32[2], bhi_i32[0]);
+          b_reg_2.i32[2] = bfi16(bhi_i32[1], bhi_i32[3]);
+          b_reg_2.i32[3] = bfi16(bhi_i32[3], bhi_i32[1]);
+
+          // SMFMAC 1: K_lo range -- A set 1 x b_reg_1
+          a_reg.i32[0] = a1_v0;
+          a_reg.i32[1] = a1_v1;
+          acc[j] = __builtin_amdgcn_smfmac_f32_16x16x32_f16(
+              a_reg.vec, b_reg_1.vec, acc[j], sparsity_idx, 0, 0);
+
+          // SMFMAC 2: K_hi range -- A set 2 x b_reg_2
+          a_reg.i32[0] = a2_v0;
+          a_reg.i32[1] = a2_v1;
+          acc[j] = __builtin_amdgcn_smfmac_f32_16x16x32_f16(
+              a_reg.vec, b_reg_2.vec, acc[j], sparsity_idx, 0, 0);
+        }
+        __syncthreads();
+      }
+    }
+
+    // Post-processing: same 2-way reduction as baseline
     for (int j = 0; j < NS / 4; ++j) {
       float *regD = reinterpret_cast<float *>(&acc[j]);
       regD[0] = regD[0] + regD[1];
@@ -4394,6 +5122,9 @@ int main() {
   test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 2>());
   test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
   test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle<4, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle<4, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle<8, 2>());
   test(MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 2>());
   test(MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 4>());
   test(MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 8>());
@@ -4412,6 +5143,20 @@ int main() {
   test(MmtKernel_256t_NSxKS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<8, 2>());
   test(MmtKernel_256t_NSxKS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<8, 4>());
   test(MmtKernel_256t_NSxKS_amdgcn_mfma_f32_16x16x16f16_zeropad_shared<16, 2>());
+
+  std::printf("\n\n\nSMFMAC unique-lane-data experiments:\n\n");
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_uniquedata<4, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_uniquedata<4, 4>());
+  // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_uniquedata<4, 8>()); // LDS > 64KB
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_uniquedata<8, 2>());
+  // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_uniquedata<8, 4>()); // LDS > 64KB
+  // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_uniquedata<16, 2>()); // LDS > 64KB
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata<4, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata<4, 4>());
+  // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata<4, 8>()); // LDS > 64KB
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata<8, 2>());
+  // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata<8, 4>()); // LDS > 64KB
+  // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata<16, 2>()); // LDS > 64KB
 
   std::printf("\n\n\nStream-K experiments:\n\n");
   test(
