@@ -4344,6 +4344,7 @@ class MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_uniquedata
     using i8x8 = __attribute__((__vector_size__(8))) int8_t;
     using i8x16 = __attribute__((__vector_size__(16))) int8_t;
     using i32x4 = __attribute__((__vector_size__(16))) int32_t;
+    using i16x2 = __attribute__((__vector_size__(4))) int16_t;
     using i16x4 = __attribute__((__vector_size__(8))) int16_t;
 
     union {
@@ -4438,39 +4439,38 @@ class MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_uniquedata
           int b_byte_offset = n_block * (KS * 2048) +
                               b_cons_n_col * (KS * 128) + kb * 128 +
                               b_cons_k_slice * 32;
-          auto *blo_i32 = reinterpret_cast<int32_t *>(
+          auto *blo = reinterpret_cast<const i16x2 *>(
               reinterpret_cast<int8_t *>(B_smem) + b_byte_offset);
-          auto *bhi_i32 = reinterpret_cast<int32_t *>(
+          auto *bhi = reinterpret_cast<const i16x2 *>(
               reinterpret_cast<int8_t *>(B_smem) + b_byte_offset + 16);
 
-          // --- B mixing at 16-bit granularity ---
+          // --- B mixing at 16-bit granularity via shufflevector ---
           // Each B VGPR (32 bits = 4 i8) holds one group of 4 K positions.
           // Sparsity pos 0,1 = bytes 0,1 (lo16); pos 2,3 = bytes 2,3 (hi16).
           // Even lane A needs B[K_lo] at pos 0,1 -> lo16 from blo.
           // Odd lane A needs B[K_hi] at pos 2,3 -> hi16 from bhi.
           //
-          // b_reg_1.v[n] = blo[n].lo16 | (bhi[n].lo16 << 16)
+          // b_reg_1.v[n] = shuffle(blo[n], bhi[n], {0,2})
           //   = {B_lo[4n], B_lo[4n+1], B_hi[4n], B_hi[4n+1]}
           //
-          // b_reg_2.v[n] = (blo[n] >> 16) | (bhi[n] & 0xFFFF0000)
+          // b_reg_2.v[n] = shuffle(blo[n], bhi[n], {1,3})
           //   = {B_lo[4n+2], B_lo[4n+3], B_hi[4n+2], B_hi[4n+3]}
           union {
             i8x16 vec;
             int32_t i32[4];
           } b_reg_1, b_reg_2;
 
-          constexpr uint32_t LO16 = 0x0000FFFF;
-          constexpr uint32_t HI16 = 0xFFFF0000;
+          // b_reg_1: {blo[n].lo16, bhi[n].lo16} for n=0..3
+          b_reg_1.i32[0] = __builtin_bit_cast(int, __builtin_shufflevector(blo[0], bhi[0], 0, 2));
+          b_reg_1.i32[1] = __builtin_bit_cast(int, __builtin_shufflevector(blo[1], bhi[1], 0, 2));
+          b_reg_1.i32[2] = __builtin_bit_cast(int, __builtin_shufflevector(blo[2], bhi[2], 0, 2));
+          b_reg_1.i32[3] = __builtin_bit_cast(int, __builtin_shufflevector(blo[3], bhi[3], 0, 2));
 
-          b_reg_1.i32[0] = (blo_i32[0] & LO16) | (((uint32_t)bhi_i32[0]) << 16);
-          b_reg_1.i32[1] = (blo_i32[1] & LO16) | (((uint32_t)bhi_i32[1]) << 16);
-          b_reg_1.i32[2] = (blo_i32[2] & LO16) | (((uint32_t)bhi_i32[2]) << 16);
-          b_reg_1.i32[3] = (blo_i32[3] & LO16) | (((uint32_t)bhi_i32[3]) << 16);
-
-          b_reg_2.i32[0] = (((uint32_t)blo_i32[0]) >> 16) | (bhi_i32[0] & HI16);
-          b_reg_2.i32[1] = (((uint32_t)blo_i32[1]) >> 16) | (bhi_i32[1] & HI16);
-          b_reg_2.i32[2] = (((uint32_t)blo_i32[2]) >> 16) | (bhi_i32[2] & HI16);
-          b_reg_2.i32[3] = (((uint32_t)blo_i32[3]) >> 16) | (bhi_i32[3] & HI16);
+          // b_reg_2: {blo[n].hi16, bhi[n].hi16} for n=0..3
+          b_reg_2.i32[0] = __builtin_bit_cast(int, __builtin_shufflevector(blo[0], bhi[0], 1, 3));
+          b_reg_2.i32[1] = __builtin_bit_cast(int, __builtin_shufflevector(blo[1], bhi[1], 1, 3));
+          b_reg_2.i32[2] = __builtin_bit_cast(int, __builtin_shufflevector(blo[2], bhi[2], 1, 3));
+          b_reg_2.i32[3] = __builtin_bit_cast(int, __builtin_shufflevector(blo[3], bhi[3], 1, 3));
 
           // SMFMAC 1: A set 1 (pos 0,1 values) x b_reg_1
           // Even lane: K0*B0 + K1*B1 + K4*B4 + ... + K13*B13
@@ -4583,6 +4583,7 @@ class MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_uniquedata_v2
       int /*M_outer*/, int N_outer, int K_outer) {
     using i8x8 = __attribute__((__vector_size__(8))) int8_t;
     using i8x16 = __attribute__((__vector_size__(16))) int8_t;
+    using i16x2 = __attribute__((__vector_size__(4))) int16_t;
     using i32x4 = __attribute__((__vector_size__(16))) int32_t;
 
     union {
@@ -4660,55 +4661,42 @@ class MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_uniquedata_v2
           int b_byte_offset = n_block * (KS * 2048) +
                               b_cons_n_col * (KS * 128) + kb * 128 +
                               b_cons_k_slice * 32;
-          auto *blo_i32 = reinterpret_cast<int32_t *>(
+          auto *blo = reinterpret_cast<const i16x2 *>(
               reinterpret_cast<int8_t *>(B_smem) + b_byte_offset);
-          auto *bhi_i32 = reinterpret_cast<int32_t *>(
+          auto *bhi = reinterpret_cast<const i16x2 *>(
               reinterpret_cast<int8_t *>(B_smem) + b_byte_offset + 16);
 
-          // --- B mixing: new layout for direct A loading ---
-          // With direct A load, A.v0 = {K0,K1,K2,K3}, so:
-          //   A.v0.[15:0]  = {K0,K1} pairs with B.v0 (pos 0,1 -> lo16)
-          //   A.v0.[31:16] = {K2,K3} pairs with B.v1 (pos 0,1 -> lo16)
-          //   A.v1.[15:0]  = {K4,K5} pairs with B.v2 (pos 0,1 -> lo16)
-          //   A.v1.[31:16] = {K6,K7} pairs with B.v3 (pos 0,1 -> lo16)
-          //
-          // Each input blo VGPR is SPLIT: lo16 -> one output, hi16 -> next.
-          // bhi provides the hi16 of each output VGPR (for odd lane pos 2,3).
+          // --- B mixing: split-VGPR layout for direct A loading ---
+          // Each input blo VGPR is SPLIT: lo16 and hi16 go to consecutive
+          // output VGPRs, mixed with corresponding bhi halves.
           //
           // b_reg_1 (pairs with a_reg_1 = first 8 A bytes):
-          //   v0 = {B0,B1, B16,B17}   v1 = {B2,B3, B18,B19}
-          //   v2 = {B4,B5, B20,B21}   v3 = {B6,B7, B22,B23}
+          //   v0 = shuffle(blo[0], bhi[0], {0,2}) = {B0,B1, B16,B17}
+          //   v1 = shuffle(blo[0], bhi[0], {1,3}) = {B2,B3, B18,B19}
+          //   v2 = shuffle(blo[1], bhi[1], {0,2}) = {B4,B5, B20,B21}
+          //   v3 = shuffle(blo[1], bhi[1], {1,3}) = {B6,B7, B22,B23}
           //
           // b_reg_2 (pairs with a_reg_2 = next 8 A bytes):
-          //   v0 = {B8,B9, B24,B25}   v1 = {B10,B11, B26,B27}
-          //   v2 = {B12,B13, B28,B29} v3 = {B14,B15, B30,B31}
+          //   v0 = shuffle(blo[2], bhi[2], {0,2}) = {B8,B9, B24,B25}
+          //   v1 = shuffle(blo[2], bhi[2], {1,3}) = {B10,B11, B26,B27}
+          //   v2 = shuffle(blo[3], bhi[3], {0,2}) = {B12,B13, B28,B29}
+          //   v3 = shuffle(blo[3], bhi[3], {1,3}) = {B14,B15, B30,B31}
           union {
             i8x16 vec;
             int32_t i32[4];
           } b_reg_1, b_reg_2;
 
-          constexpr uint32_t LO16 = 0x0000FFFF;
-          constexpr uint32_t HI16 = 0xFFFF0000;
-
           // b_reg_1: from blo[0..1] and bhi[0..1]
-          b_reg_1.i32[0] =
-              (blo_i32[0] & LO16) | (((uint32_t)bhi_i32[0]) << 16);
-          b_reg_1.i32[1] =
-              (((uint32_t)blo_i32[0]) >> 16) | (bhi_i32[0] & HI16);
-          b_reg_1.i32[2] =
-              (blo_i32[1] & LO16) | (((uint32_t)bhi_i32[1]) << 16);
-          b_reg_1.i32[3] =
-              (((uint32_t)blo_i32[1]) >> 16) | (bhi_i32[1] & HI16);
+          b_reg_1.i32[0] = __builtin_bit_cast(int, __builtin_shufflevector(blo[0], bhi[0], 0, 2));
+          b_reg_1.i32[1] = __builtin_bit_cast(int, __builtin_shufflevector(blo[0], bhi[0], 1, 3));
+          b_reg_1.i32[2] = __builtin_bit_cast(int, __builtin_shufflevector(blo[1], bhi[1], 0, 2));
+          b_reg_1.i32[3] = __builtin_bit_cast(int, __builtin_shufflevector(blo[1], bhi[1], 1, 3));
 
           // b_reg_2: from blo[2..3] and bhi[2..3]
-          b_reg_2.i32[0] =
-              (blo_i32[2] & LO16) | (((uint32_t)bhi_i32[2]) << 16);
-          b_reg_2.i32[1] =
-              (((uint32_t)blo_i32[2]) >> 16) | (bhi_i32[2] & HI16);
-          b_reg_2.i32[2] =
-              (blo_i32[3] & LO16) | (((uint32_t)bhi_i32[3]) << 16);
-          b_reg_2.i32[3] =
-              (((uint32_t)blo_i32[3]) >> 16) | (bhi_i32[3] & HI16);
+          b_reg_2.i32[0] = __builtin_bit_cast(int, __builtin_shufflevector(blo[2], bhi[2], 0, 2));
+          b_reg_2.i32[1] = __builtin_bit_cast(int, __builtin_shufflevector(blo[2], bhi[2], 1, 3));
+          b_reg_2.i32[2] = __builtin_bit_cast(int, __builtin_shufflevector(blo[3], bhi[3], 0, 2));
+          b_reg_2.i32[3] = __builtin_bit_cast(int, __builtin_shufflevector(blo[3], bhi[3], 1, 3));
 
           // SMFMAC 1: first 8 A bytes x b_reg_1
           // Even lane: K0*B0 + K1*B1 + K2*B2 + K3*B3 + K4*B4 + K5*B5 +
