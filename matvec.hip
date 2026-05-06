@@ -41,6 +41,7 @@ static constexpr int kSubgroupSize64 = 64;
 struct DeviceCapabilities {
   const char *name = "unknown";
   int subgroup_size = 0;
+  bool has_f16_f32_dot = false;
   bool has_f16_output_dot = false;
   bool has_fp8_dot = false;
 };
@@ -62,13 +63,13 @@ DeviceCapabilities detectDeviceCapabilities() {
 
   DeviceCapabilities result;
   if (architectureNameStartsWith(properties.gcnArchName, "gfx1100")) {
-    result = {"gfx1100", kSubgroupSize32, true, false};
+    result = {"gfx1100", kSubgroupSize32, true, true, false};
   } else if (architectureNameStartsWith(properties.gcnArchName, "gfx1201")) {
-    result = {"gfx1201", kSubgroupSize32, true, true};
+    result = {"gfx1201", kSubgroupSize32, true, true, true};
   } else if (architectureNameStartsWith(properties.gcnArchName, "gfx942")) {
-    result = {"gfx942", kSubgroupSize64, false, false};
+    result = {"gfx942", kSubgroupSize64, true, false, false};
   } else if (architectureNameStartsWith(properties.gcnArchName, "gfx950")) {
-    result = {"gfx950", kSubgroupSize64, false, false};
+    result = {"gfx950", kSubgroupSize64, true, false, false};
   } else {
     fprintf(stderr,
             "Warning: active device reports unrecognized target '%s'; "
@@ -443,6 +444,177 @@ template <Type A_type, Type B_type, Type C_type> struct AmdDotTraits;
 
 using f16x2 = _Float16 __attribute__((ext_vector_type(2)));
 
+__device__ static _Float16 f16FromBits(uint16_t bits) {
+  union {
+    uint16_t bits;
+    _Float16 value;
+  } converter = {bits};
+  return converter.value;
+}
+
+__device__ static uint16_t f16ToBits(_Float16 value) {
+  union {
+    _Float16 value;
+    uint16_t bits;
+  } converter = {value};
+  return converter.bits;
+}
+
+__device__ static float f32FromBits(uint32_t bits) {
+  union {
+    uint32_t bits;
+    float value;
+  } converter = {bits};
+  return converter.value;
+}
+
+__device__ static uint32_t f32ToBits(float value) {
+  union {
+    float value;
+    uint32_t bits;
+  } converter = {value};
+  return converter.bits;
+}
+
+enum DotSignedZeroCheckIndex {
+  kF16F16ToF32DotSignedZero = 0,
+  kF16F16ToF16DotSignedZero = 1,
+  kFp8Fp8ToF32DotSignedZero = 2,
+  kNumDotSignedZeroChecks = 3,
+};
+
+enum DotSignedZeroInputIndex {
+  kInputF16A0 = 0,
+  kInputF16A1 = 1,
+  kInputF16B0 = 2,
+  kInputF16B1 = 3,
+  kInputF16C = 4,
+  kInputF32C = 5,
+  kInputFp8A0 = 6,
+  kInputFp8A1 = 7,
+  kInputFp8A2 = 8,
+  kInputFp8A3 = 9,
+  kInputFp8B0 = 10,
+  kInputFp8B1 = 11,
+  kInputFp8B2 = 12,
+  kInputFp8B3 = 13,
+  kNumDotSignedZeroInputs = 14,
+};
+
+__global__ static void checkDotSignedZeroKernel(const uint32_t *input_bits,
+                                                uint32_t *output_bits) {
+  for (int i = 0; i < kNumDotSignedZeroChecks; ++i) {
+    output_bits[i] = 0xffffffffu;
+  }
+
+  const f16x2 f16_a = {
+      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16A0])),
+      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16A1]))};
+  const f16x2 f16_b = {
+      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16B0])),
+      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16B1]))};
+  if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2_f16_f16)) {
+    const _Float16 c =
+        f16FromBits(static_cast<uint16_t>(input_bits[kInputF16C]));
+    output_bits[kF16F16ToF16DotSignedZero] =
+        f16ToBits(__builtin_amdgcn_fdot2_f16_f16(f16_a, f16_b, c));
+  }
+
+  if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2)) {
+    const float c = f32FromBits(input_bits[kInputF32C]);
+    output_bits[kF16F16ToF32DotSignedZero] =
+        f32ToBits(__builtin_amdgcn_fdot2(f16_a, f16_b, c, false));
+  }
+
+#if defined(__gfx1201__)
+  auto pack4_u8 = [](const uint32_t *values) {
+    return (values[0] & 0xffu) | ((values[1] & 0xffu) << 8) |
+           ((values[2] & 0xffu) << 16) | ((values[3] & 0xffu) << 24);
+  };
+  const float c = f32FromBits(input_bits[kInputF32C]);
+  output_bits[kFp8Fp8ToF32DotSignedZero] = f32ToBits(
+      __builtin_amdgcn_dot4_f32_fp8_fp8(pack4_u8(&input_bits[kInputFp8A0]),
+                                        pack4_u8(&input_bits[kInputFp8B0]),
+                                        c));
+#endif
+}
+
+struct DotSignedZeroCheck {
+  const char *name;
+  DotSignedZeroCheckIndex index;
+  uint32_t expected_bits;
+  bool supported;
+};
+
+bool shouldRunDotSignedZeroCheck(const DotSignedZeroCheck &check) {
+  const char *filter = getenv("FILTER");
+  if (!check.supported) {
+    return false;
+  }
+  if (filter && !strstr(check.name, filter)) {
+    return false;
+  }
+  return true;
+}
+
+void checkDotSignedZero(const DeviceCapabilities &device) {
+  const DotSignedZeroCheck checks[] = {
+      {"AmdDotReduceKernel.fdot2_f32_f16_signed_zero",
+       kF16F16ToF32DotSignedZero, 0x80000000u, device.has_f16_f32_dot},
+      {"AmdDotReduceKernel.fdot2_f16_f16_signed_zero",
+       kF16F16ToF16DotSignedZero, 0x8000u, device.has_f16_output_dot},
+      {"AmdDotReduceKernel.dot4_f32_fp8_fp8_signed_zero",
+       kFp8Fp8ToF32DotSignedZero, 0x80000000u, device.has_fp8_dot},
+  };
+
+  bool should_run = false;
+  for (const DotSignedZeroCheck &check : checks) {
+    should_run |= shouldRunDotSignedZeroCheck(check);
+  }
+  if (!should_run) {
+    return;
+  }
+
+  // f16 LHS = {-0, -0}; f16 RHS = {1, 1}; f16 C = -0; f32 C = -0;
+  // fp8 LHS = {-0, -0, -0, -0}; fp8 RHS = {1, 1, 1, 1}.
+  const uint32_t input_host[] = {0x8000, 0x8000, 0x3c00, 0x3c00, 0x8000,
+                                 0x80000000u, 0x80, 0x80, 0x80, 0x80,
+                                 0x38, 0x38, 0x38, 0x38};
+  static_assert(sizeof(input_host) / sizeof(input_host[0]) ==
+                kNumDotSignedZeroInputs);
+  uint32_t output_host[kNumDotSignedZeroChecks] = {};
+  uint32_t *input_device = nullptr;
+  uint32_t *output_device = nullptr;
+  HIP_CHECK(hipMalloc(&input_device, sizeof(input_host)));
+  HIP_CHECK(hipMalloc(&output_device, sizeof(output_host)));
+  HIP_CHECK(hipMemcpy(input_device, input_host, sizeof(input_host),
+                      hipMemcpyHostToDevice));
+  checkDotSignedZeroKernel<<<1, 1>>>(input_device, output_device);
+  HIP_CHECK(hipGetLastError());
+  HIP_CHECK(hipMemcpy(output_host, output_device, sizeof(output_host),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipFree(input_device));
+  HIP_CHECK(hipFree(output_device));
+
+  bool failed = false;
+  for (const DotSignedZeroCheck &check : checks) {
+    if (!shouldRunDotSignedZeroCheck(check)) {
+      continue;
+    }
+    uint32_t actual_bits = output_host[check.index];
+    if (actual_bits != check.expected_bits) {
+      fprintf(stderr,
+              "%s: expected signed-zero result bits 0x%08x, got 0x%08x\n",
+              check.name, check.expected_bits, actual_bits);
+      failed = true;
+    }
+  }
+  if (failed) {
+    fprintf(stderr,
+            "Dot signed-zero check failed; continuing to run benchmarks.\n");
+  }
+}
+
 template <> struct AmdDotTraits<Type::FP16, Type::FP16, Type::FP32> {
   using TA = CType<Type::FP16>;
   using TB = CType<Type::FP16>;
@@ -640,15 +812,22 @@ struct SubgroupReduceKernel : MatvecKernel {
       TA b[T_N_tile][K_VEC] = {{0}};
       for (int k = 0; k < K_VEC; ++k) {
         int global_k = k_outer * T_K_tile + tile_k + k;
-        b[0][k] = static_cast<const TB *>(B_data)[global_n * K + global_k];
+        if (global_k < K) {
+          b[0][k] = static_cast<const TB *>(B_data)[global_n * K + global_k];
+        }
       }
 
       TA a[T_M_tile][K_VEC] = {{0}};
       for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
-        for (int k = 0; k < K_VEC; ++k) {
-          int global_k = k_outer * T_K_tile + tile_k + k;
-          a[m_tile][k] = static_cast<const TA *>(
-              A_data)[(global_m + m_tile) * K + global_k];
+        int row = global_m + m_tile;
+        if (row < M) {
+          for (int k = 0; k < K_VEC; ++k) {
+            int global_k = k_outer * T_K_tile + tile_k + k;
+            if (global_k < K) {
+              a[m_tile][k] =
+                  static_cast<const TA *>(A_data)[row * K + global_k];
+            }
+          }
         }
       }
 
@@ -677,8 +856,10 @@ struct SubgroupReduceKernel : MatvecKernel {
     }
     if (lane == 0) {
       for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
-        static_cast<TC *>(C_data)[(global_m + m_tile) * N + global_n] =
-            res[m_tile];
+        int row = global_m + m_tile;
+        if (row < M) {
+          static_cast<TC *>(C_data)[row * N + global_n] = res[m_tile];
+        }
       }
     }
   }
@@ -745,18 +926,25 @@ struct WorkgroupReduceKernel : MatvecKernel {
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       for (int k = 0; k < K_VEC; ++k) {
         int global_k = tile_k + k_outer * K_per_outer + k;
-        b[0][k_outer][k] =
-            static_cast<const TB *>(B_data)[global_n * K + global_k];
+        if (global_k < K) {
+          b[0][k_outer][k] =
+              static_cast<const TB *>(B_data)[global_n * K + global_k];
+        }
       }
     }
 
     TA a[T_M_tile][K_outer][K_VEC] = {{{0}}};
     for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
-      for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
-        for (int k = 0; k < K_VEC; ++k) {
-          int global_k = tile_k + k_outer * K_per_outer + k;
-          a[m_tile][k_outer][k] = static_cast<const TA *>(
-              A_data)[(global_m + m_tile) * K + global_k];
+      int row = global_m + m_tile;
+      if (row < M) {
+        for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+          for (int k = 0; k < K_VEC; ++k) {
+            int global_k = tile_k + k_outer * K_per_outer + k;
+            if (global_k < K) {
+              a[m_tile][k_outer][k] =
+                  static_cast<const TA *>(A_data)[row * K + global_k];
+            }
+          }
         }
       }
     }
@@ -809,7 +997,10 @@ struct WorkgroupReduceKernel : MatvecKernel {
 
       TC final = subgroup_reduce<T_SubgroupSize>(thread_res);
       if (lane == 0) {
-        static_cast<TC *>(C_data)[(global_m + m_tile) * N + global_n] = final;
+        int row = global_m + m_tile;
+        if (row < M) {
+          static_cast<TC *>(C_data)[row * N + global_n] = final;
+        }
       }
     }
   }
@@ -886,6 +1077,10 @@ int main(int argc, char **argv) {
   }
   DeviceCapabilities device = detectDeviceCapabilities();
   std::printf("Detected target: %s\n", device.name);
+
+  if (!getenv("SKIP_CHECK")) {
+    checkDotSignedZero(device);
+  }
 
   test(NaiveMatmulKernel{});
 
