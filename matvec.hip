@@ -68,6 +68,9 @@ constexpr uint32_t kGfx942And950Targets =
     target_mask(TargetArchitecture::Gfx942) |
     target_mask(TargetArchitecture::Gfx950);
 
+constexpr uint32_t kGfx1201Target =
+    target_mask(TargetArchitecture::Gfx1201);
+
 constexpr uint32_t preferredTargetMaskForSubgroupSize(int subgroup_size) {
   if (subgroup_size == kSubgroupSize32) {
     return kGfx11And12Targets;
@@ -133,16 +136,9 @@ TargetArchitecture detectTargetArchitecture() {
   }
   fprintf(stderr,
           "Warning: active device reports unrecognized target '%s'; "
-          "target-gated dot kernels will be skipped unless --target is used.\n",
+          "target-gated dot kernels will be skipped.\n",
           properties.gcnArchName);
   return TargetArchitecture::Unknown;
-}
-
-void printUsageAndExit(const char *argv0) {
-  fprintf(stderr,
-          "usage: %s [--target={gfx1100,gfx1201,gfx942,gfx950}]\n",
-          argv0);
-  std::exit(EXIT_FAILURE);
 }
 
 void print(const ProblemProperties &problem, FILE *file = stderr) {
@@ -552,8 +548,7 @@ template <> struct AmdDotTraits<Type::FP8, Type::FP8, Type::FP32> {
   using TB = CType<Type::FP8>;
   using TC = CType<Type::FP32>;
   static constexpr int kElementsPerDot = 4;
-  static constexpr uint32_t kSupportedTargetMask =
-      target_mask(TargetArchitecture::Gfx1201);
+  static constexpr uint32_t kSupportedTargetMask = kGfx1201Target;
 
   __device__ static uint32_t pack4(const uint8_t *values) {
     return static_cast<uint32_t>(values[0]) |
@@ -563,11 +558,16 @@ template <> struct AmdDotTraits<Type::FP8, Type::FP8, Type::FP32> {
   }
 
   __device__ static TC dot(const TA *a, const TB *b, TC c) {
-    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_dot4_f32_fp8_fp8)) {
-      return __builtin_amdgcn_dot4_f32_fp8_fp8(pack4(a), pack4(b), c);
-    }
+#if defined(__gfx1201__)
+    return __builtin_amdgcn_dot4_f32_fp8_fp8(pack4(a), pack4(b), c);
+#else
+    // Host-side target gating skips this kernel outside gfx1201. Keep this
+    // fallback so other offload-arch builds can still instantiate the template.
+    (void)a;
+    (void)b;
     __builtin_trap();
     return c;
+#endif
   }
 };
 
@@ -931,41 +931,12 @@ void test(const MatvecKernel &kernel, TargetArchitecture target) {
 }
 
 int main(int argc, char **argv) {
-  TargetArchitecture target = TargetArchitecture::Unknown;
-  bool target_was_provided = false;
-  constexpr const char *target_prefix = "--target=";
-  for (int i = 1; i < argc; ++i) {
-    if (std::strncmp(argv[i], target_prefix, std::strlen(target_prefix)) == 0) {
-      if (!parseTargetArchitecture(argv[i] + std::strlen(target_prefix),
-                                   target)) {
-        printUsageAndExit(argv[0]);
-      }
-      target_was_provided = true;
-      continue;
-    }
-    if (std::strcmp(argv[i], "--target") == 0) {
-      if (i + 1 >= argc || !parseTargetArchitecture(argv[++i], target)) {
-        printUsageAndExit(argv[0]);
-      }
-      target_was_provided = true;
-      continue;
-    }
-    printUsageAndExit(argv[0]);
+  if (argc != 1) {
+    fprintf(stderr, "usage: %s\n", argv[0]);
+    return EXIT_FAILURE;
   }
-  TargetArchitecture detected_target = detectTargetArchitecture();
-  if (target_was_provided) {
-    if (detected_target != TargetArchitecture::Unknown &&
-        detected_target != target) {
-      fprintf(stderr,
-              "error: --target=%s does not match active device target %s\n",
-              str(target), str(detected_target));
-      return EXIT_FAILURE;
-    }
-  } else {
-    target = detected_target;
-  }
-  std::printf("Selected target: %s%s\n", str(target),
-              target_was_provided ? "" : " (detected)");
+  TargetArchitecture target = detectTargetArchitecture();
+  std::printf("Detected target: %s\n", str(target));
 
   test(NaiveMatmulKernel{}, target);
   test(SubgroupReduceKernel<1, kSubgroupSize32, kSubgroupSize32>{}, target);

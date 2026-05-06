@@ -116,9 +116,8 @@ void fillRandomBuffer(int size, std::minstd_rand &r, void *out_buffer) {
     // exactly representable, float rounding is exact and we don't need
     // fuzzy compares.
     if constexpr (type == Type::FP8) {
-      // OCP E4M3 encodings for {-2, -1, 0, 1, 2}. gfx942 uses FNUZ FP8
-      // encodings instead, so this data path must remain target-gated away
-      // from gfx942 FP8 kernels.
+      // OCP E4M3 encodings for {-2, -1, 0, 1, 2}. The FP8 dot kernel is
+      // only registered for gfx1201, so we do not model gfx942 FNUZ here.
       constexpr uint8_t fp8_values[] = {0xc0, 0xb8, 0x00, 0x38, 0x40};
       out_buffer_typed[i] = fp8_values[r() % 5];
     } else {
