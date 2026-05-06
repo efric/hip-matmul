@@ -17,6 +17,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 inline void hip_check_impl(hipError_t hip_error_code, const char *condstr,
@@ -115,13 +116,13 @@ void fillRandomBuffer(int size, std::minstd_rand &r, void *out_buffer) {
     // accumulators are in [-4K, +4K] for accumulation depth K so they're
     // exactly representable, float rounding is exact and we don't need
     // fuzzy compares.
+    const int value = static_cast<int>((r() % 5)) - 2;
     if constexpr (type == Type::FP8) {
-      // OCP E4M3 encodings for {-2, -1, 0, 1, 2}. The FP8 dot kernel is
-      // only registered for gfx1201, so we do not model gfx942 FNUZ here.
+      // Type::FP8 is stored as raw OCP E4M3 bytes for the gfx12 dot intrinsic.
       constexpr uint8_t fp8_values[] = {0xc0, 0xb8, 0x00, 0x38, 0x40};
-      out_buffer_typed[i] = fp8_values[r() % 5];
+      out_buffer_typed[i] = fp8_values[value + 2];
     } else {
-      out_buffer_typed[i] = static_cast<T>(static_cast<int>((r() % 5)) - 2);
+      out_buffer_typed[i] = static_cast<T>(value);
     }
   }
 }

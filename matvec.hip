@@ -6,6 +6,7 @@
 
 #include "common.hip"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -37,66 +38,14 @@ size_t no_shared_mem(const ProblemProperties &) { return 0; }
 static constexpr int kSubgroupSize32 = 32;
 static constexpr int kSubgroupSize64 = 64;
 
-enum class TargetArchitecture { Unknown, Gfx1100, Gfx1201, Gfx942, Gfx950 };
+struct DeviceCapabilities {
+  const char *name = "unknown";
+  int subgroup_size = 0;
+  bool has_f16_output_dot = false;
+  bool has_fp8_dot = false;
+};
 
-constexpr uint32_t target_mask(TargetArchitecture target) {
-  switch (target) {
-  case TargetArchitecture::Gfx1100:
-    return 1u << 0;
-  case TargetArchitecture::Gfx1201:
-    return 1u << 1;
-  case TargetArchitecture::Gfx942:
-    return 1u << 2;
-  case TargetArchitecture::Gfx950:
-    return 1u << 3;
-  case TargetArchitecture::Unknown:
-    return 0;
-  }
-}
-
-constexpr uint32_t kAllRequestedTargets =
-    target_mask(TargetArchitecture::Gfx1100) |
-    target_mask(TargetArchitecture::Gfx1201) |
-    target_mask(TargetArchitecture::Gfx942) |
-    target_mask(TargetArchitecture::Gfx950);
-
-constexpr uint32_t kGfx11And12Targets =
-    target_mask(TargetArchitecture::Gfx1100) |
-    target_mask(TargetArchitecture::Gfx1201);
-
-constexpr uint32_t kGfx942And950Targets =
-    target_mask(TargetArchitecture::Gfx942) |
-    target_mask(TargetArchitecture::Gfx950);
-
-constexpr uint32_t kGfx1201Target =
-    target_mask(TargetArchitecture::Gfx1201);
-
-constexpr uint32_t preferredTargetMaskForSubgroupSize(int subgroup_size) {
-  if (subgroup_size == kSubgroupSize32) {
-    return kGfx11And12Targets;
-  }
-  if (subgroup_size == kSubgroupSize64) {
-    return kGfx942And950Targets;
-  }
-  return 0;
-}
-
-const char *str(TargetArchitecture target) {
-  switch (target) {
-  case TargetArchitecture::Gfx1100:
-    return "gfx1100";
-  case TargetArchitecture::Gfx1201:
-    return "gfx1201";
-  case TargetArchitecture::Gfx942:
-    return "gfx942";
-  case TargetArchitecture::Gfx950:
-    return "gfx950";
-  case TargetArchitecture::Unknown:
-    return "unknown";
-  }
-}
-
-bool targetNameStartsWith(const char *name, const char *target) {
+bool architectureNameStartsWith(const char *name, const char *target) {
   size_t target_len = std::strlen(target);
   if (std::strncmp(name, target, target_len) != 0) {
     return false;
@@ -105,40 +54,28 @@ bool targetNameStartsWith(const char *name, const char *target) {
          name[target_len] == '-';
 }
 
-bool parseTargetArchitecture(const char *name, TargetArchitecture &target) {
-  if (targetNameStartsWith(name, "gfx1100")) {
-    target = TargetArchitecture::Gfx1100;
-    return true;
-  }
-  if (targetNameStartsWith(name, "gfx1201")) {
-    target = TargetArchitecture::Gfx1201;
-    return true;
-  }
-  if (targetNameStartsWith(name, "gfx942")) {
-    target = TargetArchitecture::Gfx942;
-    return true;
-  }
-  if (targetNameStartsWith(name, "gfx950")) {
-    target = TargetArchitecture::Gfx950;
-    return true;
-  }
-  return false;
-}
-
-TargetArchitecture detectTargetArchitecture() {
+DeviceCapabilities detectDeviceCapabilities() {
   int device = 0;
   HIP_CHECK(hipGetDevice(&device));
   hipDeviceProp_t properties = {};
   HIP_CHECK(hipGetDeviceProperties(&properties, device));
-  TargetArchitecture target = TargetArchitecture::Unknown;
-  if (parseTargetArchitecture(properties.gcnArchName, target)) {
-    return target;
+
+  DeviceCapabilities result;
+  if (architectureNameStartsWith(properties.gcnArchName, "gfx1100")) {
+    result = {"gfx1100", kSubgroupSize32, true, false};
+  } else if (architectureNameStartsWith(properties.gcnArchName, "gfx1201")) {
+    result = {"gfx1201", kSubgroupSize32, true, true};
+  } else if (architectureNameStartsWith(properties.gcnArchName, "gfx942")) {
+    result = {"gfx942", kSubgroupSize64, false, false};
+  } else if (architectureNameStartsWith(properties.gcnArchName, "gfx950")) {
+    result = {"gfx950", kSubgroupSize64, false, false};
+  } else {
+    fprintf(stderr,
+            "Warning: active device reports unrecognized target '%s'; "
+            "subgroup and dot kernels will be skipped.\n",
+            properties.gcnArchName);
   }
-  fprintf(stderr,
-          "Warning: active device reports unrecognized target '%s'; "
-          "target-gated dot kernels will be skipped.\n",
-          properties.gcnArchName);
-  return TargetArchitecture::Unknown;
+  return result;
 }
 
 void print(const ProblemProperties &problem, FILE *file = stderr) {
@@ -175,7 +112,6 @@ struct MatvecKernel {
   shared_mem_bytes_func_t
       shared_mem_bytes_func;      // Amount of shared memory per workgroup.
   matvec_func_t matvec_func; // Device kernel pointer.
-  uint32_t target_mask = 0;  // Zero means target-independent.
   int subgroup_size = 0;     // Zero means the kernel is not subgroup-shaped.
 };
 
@@ -512,7 +448,6 @@ template <> struct AmdDotTraits<Type::FP16, Type::FP16, Type::FP32> {
   using TB = CType<Type::FP16>;
   using TC = CType<Type::FP32>;
   static constexpr int kElementsPerDot = 2;
-  static constexpr uint32_t kSupportedTargetMask = kAllRequestedTargets;
 
   __device__ static TC dot(const TA *a, const TB *b, TC c) {
     if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2)) {
@@ -530,7 +465,6 @@ template <> struct AmdDotTraits<Type::FP16, Type::FP16, Type::FP16> {
   using TB = CType<Type::FP16>;
   using TC = CType<Type::FP16>;
   static constexpr int kElementsPerDot = 2;
-  static constexpr uint32_t kSupportedTargetMask = kGfx11And12Targets;
 
   __device__ static TC dot(const TA *a, const TB *b, TC c) {
     if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2_f16_f16)) {
@@ -548,7 +482,6 @@ template <> struct AmdDotTraits<Type::FP8, Type::FP8, Type::FP32> {
   using TB = CType<Type::FP8>;
   using TC = CType<Type::FP32>;
   static constexpr int kElementsPerDot = 4;
-  static constexpr uint32_t kSupportedTargetMask = kGfx1201Target;
 
   __device__ static uint32_t pack4(const uint8_t *values) {
     return static_cast<uint32_t>(values[0]) |
@@ -596,9 +529,6 @@ struct AmdDotReduceKernel : MatvecKernel {
     num_threads_func = [](const ProblemProperties &) { return T_SubgroupSize; };
     shared_mem_bytes_func = no_shared_mem;
     matvec_func = run;
-    this->target_mask =
-        Dot::kSupportedTargetMask &
-        preferredTargetMaskForSubgroupSize(T_SubgroupSize);
     this->subgroup_size = T_SubgroupSize;
   }
 
@@ -678,7 +608,6 @@ struct SubgroupReduceKernel : MatvecKernel {
     num_threads_func = [](const ProblemProperties &) { return T_SubgroupSize; };
     shared_mem_bytes_func = no_shared_mem;
     matvec_func = run;
-    this->target_mask = preferredTargetMaskForSubgroupSize(T_SubgroupSize);
     this->subgroup_size = T_SubgroupSize;
   }
 
@@ -788,7 +717,6 @@ struct WorkgroupReduceKernel : MatvecKernel {
       return sizeof(TC) * T_M_tile * num_subgroups;
     };
     matvec_func = run;
-    this->target_mask = preferredTargetMaskForSubgroupSize(T_SubgroupSize);
     this->subgroup_size = T_SubgroupSize;
   }
 
@@ -887,28 +815,9 @@ struct WorkgroupReduceKernel : MatvecKernel {
   }
 };
 
-bool supportsTarget(const MatvecKernel &kernel, TargetArchitecture target) {
-  if (kernel.target_mask == 0) {
-    return true;
-  }
-  return (kernel.target_mask & target_mask(target)) != 0;
-}
-
-void test(const MatvecKernel &kernel, TargetArchitecture target) {
+void test(const MatvecKernel &kernel) {
   const char *filter = getenv("FILTER");
   if (filter && !strstr(kernel.name, filter)) {
-    return;
-  }
-  if (!supportsTarget(kernel, target)) {
-    std::printf("%s: skipping for target %s, A:%s, B:%s, C:%s, tile "
-                "MxNxK=%dx%dx%d",
-                kernel.name, str(target), str(kernel.A_type),
-                str(kernel.B_type), str(kernel.C_type), kernel.M_tile,
-                kernel.N_tile, kernel.K_tile);
-    if (kernel.subgroup_size != 0) {
-      std::printf(", subgroup=%d", kernel.subgroup_size);
-    }
-    std::printf("\n");
     return;
   }
   std::printf("%s: A:%s, B:%s, C:%s, tile MxNxK=%dx%dx%d", kernel.name,
@@ -930,60 +839,73 @@ void test(const MatvecKernel &kernel, TargetArchitecture target) {
   }
 }
 
+template <int T_SubgroupSize>
+void testSubgroupReduceKernels() {
+  test(SubgroupReduceKernel<1, T_SubgroupSize, T_SubgroupSize>{});
+  test(SubgroupReduceKernel<1, T_SubgroupSize * 4, T_SubgroupSize>{});
+  test(SubgroupReduceKernel<4, T_SubgroupSize, T_SubgroupSize>{});
+  test(SubgroupReduceKernel<4, T_SubgroupSize * 4, T_SubgroupSize>{});
+}
+
+template <int T_SubgroupSize>
+void testF16F32DotKernels() {
+  test(AmdDotReduceKernel<1, T_SubgroupSize * 4, T_SubgroupSize, Type::FP16,
+                          Type::FP16, Type::FP32>{});
+  test(AmdDotReduceKernel<4, T_SubgroupSize * 4, T_SubgroupSize, Type::FP16,
+                          Type::FP16, Type::FP32>{});
+}
+
+template <int T_SubgroupSize>
+void testF16F16DotKernels() {
+  test(AmdDotReduceKernel<1, T_SubgroupSize * 4, T_SubgroupSize, Type::FP16,
+                          Type::FP16, Type::FP16>{});
+  test(AmdDotReduceKernel<4, T_SubgroupSize * 4, T_SubgroupSize, Type::FP16,
+                          Type::FP16, Type::FP16>{});
+}
+
+template <int T_SubgroupSize>
+void testFp8DotKernels() {
+  test(AmdDotReduceKernel<1, T_SubgroupSize * 4, T_SubgroupSize, Type::FP8,
+                          Type::FP8, Type::FP32>{});
+  test(AmdDotReduceKernel<4, T_SubgroupSize * 4, T_SubgroupSize, Type::FP8,
+                          Type::FP8, Type::FP32>{});
+}
+
+template <int T_SubgroupSize>
+void testWorkgroupReduceKernels() {
+  test(WorkgroupReduceKernel<1, 4 * 4, T_SubgroupSize>{});
+  test(WorkgroupReduceKernel<2, 4 * 4, T_SubgroupSize>{});
+  test(WorkgroupReduceKernel<3, 4 * 4, T_SubgroupSize>{});
+  test(WorkgroupReduceKernel<4, 4 * 4, T_SubgroupSize>{});
+}
+
 int main(int argc, char **argv) {
   if (argc != 1) {
     fprintf(stderr, "usage: %s\n", argv[0]);
     return EXIT_FAILURE;
   }
-  TargetArchitecture target = detectTargetArchitecture();
-  std::printf("Detected target: %s\n", str(target));
+  DeviceCapabilities device = detectDeviceCapabilities();
+  std::printf("Detected target: %s\n", device.name);
 
-  test(NaiveMatmulKernel{}, target);
-  test(SubgroupReduceKernel<1, kSubgroupSize32, kSubgroupSize32>{}, target);
-  test(SubgroupReduceKernel<1, kSubgroupSize32 * 4, kSubgroupSize32>{},
-       target);
-  test(SubgroupReduceKernel<4, kSubgroupSize32, kSubgroupSize32>{}, target);
-  test(SubgroupReduceKernel<4, kSubgroupSize32 * 4, kSubgroupSize32>{},
-       target);
-  test(SubgroupReduceKernel<1, kSubgroupSize64, kSubgroupSize64>{}, target);
-  test(SubgroupReduceKernel<1, kSubgroupSize64 * 4, kSubgroupSize64>{},
-       target);
-  test(SubgroupReduceKernel<4, kSubgroupSize64, kSubgroupSize64>{}, target);
-  test(SubgroupReduceKernel<4, kSubgroupSize64 * 4, kSubgroupSize64>{},
-       target);
+  test(NaiveMatmulKernel{});
 
-  test(AmdDotReduceKernel<1, kSubgroupSize32 * 4, kSubgroupSize32,
-                          Type::FP16, Type::FP16, Type::FP32>{},
-       target);
-  test(AmdDotReduceKernel<4, kSubgroupSize32 * 4, kSubgroupSize32,
-                          Type::FP16, Type::FP16, Type::FP32>{},
-       target);
-  test(AmdDotReduceKernel<1, kSubgroupSize64 * 4, kSubgroupSize64,
-                          Type::FP16, Type::FP16, Type::FP32>{},
-       target);
-  test(AmdDotReduceKernel<4, kSubgroupSize64 * 4, kSubgroupSize64,
-                          Type::FP16, Type::FP16, Type::FP32>{},
-       target);
-  test(AmdDotReduceKernel<1, kSubgroupSize32 * 4, kSubgroupSize32,
-                          Type::FP16, Type::FP16, Type::FP16>{},
-       target);
-  test(AmdDotReduceKernel<4, kSubgroupSize32 * 4, kSubgroupSize32,
-                          Type::FP16, Type::FP16, Type::FP16>{},
-       target);
-  test(AmdDotReduceKernel<1, kSubgroupSize32 * 4, kSubgroupSize32,
-                          Type::FP8, Type::FP8, Type::FP32>{},
-       target);
-  test(AmdDotReduceKernel<4, kSubgroupSize32 * 4, kSubgroupSize32,
-                          Type::FP8, Type::FP8, Type::FP32>{},
-       target);
-
-  test(WorkgroupReduceKernel<1, 4 * 4, kSubgroupSize32>{}, target);
-  test(WorkgroupReduceKernel<2, 4 * 4, kSubgroupSize32>{}, target);
-  test(WorkgroupReduceKernel<3, 4 * 4, kSubgroupSize32>{}, target);
-  test(WorkgroupReduceKernel<4, 4 * 4, kSubgroupSize32>{}, target);
-  test(WorkgroupReduceKernel<1, 4 * 4, kSubgroupSize64>{}, target);
-  test(WorkgroupReduceKernel<2, 4 * 4, kSubgroupSize64>{}, target);
-  test(WorkgroupReduceKernel<3, 4 * 4, kSubgroupSize64>{}, target);
-  test(WorkgroupReduceKernel<4, 4 * 4, kSubgroupSize64>{}, target);
+  if (device.subgroup_size == kSubgroupSize32) {
+    testSubgroupReduceKernels<kSubgroupSize32>();
+    testF16F32DotKernels<kSubgroupSize32>();
+    if (device.has_f16_output_dot) {
+      testF16F16DotKernels<kSubgroupSize32>();
+    }
+    if (device.has_fp8_dot) {
+      testFp8DotKernels<kSubgroupSize32>();
+    }
+    testWorkgroupReduceKernels<kSubgroupSize32>();
+  } else if (device.subgroup_size == kSubgroupSize64) {
+    testSubgroupReduceKernels<kSubgroupSize64>();
+    testF16F32DotKernels<kSubgroupSize64>();
+    if (device.has_f16_output_dot) {
+      testF16F16DotKernels<kSubgroupSize64>();
+    }
+    testWorkgroupReduceKernels<kSubgroupSize64>();
+  }
   return 0;
 }
