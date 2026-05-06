@@ -7,7 +7,10 @@
 #include "common.hip"
 
 #include <cassert>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <random>
 #include <type_traits>
 #include <vector>
@@ -31,6 +34,117 @@ using shared_mem_bytes_func_t = size_t (*)(const ProblemProperties & /*problem*/
 
 size_t no_shared_mem(const ProblemProperties &) { return 0; }
 
+static constexpr int kSubgroupSize32 = 32;
+static constexpr int kSubgroupSize64 = 64;
+
+enum class TargetArchitecture { Unknown, Gfx1100, Gfx1201, Gfx942, Gfx950 };
+
+constexpr uint32_t target_mask(TargetArchitecture target) {
+  switch (target) {
+  case TargetArchitecture::Gfx1100:
+    return 1u << 0;
+  case TargetArchitecture::Gfx1201:
+    return 1u << 1;
+  case TargetArchitecture::Gfx942:
+    return 1u << 2;
+  case TargetArchitecture::Gfx950:
+    return 1u << 3;
+  case TargetArchitecture::Unknown:
+    return 0;
+  }
+}
+
+constexpr uint32_t kAllRequestedTargets =
+    target_mask(TargetArchitecture::Gfx1100) |
+    target_mask(TargetArchitecture::Gfx1201) |
+    target_mask(TargetArchitecture::Gfx942) |
+    target_mask(TargetArchitecture::Gfx950);
+
+constexpr uint32_t kGfx11And12Targets =
+    target_mask(TargetArchitecture::Gfx1100) |
+    target_mask(TargetArchitecture::Gfx1201);
+
+constexpr uint32_t kGfx942And950Targets =
+    target_mask(TargetArchitecture::Gfx942) |
+    target_mask(TargetArchitecture::Gfx950);
+
+constexpr uint32_t preferredTargetMaskForSubgroupSize(int subgroup_size) {
+  if (subgroup_size == kSubgroupSize32) {
+    return kGfx11And12Targets;
+  }
+  if (subgroup_size == kSubgroupSize64) {
+    return kGfx942And950Targets;
+  }
+  return 0;
+}
+
+const char *str(TargetArchitecture target) {
+  switch (target) {
+  case TargetArchitecture::Gfx1100:
+    return "gfx1100";
+  case TargetArchitecture::Gfx1201:
+    return "gfx1201";
+  case TargetArchitecture::Gfx942:
+    return "gfx942";
+  case TargetArchitecture::Gfx950:
+    return "gfx950";
+  case TargetArchitecture::Unknown:
+    return "unknown";
+  }
+}
+
+bool targetNameStartsWith(const char *name, const char *target) {
+  size_t target_len = std::strlen(target);
+  if (std::strncmp(name, target, target_len) != 0) {
+    return false;
+  }
+  return name[target_len] == '\0' || name[target_len] == ':' ||
+         name[target_len] == '-';
+}
+
+bool parseTargetArchitecture(const char *name, TargetArchitecture &target) {
+  if (targetNameStartsWith(name, "gfx1100")) {
+    target = TargetArchitecture::Gfx1100;
+    return true;
+  }
+  if (targetNameStartsWith(name, "gfx1201")) {
+    target = TargetArchitecture::Gfx1201;
+    return true;
+  }
+  if (targetNameStartsWith(name, "gfx942")) {
+    target = TargetArchitecture::Gfx942;
+    return true;
+  }
+  if (targetNameStartsWith(name, "gfx950")) {
+    target = TargetArchitecture::Gfx950;
+    return true;
+  }
+  return false;
+}
+
+TargetArchitecture detectTargetArchitecture() {
+  int device = 0;
+  HIP_CHECK(hipGetDevice(&device));
+  hipDeviceProp_t properties = {};
+  HIP_CHECK(hipGetDeviceProperties(&properties, device));
+  TargetArchitecture target = TargetArchitecture::Unknown;
+  if (parseTargetArchitecture(properties.gcnArchName, target)) {
+    return target;
+  }
+  fprintf(stderr,
+          "Warning: active device reports unrecognized target '%s'; "
+          "target-gated dot kernels will be skipped unless --target is used.\n",
+          properties.gcnArchName);
+  return TargetArchitecture::Unknown;
+}
+
+void printUsageAndExit(const char *argv0) {
+  fprintf(stderr,
+          "usage: %s [--target={gfx1100,gfx1201,gfx942,gfx950}]\n",
+          argv0);
+  std::exit(EXIT_FAILURE);
+}
+
 void print(const ProblemProperties &problem, FILE *file = stderr) {
   fprintf(file, "A:%s, B:%s, C:%s, Total MxNxK=%dx%dx%d\n", str(problem.A_type),
           str(problem.B_type), str(problem.C_type), problem.total.M,
@@ -41,15 +155,15 @@ void print(const ProblemProperties &problem, FILE *file = stderr) {
 }
 
 int flat_a_size(const ProblemProperties &problem) {
-  return type_size(problem.A_type) * problem.total.M * problem.total.K;
+  return problem.total.M * problem.total.K;
 }
 
 int flat_b_size(const ProblemProperties &problem) {
-  return type_size(problem.B_type) * problem.total.N * problem.total.K;
+  return problem.total.N * problem.total.K;
 }
 
 int flat_c_size(const ProblemProperties &problem) {
-  return type_size(problem.C_type) * problem.total.M * problem.total.N;
+  return problem.total.M * problem.total.N;
 }
 
 struct MatvecKernel {
@@ -65,6 +179,8 @@ struct MatvecKernel {
   shared_mem_bytes_func_t
       shared_mem_bytes_func;      // Amount of shared memory per workgroup.
   matvec_func_t matvec_func; // Device kernel pointer.
+  uint32_t target_mask = 0;  // Zero means target-independent.
+  int subgroup_size = 0;     // Zero means the kernel is not subgroup-shaped.
 };
 
 ProblemProperties getBenchmarkProblemSize(const MatvecKernel &kernel,
@@ -90,6 +206,14 @@ ProblemProperties getCheckProblemSize(const MatvecKernel &kernel) {
   return getBenchmarkProblemSize(kernel, total);
 }
 
+template <Type T> float referenceValue(CType<T> value) {
+  return static_cast<float>(value);
+}
+
+template <> float referenceValue<Type::FP8>(CType<Type::FP8> value) {
+  return ocp_e4m3_fp8_to_float(value);
+}
+
 template <Type A_type, Type B_type, Type C_type>
 void checkMatvecResults(const void *A_data_void, const void *B_data_void,
                         const void *C_data_void, const ProblemProperties &problem) {
@@ -111,13 +235,20 @@ void checkMatvecResults(const void *A_data_void, const void *B_data_void,
         for (int n_tile = 0; n_tile < problem.tile.N; ++n_tile) {
           int global_m = m_outer * problem.tile.M + m_tile;
           int global_n = n_outer * problem.tile.N + n_tile;
+          if (global_m >= problem.total.M || global_n >= problem.total.N) {
+            continue;
+          }
           TC c = {0};
           for (int k_outer = 0; k_outer < problem.outer.K; ++k_outer) {
             for (int k_tile = 0; k_tile < problem.tile.K; ++k_tile) {
               int global_k = k_outer * problem.tile.K + k_tile;
+              if (global_k >= problem.total.K) {
+                continue;
+              }
               TA a = A_data[global_m * problem.total.K + global_k];
               TB b = B_data[global_n * problem.total.K + global_k];
-              c += static_cast<TC>(a) * static_cast<TC>(b);
+              c += static_cast<TC>(referenceValue<A_type>(a)) *
+                   static_cast<TC>(referenceValue<B_type>(b));
             }
           }
           TC expected = c;
@@ -148,7 +279,9 @@ void checkMatvecResults(Type A_type, Type B_type, Type C_type,
     return;                                                                    \
   }
   HANDLE_CASE(FP32, FP32, FP32)
+  HANDLE_CASE(FP8, FP8, FP32)
   HANDLE_CASE(FP16, FP16, FP32)
+  HANDLE_CASE(FP16, FP16, FP16)
   HANDLE_CASE(SI8, SI8, SI32)
 #undef HANDLE_CASE
 
@@ -357,14 +490,174 @@ template <typename T> __device__ static T fma(T a, T b, T c) {
   }
 }
 
-template <typename T> __device__ static T subgroup_reduce(T value) {
-  for (int offset = warpSize >> 1; offset > 0; offset = offset >> 1) {
-    value += __shfl_down(value, offset, warpSize);
+template <int T_SubgroupSize, typename T>
+__device__ static T subgroup_reduce(T value) {
+  for (int offset = T_SubgroupSize >> 1; offset > 0; offset = offset >> 1) {
+    value += __shfl_down(value, offset, T_SubgroupSize);
   }
   return value;
 };
 
-template <int T_M_tile, int T_K_tile>
+template <int T_SubgroupSize>
+__device__ static _Float16 subgroup_reduce(_Float16 value) {
+  float reduced = static_cast<float>(value);
+  for (int offset = T_SubgroupSize >> 1; offset > 0; offset = offset >> 1) {
+    reduced += __shfl_down(reduced, offset, T_SubgroupSize);
+  }
+  return static_cast<_Float16>(reduced);
+}
+
+template <Type A_type, Type B_type, Type C_type> struct AmdDotTraits;
+
+using f16x2 = _Float16 __attribute__((ext_vector_type(2)));
+
+template <> struct AmdDotTraits<Type::FP16, Type::FP16, Type::FP32> {
+  using TA = CType<Type::FP16>;
+  using TB = CType<Type::FP16>;
+  using TC = CType<Type::FP32>;
+  static constexpr int kElementsPerDot = 2;
+  static constexpr uint32_t kSupportedTargetMask = kAllRequestedTargets;
+
+  __device__ static TC dot(const TA *a, const TB *b, TC c) {
+    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2)) {
+      const f16x2 a_vec = {a[0], a[1]};
+      const f16x2 b_vec = {b[0], b[1]};
+      return __builtin_amdgcn_fdot2(a_vec, b_vec, c, false);
+    }
+    __builtin_trap();
+    return c;
+  }
+};
+
+template <> struct AmdDotTraits<Type::FP16, Type::FP16, Type::FP16> {
+  using TA = CType<Type::FP16>;
+  using TB = CType<Type::FP16>;
+  using TC = CType<Type::FP16>;
+  static constexpr int kElementsPerDot = 2;
+  static constexpr uint32_t kSupportedTargetMask = kGfx11And12Targets;
+
+  __device__ static TC dot(const TA *a, const TB *b, TC c) {
+    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2_f16_f16)) {
+      const f16x2 a_vec = {a[0], a[1]};
+      const f16x2 b_vec = {b[0], b[1]};
+      return __builtin_amdgcn_fdot2_f16_f16(a_vec, b_vec, c);
+    }
+    __builtin_trap();
+    return c;
+  }
+};
+
+template <> struct AmdDotTraits<Type::FP8, Type::FP8, Type::FP32> {
+  using TA = CType<Type::FP8>;
+  using TB = CType<Type::FP8>;
+  using TC = CType<Type::FP32>;
+  static constexpr int kElementsPerDot = 4;
+  static constexpr uint32_t kSupportedTargetMask =
+      target_mask(TargetArchitecture::Gfx1201);
+
+  __device__ static uint32_t pack4(const uint8_t *values) {
+    return static_cast<uint32_t>(values[0]) |
+           (static_cast<uint32_t>(values[1]) << 8) |
+           (static_cast<uint32_t>(values[2]) << 16) |
+           (static_cast<uint32_t>(values[3]) << 24);
+  }
+
+  __device__ static TC dot(const TA *a, const TB *b, TC c) {
+    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_dot4_f32_fp8_fp8)) {
+      return __builtin_amdgcn_dot4_f32_fp8_fp8(pack4(a), pack4(b), c);
+    }
+    __builtin_trap();
+    return c;
+  }
+};
+
+template <int T_M_tile, int T_K_tile, int T_SubgroupSize, Type T_A_type,
+          Type T_B_type, Type T_C_type>
+struct AmdDotReduceKernel : MatvecKernel {
+  using Dot = AmdDotTraits<T_A_type, T_B_type, T_C_type>;
+  using TA = CType<T_A_type>;
+  using TB = CType<T_B_type>;
+  using TC = CType<T_C_type>;
+  static constexpr int T_N_tile = 1;
+  static constexpr int K_VEC = T_K_tile / T_SubgroupSize;
+  static_assert(T_K_tile == K_VEC * T_SubgroupSize,
+                "Invalid configuration");
+  static_assert(K_VEC % Dot::kElementsPerDot == 0,
+                "K vector width must contain whole dot operands");
+
+  AmdDotReduceKernel() {
+    name = __FUNCTION__;
+    this->A_type = T_A_type;
+    this->B_type = T_B_type;
+    this->C_type = T_C_type;
+    M_tile = T_M_tile;
+    N_tile = T_N_tile;
+    K_tile = T_K_tile;
+    num_threads_func = [](const ProblemProperties &) { return T_SubgroupSize; };
+    shared_mem_bytes_func = no_shared_mem;
+    matvec_func = run;
+    this->target_mask =
+        Dot::kSupportedTargetMask &
+        preferredTargetMaskForSubgroupSize(T_SubgroupSize);
+    this->subgroup_size = T_SubgroupSize;
+  }
+
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int M, int N, int K) {
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int lane = threadIdx.x % T_SubgroupSize;
+
+    int K_outer = ceil_div(K, T_K_tile);
+    int global_m = m_outer * T_M_tile;
+    int global_n = n_outer * T_N_tile;
+    if (global_m >= M || global_n >= N)
+      return;
+
+    int tile_k = lane * K_VEC;
+    TC c[T_M_tile] = {0};
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      TB b[K_VEC] = {0};
+      for (int k = 0; k < K_VEC; ++k) {
+        int global_k = k_outer * T_K_tile + tile_k + k;
+        if (global_k < K) {
+          b[k] = static_cast<const TB *>(B_data)[global_n * K + global_k];
+        }
+      }
+
+      for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+        TA a[K_VEC] = {0};
+        if (global_m + m_tile < M) {
+          for (int k = 0; k < K_VEC; ++k) {
+            int global_k = k_outer * T_K_tile + tile_k + k;
+            if (global_k < K) {
+              a[k] = static_cast<const TA *>(
+                  A_data)[(global_m + m_tile) * K + global_k];
+            }
+          }
+        }
+        for (int k = 0; k < K_VEC; k += Dot::kElementsPerDot) {
+          c[m_tile] = Dot::dot(&a[k], &b[k], c[m_tile]);
+        }
+      }
+    }
+
+    for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+      c[m_tile] = subgroup_reduce<T_SubgroupSize>(c[m_tile]);
+    }
+
+    if (lane == 0) {
+      for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+        int row = global_m + m_tile;
+        if (row < M) {
+          static_cast<TC *>(C_data)[row * N + global_n] = c[m_tile];
+        }
+      }
+    }
+  }
+};
+
+template <int T_M_tile, int T_K_tile, int T_SubgroupSize>
 struct SubgroupReduceKernel : MatvecKernel {
   using TA = float;
   using TB = float;
@@ -382,20 +675,24 @@ struct SubgroupReduceKernel : MatvecKernel {
     M_tile = T_M_tile;
     N_tile = T_N_tile;
     K_tile = T_K_tile;
-    num_threads_func = [](const ProblemProperties &) { return warpSize; };
+    num_threads_func = [](const ProblemProperties &) { return T_SubgroupSize; };
     shared_mem_bytes_func = no_shared_mem;
     matvec_func = run;
+    this->target_mask = preferredTargetMaskForSubgroupSize(T_SubgroupSize);
+    this->subgroup_size = T_SubgroupSize;
   }
 
   __global__ static void run(const void *A_data, const void *B_data,
                              void *C_data, int M, int N, int K) {
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
-    int lane = threadIdx.x % warpSize;
+    int lane = threadIdx.x % T_SubgroupSize;
 
     // The number of adjacent elements to be accessed by a thread. This is used
     // to guarantee vectorized memory accesses, e.g., `global_load_dwordx4`.
-    static constexpr int K_VEC = T_K_tile / warpSize;
+    static constexpr int K_VEC = T_K_tile / T_SubgroupSize;
+    static_assert(T_K_tile == K_VEC * T_SubgroupSize,
+                  "Invalid configuration");
     int K_outer = ceil_div(K, T_K_tile);
 
     int global_m = m_outer * T_M_tile;
@@ -447,7 +744,7 @@ struct SubgroupReduceKernel : MatvecKernel {
     // Perform subgroup-level reduction, such that thread 0 contains the final
     // result for the whole subgroup.
     for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
-      res[m_tile] = subgroup_reduce(res[m_tile]);
+      res[m_tile] = subgroup_reduce<T_SubgroupSize>(res[m_tile]);
     }
     if (lane == 0) {
       for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
@@ -458,7 +755,7 @@ struct SubgroupReduceKernel : MatvecKernel {
   }
 };
 
-template <int T_M_tile, int T_K_tile>
+template <int T_M_tile, int T_K_tile, int T_SubgroupSize>
 struct WorkgroupReduceKernel : MatvecKernel {
   using TA = float;
   using TB = float;
@@ -485,30 +782,33 @@ struct WorkgroupReduceKernel : MatvecKernel {
       return problem.total.K / T_K_tile;
     };
     shared_mem_bytes_func = [](const ProblemProperties &problem) {
-      int num_subgroups = ceil_div(problem.total.K / T_K_tile, warpSize);
+      int num_subgroups =
+          ceil_div(problem.total.K / T_K_tile, T_SubgroupSize);
       assert(num_subgroups <= 32 && "Too many subgroups per workgroup");
       return sizeof(TC) * T_M_tile * num_subgroups;
     };
     matvec_func = run;
+    this->target_mask = preferredTargetMaskForSubgroupSize(T_SubgroupSize);
+    this->subgroup_size = T_SubgroupSize;
   }
 
   __global__ static void run(const void *A_data, const void *B_data,
                              void *C_data, int M, int N, int K) {
     extern __shared__ TC shared_mem[];
 
-    const int num_subgroups = ceil_div(K / T_K_tile, warpSize);
+    const int num_subgroups = ceil_div(K / T_K_tile, T_SubgroupSize);
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
-    int lane = threadIdx.x % warpSize;
-    int subgroup = threadIdx.x / warpSize;
+    int lane = threadIdx.x % T_SubgroupSize;
+    int subgroup = threadIdx.x / T_SubgroupSize;
 
     int global_m = m_outer * T_M_tile;
     int global_n = n_outer * T_N_tile;
     if (global_m >= M || global_n >= N)
       return;
 
-    static constexpr int K_per_subgroup = T_K_tile * warpSize;
-    static constexpr int K_per_outer = K_VEC * warpSize;
+    static constexpr int K_per_subgroup = T_K_tile * T_SubgroupSize;
+    static constexpr int K_per_outer = K_VEC * T_SubgroupSize;
     int tile_k = subgroup * K_per_subgroup + lane * K_VEC;
 
     // Load the vector operand first to hide the latency. We will need these
@@ -559,7 +859,7 @@ struct WorkgroupReduceKernel : MatvecKernel {
     // Perform subgroup-level reduction, such that thread 0 contains the
     // final result for the whole subgroup.
     for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
-      TC thread_res = subgroup_reduce(res[m_tile]);
+      TC thread_res = subgroup_reduce<T_SubgroupSize>(res[m_tile]);
       res[m_tile] = thread_res;
     }
 
@@ -579,7 +879,7 @@ struct WorkgroupReduceKernel : MatvecKernel {
         thread_res = shared_mem[lane * T_M_tile + m_tile];
       }
 
-      TC final = subgroup_reduce(thread_res);
+      TC final = subgroup_reduce<T_SubgroupSize>(thread_res);
       if (lane == 0) {
         static_cast<TC *>(C_data)[(global_m + m_tile) * N + global_n] = final;
       }
@@ -587,14 +887,37 @@ struct WorkgroupReduceKernel : MatvecKernel {
   }
 };
 
-void test(const MatvecKernel &kernel) {
+bool supportsTarget(const MatvecKernel &kernel, TargetArchitecture target) {
+  if (kernel.target_mask == 0) {
+    return true;
+  }
+  return (kernel.target_mask & target_mask(target)) != 0;
+}
+
+void test(const MatvecKernel &kernel, TargetArchitecture target) {
   const char *filter = getenv("FILTER");
   if (filter && !strstr(kernel.name, filter)) {
     return;
   }
-  std::printf("%s: A:%s, B:%s, C:%s, tile MxNxK=%dx%dx%d\n", kernel.name,
+  if (!supportsTarget(kernel, target)) {
+    std::printf("%s: skipping for target %s, A:%s, B:%s, C:%s, tile "
+                "MxNxK=%dx%dx%d",
+                kernel.name, str(target), str(kernel.A_type),
+                str(kernel.B_type), str(kernel.C_type), kernel.M_tile,
+                kernel.N_tile, kernel.K_tile);
+    if (kernel.subgroup_size != 0) {
+      std::printf(", subgroup=%d", kernel.subgroup_size);
+    }
+    std::printf("\n");
+    return;
+  }
+  std::printf("%s: A:%s, B:%s, C:%s, tile MxNxK=%dx%dx%d", kernel.name,
               str(kernel.A_type), str(kernel.B_type), str(kernel.C_type),
               kernel.M_tile, kernel.N_tile, kernel.K_tile);
+  if (kernel.subgroup_size != 0) {
+    std::printf(", subgroup=%d", kernel.subgroup_size);
+  }
+  std::printf("\n");
 
   if (!getenv("SKIP_CHECK")) {
     check(kernel);
@@ -607,15 +930,89 @@ void test(const MatvecKernel &kernel) {
   }
 }
 
-int main() {
-  test(NaiveMatmulKernel{});
-  test(SubgroupReduceKernel<1, warpSize>{});
-  test(SubgroupReduceKernel<1, warpSize * 4>{});
-  test(SubgroupReduceKernel<4, warpSize>{});
-  test(SubgroupReduceKernel<4, warpSize * 4>{});
-  test(WorkgroupReduceKernel<1, 4 * 4>{});
-  test(WorkgroupReduceKernel<2, 4 * 4>{});
-  test(WorkgroupReduceKernel<3, 4 * 4>{});
-  test(WorkgroupReduceKernel<4, 4 * 4>{});
+int main(int argc, char **argv) {
+  TargetArchitecture target = TargetArchitecture::Unknown;
+  bool target_was_provided = false;
+  constexpr const char *target_prefix = "--target=";
+  for (int i = 1; i < argc; ++i) {
+    if (std::strncmp(argv[i], target_prefix, std::strlen(target_prefix)) == 0) {
+      if (!parseTargetArchitecture(argv[i] + std::strlen(target_prefix),
+                                   target)) {
+        printUsageAndExit(argv[0]);
+      }
+      target_was_provided = true;
+      continue;
+    }
+    if (std::strcmp(argv[i], "--target") == 0) {
+      if (i + 1 >= argc || !parseTargetArchitecture(argv[++i], target)) {
+        printUsageAndExit(argv[0]);
+      }
+      target_was_provided = true;
+      continue;
+    }
+    printUsageAndExit(argv[0]);
+  }
+  TargetArchitecture detected_target = detectTargetArchitecture();
+  if (target_was_provided) {
+    if (detected_target != TargetArchitecture::Unknown &&
+        detected_target != target) {
+      fprintf(stderr,
+              "error: --target=%s does not match active device target %s\n",
+              str(target), str(detected_target));
+      return EXIT_FAILURE;
+    }
+  } else {
+    target = detected_target;
+  }
+  std::printf("Selected target: %s%s\n", str(target),
+              target_was_provided ? "" : " (detected)");
+
+  test(NaiveMatmulKernel{}, target);
+  test(SubgroupReduceKernel<1, kSubgroupSize32, kSubgroupSize32>{}, target);
+  test(SubgroupReduceKernel<1, kSubgroupSize32 * 4, kSubgroupSize32>{},
+       target);
+  test(SubgroupReduceKernel<4, kSubgroupSize32, kSubgroupSize32>{}, target);
+  test(SubgroupReduceKernel<4, kSubgroupSize32 * 4, kSubgroupSize32>{},
+       target);
+  test(SubgroupReduceKernel<1, kSubgroupSize64, kSubgroupSize64>{}, target);
+  test(SubgroupReduceKernel<1, kSubgroupSize64 * 4, kSubgroupSize64>{},
+       target);
+  test(SubgroupReduceKernel<4, kSubgroupSize64, kSubgroupSize64>{}, target);
+  test(SubgroupReduceKernel<4, kSubgroupSize64 * 4, kSubgroupSize64>{},
+       target);
+
+  test(AmdDotReduceKernel<1, kSubgroupSize32 * 4, kSubgroupSize32,
+                          Type::FP16, Type::FP16, Type::FP32>{},
+       target);
+  test(AmdDotReduceKernel<4, kSubgroupSize32 * 4, kSubgroupSize32,
+                          Type::FP16, Type::FP16, Type::FP32>{},
+       target);
+  test(AmdDotReduceKernel<1, kSubgroupSize64 * 4, kSubgroupSize64,
+                          Type::FP16, Type::FP16, Type::FP32>{},
+       target);
+  test(AmdDotReduceKernel<4, kSubgroupSize64 * 4, kSubgroupSize64,
+                          Type::FP16, Type::FP16, Type::FP32>{},
+       target);
+  test(AmdDotReduceKernel<1, kSubgroupSize32 * 4, kSubgroupSize32,
+                          Type::FP16, Type::FP16, Type::FP16>{},
+       target);
+  test(AmdDotReduceKernel<4, kSubgroupSize32 * 4, kSubgroupSize32,
+                          Type::FP16, Type::FP16, Type::FP16>{},
+       target);
+  test(AmdDotReduceKernel<1, kSubgroupSize32 * 4, kSubgroupSize32,
+                          Type::FP8, Type::FP8, Type::FP32>{},
+       target);
+  test(AmdDotReduceKernel<4, kSubgroupSize32 * 4, kSubgroupSize32,
+                          Type::FP8, Type::FP8, Type::FP32>{},
+       target);
+
+  test(WorkgroupReduceKernel<1, 4 * 4, kSubgroupSize32>{}, target);
+  test(WorkgroupReduceKernel<2, 4 * 4, kSubgroupSize32>{}, target);
+  test(WorkgroupReduceKernel<3, 4 * 4, kSubgroupSize32>{}, target);
+  test(WorkgroupReduceKernel<4, 4 * 4, kSubgroupSize32>{}, target);
+  test(WorkgroupReduceKernel<1, 4 * 4, kSubgroupSize64>{}, target);
+  test(WorkgroupReduceKernel<2, 4 * 4, kSubgroupSize64>{}, target);
+  test(WorkgroupReduceKernel<3, 4 * 4, kSubgroupSize64>{}, target);
+  test(WorkgroupReduceKernel<4, 4 * 4, kSubgroupSize64>{}, target);
   return 0;
 }

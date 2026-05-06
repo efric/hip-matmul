@@ -9,8 +9,14 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cmath>
+#include <cstddef>
 #include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <random>
+#include <string>
 #include <vector>
 
 inline void hip_check_impl(hipError_t hip_error_code, const char *condstr,
@@ -33,7 +39,7 @@ struct MNKShape {
   int M, N, K;
 };
 
-enum class Type { SI8, SI16, SI32, FP16, FP32 };
+enum class Type { SI8, SI16, SI32, FP8, FP16, FP32 };
 
 inline const char *str(Type t) {
   switch (t) {
@@ -43,6 +49,8 @@ inline const char *str(Type t) {
     return "si16";
   case Type::SI32:
     return "si32";
+  case Type::FP8:
+    return "fp8";
   case Type::FP16:
     return "fp16";
   case Type::FP32:
@@ -58,6 +66,8 @@ inline __device__ __host__ int type_size(Type t) {
     return 2;
   case Type::SI32:
     return 4;
+  case Type::FP8:
+    return 1;
   case Type::FP16:
     return 2;
   case Type::FP32:
@@ -74,6 +84,9 @@ template <> struct CTypeImpl<Type::SI16> {
 };
 template <> struct CTypeImpl<Type::SI32> {
   using type = int32_t;
+};
+template <> struct CTypeImpl<Type::FP8> {
+  using type = uint8_t;
 };
 template <> struct CTypeImpl<Type::FP16> {
   using type = _Float16;
@@ -102,8 +115,30 @@ void fillRandomBuffer(int size, std::minstd_rand &r, void *out_buffer) {
     // accumulators are in [-4K, +4K] for accumulation depth K so they're
     // exactly representable, float rounding is exact and we don't need
     // fuzzy compares.
-    out_buffer_typed[i] = static_cast<T>(static_cast<int>((r() % 5)) - 2);
+    if constexpr (type == Type::FP8) {
+      // OCP E4M3 encodings for {-2, -1, 0, 1, 2}. gfx942 uses FNUZ FP8
+      // encodings instead, so this data path must remain target-gated away
+      // from gfx942 FP8 kernels.
+      constexpr uint8_t fp8_values[] = {0xc0, 0xb8, 0x00, 0x38, 0x40};
+      out_buffer_typed[i] = fp8_values[r() % 5];
+    } else {
+      out_buffer_typed[i] = static_cast<T>(static_cast<int>((r() % 5)) - 2);
+    }
   }
+}
+
+inline float ocp_e4m3_fp8_to_float(uint8_t value) {
+  const int sign = (value & 0x80) ? -1 : 1;
+  const int exponent = (value >> 3) & 0xf;
+  const int mantissa = value & 0x7;
+  if (exponent == 0xf && mantissa == 0x7) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  if (exponent == 0) {
+    return sign * std::ldexp(static_cast<float>(mantissa) / 8.0f, -6);
+  }
+  return sign * std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f,
+                           exponent - 7);
 }
 
 inline std::vector<std::byte> makeRandomBuffer(Type type, int size,
@@ -116,6 +151,8 @@ inline std::vector<std::byte> makeRandomBuffer(Type type, int size,
     fillRandomBuffer<Type::SI16>(size, r, result.data());
   } else if (type == Type::SI32) {
     fillRandomBuffer<Type::SI32>(size, r, result.data());
+  } else if (type == Type::FP8) {
+    fillRandomBuffer<Type::FP8>(size, r, result.data());
   } else if (type == Type::FP16) {
     fillRandomBuffer<Type::FP16>(size, r, result.data());
   } else if (type == Type::FP32) {
