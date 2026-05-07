@@ -182,9 +182,66 @@ template <> float referenceValue<Type::FP8>(CType<Type::FP8> value) {
   return ocp_e4m3_fp8_to_float(value);
 }
 
+struct NumericalErrorLocation {
+  int m_outer = 0;
+  int n_outer = 0;
+  int m_tile = 0;
+  int n_tile = 0;
+  int global_m = 0;
+  int global_n = 0;
+};
+
+struct NumericalCheckResult {
+  uint64_t num_errors = 0;
+  double worst_abs_diff = 0.0;
+  double worst_actual = 0.0;
+  double worst_expected = 0.0;
+  NumericalErrorLocation worst_location;
+  ProblemProperties worst_problem = {};
+
+  void record(double actual, double expected,
+              const NumericalErrorLocation &location,
+              const ProblemProperties &problem) {
+    double abs_diff = std::abs(actual - expected);
+    ++num_errors;
+    if (abs_diff > worst_abs_diff || num_errors == 1) {
+      worst_abs_diff = abs_diff;
+      worst_actual = actual;
+      worst_expected = expected;
+      worst_location = location;
+      worst_problem = problem;
+    }
+  }
+};
+
+struct KernelNumericalCheckSummary {
+  const char *name = nullptr;
+  Type A_type = Type::FP32;
+  Type B_type = Type::FP32;
+  Type C_type = Type::FP32;
+  int M_tile = 0;
+  int N_tile = 0;
+  int K_tile = 0;
+  int subgroup_size = 0;
+  NumericalCheckResult result;
+};
+
+std::vector<KernelNumericalCheckSummary> numerical_check_summaries;
+
+bool isDuplicatePrefixValue(const int *values, int index) {
+  for (int i = 0; i < index; ++i) {
+    if (values[i] == values[index]) {
+      return true;
+    }
+  }
+  return false;
+}
+
 template <Type A_type, Type B_type, Type C_type>
-void checkMatvecResults(const void *A_data_void, const void *B_data_void,
-                        const void *C_data_void, const ProblemProperties &problem) {
+NumericalCheckResult
+checkMatvecResults(const void *A_data_void, const void *B_data_void,
+                   const void *C_data_void, const ProblemProperties &problem) {
+  NumericalCheckResult result;
   if (getIntEnvVar("DEBUG", 0)) {
     fprintf(stderr, "Checking matvec result\n");
     print(problem);
@@ -197,8 +254,18 @@ void checkMatvecResults(const void *A_data_void, const void *B_data_void,
   const TC *C_data = static_cast<const TC *>(C_data_void);
   // This reference code is slow. To make the checks not too slow on
   // large matmuls, we only check the 9 corner/middle tiles.
-  for (int m_outer : {0, problem.outer.M / 2, problem.outer.M - 1}) {
-    for (int n_outer : {0, problem.outer.N / 2, problem.outer.N - 1}) {
+  int m_outer_values[] = {0, problem.outer.M / 2, problem.outer.M - 1};
+  int n_outer_values[] = {0, problem.outer.N / 2, problem.outer.N - 1};
+  for (int m_outer_index = 0; m_outer_index < 3; ++m_outer_index) {
+    if (isDuplicatePrefixValue(m_outer_values, m_outer_index)) {
+      continue;
+    }
+    int m_outer = m_outer_values[m_outer_index];
+    for (int n_outer_index = 0; n_outer_index < 3; ++n_outer_index) {
+      if (isDuplicatePrefixValue(n_outer_values, n_outer_index)) {
+        continue;
+      }
+      int n_outer = n_outer_values[n_outer_index];
       for (int m_tile = 0; m_tile < problem.tile.M; ++m_tile) {
         for (int n_tile = 0; n_tile < problem.tile.N; ++n_tile) {
           int global_m = m_outer * problem.tile.M + m_tile;
@@ -222,29 +289,27 @@ void checkMatvecResults(const void *A_data_void, const void *B_data_void,
           TC expected = c;
           TC actual = C_data[global_m * problem.total.N + global_n];
           if (actual != expected) {
-            fprintf(stderr,
-                    "matmul numerical error: actual(%g) != "
-                    "expected(%g), at m_outer=%d n_outer=%d m_tile=%d "
-                    "n_tile=%d, at %s:%d. Note: outer MxNxK = %dx%dx%d\n",
-                    static_cast<float>(actual), static_cast<float>(expected),
-                    m_outer, n_outer, m_tile, n_tile, __FILE__, __LINE__,
-                    problem.outer.M, problem.outer.N, problem.outer.K);
-            abort();
+            double actual_double = static_cast<double>(actual);
+            double expected_double = static_cast<double>(expected);
+            NumericalErrorLocation location = {
+                m_outer, n_outer, m_tile, n_tile, global_m, global_n};
+            result.record(actual_double, expected_double, location, problem);
           }
         }
       }
     }
   }
+  return result;
 }
 
-void checkMatvecResults(Type A_type, Type B_type, Type C_type,
-                        const void *A_data_void, const void *B_data_void,
-                        const void *C_data_void, const ProblemProperties &problem) {
+NumericalCheckResult
+checkMatvecResults(Type A_type, Type B_type, Type C_type,
+                   const void *A_data_void, const void *B_data_void,
+                   const void *C_data_void, const ProblemProperties &problem) {
 #define HANDLE_CASE(A, B, C)                                                   \
   if (A_type == Type::A && B_type == Type::B && C_type == Type::C) {           \
-    checkMatvecResults<Type::A, Type::B, Type::C>(A_data_void, B_data_void,    \
-                                                  C_data_void, problem);       \
-    return;                                                                    \
+    return checkMatvecResults<Type::A, Type::B, Type::C>(                      \
+        A_data_void, B_data_void, C_data_void, problem);                       \
   }
   HANDLE_CASE(FP32, FP32, FP32)
   HANDLE_CASE(FP8, FP8, FP32)
@@ -254,10 +319,12 @@ void checkMatvecResults(Type A_type, Type B_type, Type C_type,
 #undef HANDLE_CASE
 
   fprintf(stderr, "%s:%d: unhandled types\n", __FILE__, __LINE__);
-  abort();
+  NumericalCheckResult result;
+  return result;
 }
 
-void check(const MatvecKernel &kernel, const ProblemProperties &problem) {
+NumericalCheckResult check(const MatvecKernel &kernel,
+                           const ProblemProperties &problem) {
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
       makeRandomBuffer(kernel.A_type, flat_a_size(problem), random_engine);
@@ -297,17 +364,19 @@ void check(const MatvecKernel &kernel, const ProblemProperties &problem) {
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_host_data.size(),
                       hipMemcpyDeviceToHost));
-  checkMatvecResults(kernel.A_type, kernel.B_type, kernel.C_type,
-                     A_host_data.data(), B_host_data.data(), C_host_data.data(),
-                     problem);
+  NumericalCheckResult result =
+      checkMatvecResults(kernel.A_type, kernel.B_type, kernel.C_type,
+                         A_host_data.data(), B_host_data.data(),
+                         C_host_data.data(), problem);
 
   HIP_CHECK(hipFree(A_device_buffer));
   HIP_CHECK(hipFree(B_device_buffer));
   HIP_CHECK(hipFree(C_device_buffer));
+  return result;
 }
 
-void check(const MatvecKernel &kernel) {
-  check(kernel, getCheckProblemSize(kernel));
+NumericalCheckResult check(const MatvecKernel &kernel) {
+  return check(kernel, getCheckProblemSize(kernel));
 }
 
 void benchmark(const MatvecKernel &kernel, MNKShape total) {
@@ -1134,7 +1203,11 @@ void test(const MatvecKernel &kernel) {
   std::printf("\n");
 
   if (!getenv("SKIP_CHECK")) {
-    check(kernel);
+    NumericalCheckResult result = check(kernel);
+    numerical_check_summaries.push_back(
+        {kernel.name, kernel.A_type, kernel.B_type, kernel.C_type,
+         kernel.M_tile, kernel.N_tile, kernel.K_tile, kernel.subgroup_size,
+         result});
   }
 
   MNKShape test_shapes[] = {
@@ -1184,6 +1257,59 @@ void testWorkgroupReduceKernels() {
   test(WorkgroupReduceKernel<4, 4 * 4, T_SubgroupSize>{});
 }
 
+void printNumericalCheckSummary() {
+  std::printf("\nNumerical check summary:\n");
+  if (numerical_check_summaries.empty()) {
+    std::printf("  No numerical checks were run.\n");
+    return;
+  }
+
+  uint64_t total_errors = 0;
+  uint64_t failed_kernels = 0;
+  for (const KernelNumericalCheckSummary &summary :
+       numerical_check_summaries) {
+    total_errors += summary.result.num_errors;
+    failed_kernels += summary.result.num_errors != 0;
+  }
+  if (total_errors == 0) {
+    std::printf("  No numerical errors across %zu checked kernels.\n",
+                numerical_check_summaries.size());
+    return;
+  }
+
+  std::printf("  %llu numerical errors across %llu failing kernels.\n",
+              static_cast<unsigned long long>(total_errors),
+              static_cast<unsigned long long>(failed_kernels));
+  for (const KernelNumericalCheckSummary &summary :
+       numerical_check_summaries) {
+    const NumericalCheckResult &result = summary.result;
+    if (result.num_errors == 0) {
+      continue;
+    }
+    const NumericalErrorLocation &location = result.worst_location;
+    const ProblemProperties &problem = result.worst_problem;
+    std::printf("  %s: A:%s, B:%s, C:%s, tile MxNxK=%dx%dx%d",
+                summary.name, str(summary.A_type), str(summary.B_type),
+                str(summary.C_type), summary.M_tile, summary.N_tile,
+                summary.K_tile);
+    if (summary.subgroup_size != 0) {
+      std::printf(", subgroup=%d", summary.subgroup_size);
+    }
+    std::printf("\n");
+    std::printf(
+        "    errors=%llu, worst_abs_diff=%.9g, actual=%.9g, expected=%.9g\n",
+        static_cast<unsigned long long>(result.num_errors),
+        result.worst_abs_diff, result.worst_actual, result.worst_expected);
+    std::printf(
+        "    worst at global_m=%d global_n=%d, m_outer=%d n_outer=%d "
+        "m_tile=%d n_tile=%d, total MxNxK=%dx%dx%d, outer MxNxK=%dx%dx%d\n",
+        location.global_m, location.global_n, location.m_outer,
+        location.n_outer, location.m_tile, location.n_tile, problem.total.M,
+        problem.total.N, problem.total.K, problem.outer.M, problem.outer.N,
+        problem.outer.K);
+  }
+}
+
 int main(int argc, char **argv) {
   if (argc != 1) {
     fprintf(stderr, "usage: %s\n", argv[0]);
@@ -1215,6 +1341,9 @@ int main(int argc, char **argv) {
       testF16F16DotKernels<kSubgroupSize64>();
     }
     testWorkgroupReduceKernels<kSubgroupSize64>();
+  }
+  if (!getenv("SKIP_CHECK")) {
+    printNumericalCheckSummary();
   }
   return 0;
 }
