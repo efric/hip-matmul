@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +17,14 @@
 #include <random>
 #include <type_traits>
 #include <vector>
+
+#ifndef __has_builtin
+#define __has_builtin(x) 0
+#endif
+
+#if defined(__FAST_MATH__)
+#error "Signed-zero checks must not be compiled with -ffast-math."
+#endif
 
 // Device function that implements a matrix vector multiplication over data in
 // the 'global' layout. This is not intended to work with data tiling.
@@ -146,13 +156,13 @@ struct MatvecKernel {
   num_threads_func_t num_threads_func; // Number of threads that the kernel
                                        // requires running on.
   shared_mem_bytes_func_t
-      shared_mem_bytes_func;      // Amount of shared memory per workgroup.
+      shared_mem_bytes_func; // Amount of shared memory per workgroup.
   matvec_func_t matvec_func; // Device kernel pointer.
   int subgroup_size = 0;     // Zero means the kernel is not subgroup-shaped.
 };
 
 ProblemProperties getBenchmarkProblemSize(const MatvecKernel &kernel,
-                                    MNKShape total) {
+                                          MNKShape total) {
   ProblemProperties problem_size = {};
   problem_size.A_type = kernel.A_type;
   problem_size.B_type = kernel.B_type;
@@ -460,7 +470,7 @@ void benchmark(const MatvecKernel &kernel, MNKShape total) {
   float kernel_bytes_read_per_s = 1000.f * kernel_bytes_read / kernel_ms;
   std::printf(
       "\tRead %.4g TB/s, %.4g Tflop/s, latency %.2g ms, iterations=%d\n",
-      1.e-12f * kernel_ops_per_s, 1e-12f * kernel_bytes_read_per_s, kernel_ms,
+      1.e-12f * kernel_bytes_read_per_s, 1e-12f * kernel_ops_per_s, kernel_ms,
       iterations);
 }
 
@@ -544,8 +554,6 @@ __device__ static _Float16 subgroup_reduce(_Float16 value) {
   return static_cast<_Float16>(reduced);
 }
 
-template <Type A_type, Type B_type, Type C_type> struct AmdDotTraits;
-
 using f16x2 = _Float16 __attribute__((ext_vector_type(2)));
 using f32x2 = float __attribute__((ext_vector_type(2)));
 
@@ -586,6 +594,13 @@ __device__ static uint32_t f16x2ToBits(f16x2 value) {
          (static_cast<uint32_t>(f16ToBits(value[1])) << 16);
 }
 
+static constexpr uint16_t kF16NegZeroBits = 0x8000u;
+static constexpr uint16_t kF16PosOneBits = 0x3c00u;
+static constexpr uint32_t kF32NegZeroBits = 0x80000000u;
+static constexpr uint32_t kF32PosOneBits = 0x3f800000u;
+static constexpr uint8_t kFp8NegZeroBits = 0x80u;
+static constexpr uint8_t kFp8PosOneBits = 0x38u;
+
 enum SignedZeroCheckIndex {
   kF16F16ToF32DotSignedZero = 0,
   kF16F16ToF16DotSignedZero = 1,
@@ -595,111 +610,380 @@ enum SignedZeroCheckIndex {
   kF32F32ToF32PackedFmaSignedZeroLow = 5,
   kF32F32ToF32PackedFmaSignedZeroHigh = 6,
   kFp8Fp8ToF32DotSignedZero = 7,
-  kNumSignedZeroChecks = 8,
+
+  // These validate the same dot wrappers used by AmdDotReduceKernel plus the
+  // subgroup reduction path. They are kept separate from the instruction-level
+  // dot checks so tail/padding behavior in a benchmark kernel cannot change the
+  // instruction oracle.
+  kF16F16ToF32DotReduceSignedZero = 8,
+  kF16F16ToF16DotReduceSignedZero = 9,
+  kFp8Fp8ToF32DotReduceSignedZero = 10,
+
+  kNumSignedZeroChecks = 11,
 };
 
-enum SignedZeroInputIndex {
-  kInputF16A0 = 0,
-  kInputF16A1 = 1,
-  kInputF16B0 = 2,
-  kInputF16B1 = 3,
-  kInputF16C0 = 4,
-  kInputF16C1 = 5,
-  kInputF32A0 = 6,
-  kInputF32A1 = 7,
-  kInputF32B0 = 8,
-  kInputF32B1 = 9,
-  kInputF32C0 = 10,
-  kInputF32C1 = 11,
-  kInputF16ScalarA = 12,
-  kInputF16ScalarB = 13,
-  kInputF16ScalarC = 14,
-  kInputF32ScalarA = 15,
-  kInputF32ScalarB = 16,
-  kInputF32ScalarC = 17,
-  kInputFp8A0 = 18,
-  kInputFp8A1 = 19,
-  kInputFp8A2 = 20,
-  kInputFp8A3 = 21,
-  kInputFp8B0 = 22,
-  kInputFp8B1 = 23,
-  kInputFp8B2 = 24,
-  kInputFp8B3 = 25,
-  kNumSignedZeroInputs = 26,
+static_assert(kNumSignedZeroChecks <= 32,
+              "Signed-zero run mask assumes at most 32 checks");
+
+struct SignedZeroInputs {
+  uint32_t f16_a[2];
+  uint32_t f16_b[2];
+  uint32_t f16_c[2];
+
+  uint32_t f32_a[2];
+  uint32_t f32_b[2];
+  uint32_t f32_c[2];
+
+  uint32_t f16_scalar_a;
+  uint32_t f16_scalar_b;
+  uint32_t f16_scalar_c;
+
+  uint32_t f32_scalar_a;
+  uint32_t f32_scalar_b;
+  uint32_t f32_scalar_c;
+
+  uint32_t fp8_a[4];
+  uint32_t fp8_b[4];
 };
 
-__global__ static void checkSignedZeroKernel(const uint32_t *input_bits,
-                                             uint32_t *output_bits) {
-  for (int i = 0; i < kNumSignedZeroChecks; ++i) {
-    output_bits[i] = 0xffffffffu;
-  }
+template <Type A_type, Type B_type, Type C_type> struct AmdDotTraits;
 
-  const f16x2 f16_a = {
-      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16A0])),
-      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16A1]))};
-  const f16x2 f16_b = {
-      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16B0])),
-      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16B1]))};
-  if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2_f16_f16)) {
-    const _Float16 c =
-        f16FromBits(static_cast<uint16_t>(input_bits[kInputF16C0]));
-    output_bits[kF16F16ToF16DotSignedZero] =
-        f16ToBits(__builtin_amdgcn_fdot2_f16_f16(f16_a, f16_b, c));
-  }
+template <> struct AmdDotTraits<Type::FP16, Type::FP16, Type::FP32> {
+  using TA = CType<Type::FP16>;
+  using TB = CType<Type::FP16>;
+  using TC = CType<Type::FP32>;
+  static constexpr int kElementsPerDot = 2;
 
-  const _Float16 f16_scalar_a =
-      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16ScalarA]));
-  const _Float16 f16_scalar_b =
-      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16ScalarB]));
-  const _Float16 f16_scalar_c =
-      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16ScalarC]));
-  output_bits[kF16F16ToF16ScalarFmaSignedZero] =
-      f16ToBits(__builtin_elementwise_fma(f16_scalar_a, f16_scalar_b,
-                                          f16_scalar_c));
-
-  const f16x2 f16_c = {
-      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16C0])),
-      f16FromBits(static_cast<uint16_t>(input_bits[kInputF16C1]))};
-  output_bits[kF16F16ToF16PackedFmaSignedZero] =
-      f16x2ToBits(__builtin_elementwise_fma(f16_a, f16_b, f16_c));
-
-  const f32x2 f32_a = {f32FromBits(input_bits[kInputF32A0]),
-                       f32FromBits(input_bits[kInputF32A1])};
-  const f32x2 f32_b = {f32FromBits(input_bits[kInputF32B0]),
-                       f32FromBits(input_bits[kInputF32B1])};
-  const f32x2 f32_c = {f32FromBits(input_bits[kInputF32C0]),
-                       f32FromBits(input_bits[kInputF32C1])};
-  const float f32_scalar_a = f32FromBits(input_bits[kInputF32ScalarA]);
-  const float f32_scalar_b = f32FromBits(input_bits[kInputF32ScalarB]);
-  const float f32_scalar_c = f32FromBits(input_bits[kInputF32ScalarC]);
-  output_bits[kF32F32ToF32ScalarFmaSignedZero] =
-      f32ToBits(__builtin_elementwise_fma(f32_scalar_a, f32_scalar_b,
-                                          f32_scalar_c));
-
-  const f32x2 f32_packed_fma =
-      __builtin_elementwise_fma(f32_a, f32_b, f32_c);
-  output_bits[kF32F32ToF32PackedFmaSignedZeroLow] =
-      f32ToBits(f32_packed_fma[0]);
-  output_bits[kF32F32ToF32PackedFmaSignedZeroHigh] =
-      f32ToBits(f32_packed_fma[1]);
-
-  if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2)) {
-    const float c = f32FromBits(input_bits[kInputF32C0]);
-    output_bits[kF16F16ToF32DotSignedZero] =
-        f32ToBits(__builtin_amdgcn_fdot2(f16_a, f16_b, c, false));
-  }
-
-#if defined(__gfx1200__) || defined(__gfx1201__)
-  auto pack4_u8 = [](const uint32_t *values) {
-    return (values[0] & 0xffu) | ((values[1] & 0xffu) << 8) |
-           ((values[2] & 0xffu) << 16) | ((values[3] & 0xffu) << 24);
-  };
-  const float c = f32FromBits(input_bits[kInputF32C0]);
-  output_bits[kFp8Fp8ToF32DotSignedZero] = f32ToBits(
-      __builtin_amdgcn_dot4_f32_fp8_fp8(pack4_u8(&input_bits[kInputFp8A0]),
-                                        pack4_u8(&input_bits[kInputFp8B0]),
-                                        c));
+  // Keep the AMDGPU builtin directly guarded by
+  // __builtin_amdgcn_is_invocable. Clang diagnoses hiding that predicate behind
+  // a helper that merely returns bool because that no longer effectively guards
+  // target-dependent builtin use.
+  __device__ static bool tryDot(const TA *a, const TB *b, TC c, TC *result) {
+#if __has_builtin(__builtin_amdgcn_fdot2)
+    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2)) {
+      const f16x2 a_vec = {a[0], a[1]};
+      const f16x2 b_vec = {b[0], b[1]};
+      *result = __builtin_amdgcn_fdot2(a_vec, b_vec, c, false);
+      return true;
+    }
 #endif
+    (void)a;
+    (void)b;
+    (void)c;
+    (void)result;
+    return false;
+  }
+
+  __device__ static TC dot(const TA *a, const TB *b, TC c) {
+    TC result = c;
+    if (tryDot(a, b, c, &result)) {
+      return result;
+    }
+    __builtin_trap();
+    return result;
+  }
+
+  __device__ static uint32_t bits(TC value) { return f32ToBits(value); }
+};
+
+template <> struct AmdDotTraits<Type::FP16, Type::FP16, Type::FP16> {
+  using TA = CType<Type::FP16>;
+  using TB = CType<Type::FP16>;
+  using TC = CType<Type::FP16>;
+  static constexpr int kElementsPerDot = 2;
+
+  // See the f16->f32 specialization for why this is a tryDot helper rather
+  // than an isInvocable() helper returning bool.
+  __device__ static bool tryDot(const TA *a, const TB *b, TC c, TC *result) {
+#if __has_builtin(__builtin_amdgcn_fdot2_f16_f16)
+    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2_f16_f16)) {
+      const f16x2 a_vec = {a[0], a[1]};
+      const f16x2 b_vec = {b[0], b[1]};
+      *result = __builtin_amdgcn_fdot2_f16_f16(a_vec, b_vec, c);
+      return true;
+    }
+#endif
+    (void)a;
+    (void)b;
+    (void)c;
+    (void)result;
+    return false;
+  }
+
+  __device__ static TC dot(const TA *a, const TB *b, TC c) {
+    TC result = c;
+    if (tryDot(a, b, c, &result)) {
+      return result;
+    }
+    __builtin_trap();
+    return result;
+  }
+
+  __device__ static uint32_t bits(TC value) {
+    return static_cast<uint32_t>(f16ToBits(value));
+  }
+};
+
+template <> struct AmdDotTraits<Type::FP8, Type::FP8, Type::FP32> {
+  using TA = CType<Type::FP8>;
+  using TB = CType<Type::FP8>;
+  using TC = CType<Type::FP32>;
+  static constexpr int kElementsPerDot = 4;
+
+  static_assert(sizeof(TA) == 1, "FP8 dot expects 8-bit A elements");
+  static_assert(sizeof(TB) == 1, "FP8 dot expects 8-bit B elements");
+
+  __device__ static uint32_t pack4(const TA *values) {
+    return static_cast<uint32_t>(values[0]) |
+           (static_cast<uint32_t>(values[1]) << 8) |
+           (static_cast<uint32_t>(values[2]) << 16) |
+           (static_cast<uint32_t>(values[3]) << 24);
+  }
+
+  // See the f16->f32 specialization for why this is a tryDot helper rather
+  // than an isInvocable() helper returning bool.
+  __device__ static bool tryDot(const TA *a, const TB *b, TC c, TC *result) {
+#if __has_builtin(__builtin_amdgcn_dot4_f32_fp8_fp8)
+    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_dot4_f32_fp8_fp8)) {
+      *result = __builtin_amdgcn_dot4_f32_fp8_fp8(pack4(a), pack4(b), c);
+      return true;
+    }
+#endif
+    (void)a;
+    (void)b;
+    (void)c;
+    (void)result;
+    return false;
+  }
+
+  __device__ static TC dot(const TA *a, const TB *b, TC c) {
+    TC result = c;
+    if (tryDot(a, b, c, &result)) {
+      return result;
+    }
+    __builtin_trap();
+    return result;
+  }
+
+  __device__ static uint32_t bits(TC value) { return f32ToBits(value); }
+};
+
+__device__ static void recordSignedZeroResult(uint32_t *output_bits,
+                                              uint32_t &ran_mask,
+                                              SignedZeroCheckIndex index,
+                                              uint32_t bits) {
+  output_bits[static_cast<int>(index)] = bits;
+  ran_mask |= 1u << static_cast<unsigned>(index);
+}
+
+__global__ static void checkSignedZeroKernel(const SignedZeroInputs *input,
+                                             uint32_t *output_bits,
+                                             uint32_t *ran_mask_out) {
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0) {
+    return;
+  }
+
+  for (int i = 0; i < kNumSignedZeroChecks; ++i) {
+    output_bits[i] = 0;
+  }
+
+  uint32_t ran_mask = 0;
+
+  // fdot2 f16*f16 -> f32:
+  //   (-0 * +1) + (-0 * +1) + (-0) == -0
+  {
+    using Dot = AmdDotTraits<Type::FP16, Type::FP16, Type::FP32>;
+    Dot::TA a[2] = {
+        f16FromBits(static_cast<uint16_t>(input->f16_a[0])),
+        f16FromBits(static_cast<uint16_t>(input->f16_a[1])),
+    };
+    Dot::TB b[2] = {
+        f16FromBits(static_cast<uint16_t>(input->f16_b[0])),
+        f16FromBits(static_cast<uint16_t>(input->f16_b[1])),
+    };
+    Dot::TC c = f32FromBits(input->f32_c[0]);
+    Dot::TC result = c;
+    if (Dot::tryDot(a, b, c, &result)) {
+      recordSignedZeroResult(output_bits, ran_mask,
+                             kF16F16ToF32DotSignedZero, Dot::bits(result));
+    }
+  }
+
+  // fdot2 f16*f16 -> f16:
+  //   (-0 * +1) + (-0 * +1) + (-0) == -0
+  {
+    using Dot = AmdDotTraits<Type::FP16, Type::FP16, Type::FP16>;
+    Dot::TA a[2] = {
+        f16FromBits(static_cast<uint16_t>(input->f16_a[0])),
+        f16FromBits(static_cast<uint16_t>(input->f16_a[1])),
+    };
+    Dot::TB b[2] = {
+        f16FromBits(static_cast<uint16_t>(input->f16_b[0])),
+        f16FromBits(static_cast<uint16_t>(input->f16_b[1])),
+    };
+    Dot::TC c = f16FromBits(static_cast<uint16_t>(input->f16_c[0]));
+    Dot::TC result = c;
+    if (Dot::tryDot(a, b, c, &result)) {
+      recordSignedZeroResult(output_bits, ran_mask,
+                             kF16F16ToF16DotSignedZero, Dot::bits(result));
+    }
+  }
+
+  // Scalar f16 FMA:
+  //   (-0 * +1) + (-0) == -0
+  {
+    const _Float16 a =
+        f16FromBits(static_cast<uint16_t>(input->f16_scalar_a));
+    const _Float16 b =
+        f16FromBits(static_cast<uint16_t>(input->f16_scalar_b));
+    const _Float16 c =
+        f16FromBits(static_cast<uint16_t>(input->f16_scalar_c));
+    recordSignedZeroResult(
+        output_bits, ran_mask, kF16F16ToF16ScalarFmaSignedZero,
+        static_cast<uint32_t>(f16ToBits(__builtin_elementwise_fma(a, b, c))));
+  }
+
+  // Scalar f32 FMA:
+  //   (-0 * +1) + (-0) == -0
+  {
+    const float a = f32FromBits(input->f32_scalar_a);
+    const float b = f32FromBits(input->f32_scalar_b);
+    const float c = f32FromBits(input->f32_scalar_c);
+    recordSignedZeroResult(output_bits, ran_mask,
+                           kF32F32ToF32ScalarFmaSignedZero,
+                           f32ToBits(__builtin_elementwise_fma(a, b, c)));
+  }
+
+  // Packed f16 FMA, both lanes:
+  //   {-0, -0} * {+1, +1} + {-0, -0} == {-0, -0}
+  {
+    const f16x2 a = {
+        f16FromBits(static_cast<uint16_t>(input->f16_a[0])),
+        f16FromBits(static_cast<uint16_t>(input->f16_a[1])),
+    };
+    const f16x2 b = {
+        f16FromBits(static_cast<uint16_t>(input->f16_b[0])),
+        f16FromBits(static_cast<uint16_t>(input->f16_b[1])),
+    };
+    const f16x2 c = {
+        f16FromBits(static_cast<uint16_t>(input->f16_c[0])),
+        f16FromBits(static_cast<uint16_t>(input->f16_c[1])),
+    };
+    recordSignedZeroResult(output_bits, ran_mask,
+                           kF16F16ToF16PackedFmaSignedZero,
+                           f16x2ToBits(__builtin_elementwise_fma(a, b, c)));
+  }
+
+  // Vector f32 FMA, both lanes:
+  //   {-0, -0} * {+1, +1} + {-0, -0} == {-0, -0}
+  {
+    const f32x2 a = {
+        f32FromBits(input->f32_a[0]),
+        f32FromBits(input->f32_a[1]),
+    };
+    const f32x2 b = {
+        f32FromBits(input->f32_b[0]),
+        f32FromBits(input->f32_b[1]),
+    };
+    const f32x2 c = {
+        f32FromBits(input->f32_c[0]),
+        f32FromBits(input->f32_c[1]),
+    };
+    const f32x2 result = __builtin_elementwise_fma(a, b, c);
+    recordSignedZeroResult(output_bits, ran_mask,
+                           kF32F32ToF32PackedFmaSignedZeroLow,
+                           f32ToBits(result[0]));
+    recordSignedZeroResult(output_bits, ran_mask,
+                           kF32F32ToF32PackedFmaSignedZeroHigh,
+                           f32ToBits(result[1]));
+  }
+
+  // dot4 fp8*fp8 -> f32:
+  //   four copies of (-0 * +1), plus c=-0, should still be -0.
+  {
+    using Dot = AmdDotTraits<Type::FP8, Type::FP8, Type::FP32>;
+    Dot::TA a[4] = {
+        static_cast<Dot::TA>(input->fp8_a[0] & 0xffu),
+        static_cast<Dot::TA>(input->fp8_a[1] & 0xffu),
+        static_cast<Dot::TA>(input->fp8_a[2] & 0xffu),
+        static_cast<Dot::TA>(input->fp8_a[3] & 0xffu),
+    };
+    Dot::TB b[4] = {
+        static_cast<Dot::TB>(input->fp8_b[0] & 0xffu),
+        static_cast<Dot::TB>(input->fp8_b[1] & 0xffu),
+        static_cast<Dot::TB>(input->fp8_b[2] & 0xffu),
+        static_cast<Dot::TB>(input->fp8_b[3] & 0xffu),
+    };
+    Dot::TC c = f32FromBits(input->f32_c[0]);
+    Dot::TC result = c;
+    if (Dot::tryDot(a, b, c, &result)) {
+      recordSignedZeroResult(output_bits, ran_mask,
+                             kFp8Fp8ToF32DotSignedZero, Dot::bits(result));
+    }
+  }
+
+  *ran_mask_out = ran_mask;
+}
+
+template <int T_SubgroupSize, Type T_A_type, Type T_B_type, Type T_C_type>
+__global__ static void
+checkDotReduceSignedZeroKernel(const SignedZeroInputs *input,
+                               uint32_t *output_bits,
+                               uint32_t *ran_mask_out,
+                               SignedZeroCheckIndex output_index) {
+  using Dot = AmdDotTraits<T_A_type, T_B_type, T_C_type>;
+  using TA = typename Dot::TA;
+  using TB = typename Dot::TB;
+  using TC = typename Dot::TC;
+
+  if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+      threadIdx.y != 0 || threadIdx.z != 0 ||
+      threadIdx.x >= T_SubgroupSize) {
+    return;
+  }
+
+  TA a[Dot::kElementsPerDot] = {};
+  TB b[Dot::kElementsPerDot] = {};
+
+  if constexpr (T_A_type == Type::FP16 && T_B_type == Type::FP16) {
+    static_assert(Dot::kElementsPerDot == 2);
+    a[0] = f16FromBits(static_cast<uint16_t>(input->f16_a[0]));
+    a[1] = f16FromBits(static_cast<uint16_t>(input->f16_a[1]));
+    b[0] = f16FromBits(static_cast<uint16_t>(input->f16_b[0]));
+    b[1] = f16FromBits(static_cast<uint16_t>(input->f16_b[1]));
+  } else if constexpr (T_A_type == Type::FP8 && T_B_type == Type::FP8) {
+    static_assert(Dot::kElementsPerDot == 4);
+    for (int i = 0; i < 4; ++i) {
+      a[i] = static_cast<TA>(input->fp8_a[i] & 0xffu);
+      b[i] = static_cast<TB>(input->fp8_b[i] & 0xffu);
+    }
+  } else {
+    __builtin_trap();
+  }
+
+  TC c = {};
+  if constexpr (T_C_type == Type::FP16) {
+    c = f16FromBits(static_cast<uint16_t>(input->f16_c[0]));
+  } else if constexpr (T_C_type == Type::FP32) {
+    c = f32FromBits(input->f32_c[0]);
+  } else {
+    __builtin_trap();
+  }
+
+  // Every lane computes -0 so subgroup reduction is not mixing the dot result
+  // with +0 padding lanes. This checks that the wrapper used by
+  // AmdDotReduceKernel can preserve -0 through the reduction path.
+  TC result = c;
+  if (!Dot::tryDot(a, b, c, &result)) {
+    return;
+  }
+  result = subgroup_reduce<T_SubgroupSize>(result);
+
+  if (threadIdx.x == 0) {
+    output_bits[static_cast<int>(output_index)] = Dot::bits(result);
+    *ran_mask_out |= 1u << static_cast<unsigned>(output_index);
+  }
 }
 
 struct SignedZeroCheck {
@@ -709,79 +993,188 @@ struct SignedZeroCheck {
   bool supported;
 };
 
-bool shouldRunSignedZeroCheck(const SignedZeroCheck &check) {
+bool signedZeroFilterMatches(const SignedZeroCheck &check) {
   const char *filter = getenv("FILTER");
-  if (!check.supported) {
-    return false;
-  }
-  if (filter && !strstr(check.name, filter)) {
-    return false;
-  }
-  return true;
+  return !filter || strstr(check.name, filter);
 }
 
-void checkSignedZero(const DeviceCapabilities &device) {
+bool signedZeroRan(uint32_t ran_mask, SignedZeroCheckIndex index) {
+  return (ran_mask & (1u << static_cast<unsigned>(index))) != 0;
+}
+
+bool checkSignedZero(const DeviceCapabilities &device) {
   const SignedZeroCheck checks[] = {
-      {"AmdDotReduceKernel.fdot2_f32_f16_signed_zero",
-       kF16F16ToF32DotSignedZero, 0x80000000u, device.dot.f16_f32},
-      {"AmdDotReduceKernel.fdot2_f16_f16_signed_zero",
-       kF16F16ToF16DotSignedZero, 0x8000u, device.dot.f16_f16},
-      {"v_fma_f16_signed_zero", kF16F16ToF16ScalarFmaSignedZero, 0x8000u,
+      {"amdgcn.fdot2_f32_f16_signed_zero",
+       kF16F16ToF32DotSignedZero, kF32NegZeroBits, device.dot.f16_f32},
+      {"amdgcn.fdot2_f16_f16_signed_zero",
+       kF16F16ToF16DotSignedZero, kF16NegZeroBits, device.dot.f16_f16},
+      {"v_fma_f16_signed_zero",
+       kF16F16ToF16ScalarFmaSignedZero, kF16NegZeroBits,
        device.fma.scalar_f16},
-      {"v_fma_f32_signed_zero", kF32F32ToF32ScalarFmaSignedZero,
-       0x80000000u, device.fma.scalar_f32},
-      {"v_pk_fma_f16_signed_zero", kF16F16ToF16PackedFmaSignedZero,
-       0x80008000u, device.fma.packed_f16},
+      {"v_fma_f32_signed_zero",
+       kF32F32ToF32ScalarFmaSignedZero, kF32NegZeroBits,
+       device.fma.scalar_f32},
+      {"v_pk_fma_f16_signed_zero",
+       kF16F16ToF16PackedFmaSignedZero, 0x80008000u,
+       device.fma.packed_f16},
       {"v_pk_fma_f32_signed_zero.low",
-       kF32F32ToF32PackedFmaSignedZeroLow, 0x80000000u,
+       kF32F32ToF32PackedFmaSignedZeroLow, kF32NegZeroBits,
        device.fma.packed_f32},
       {"v_pk_fma_f32_signed_zero.high",
-       kF32F32ToF32PackedFmaSignedZeroHigh, 0x80000000u,
+       kF32F32ToF32PackedFmaSignedZeroHigh, kF32NegZeroBits,
        device.fma.packed_f32},
-      {"AmdDotReduceKernel.dot4_f32_fp8_fp8_signed_zero",
-       kFp8Fp8ToF32DotSignedZero, 0x80000000u, device.dot.fp8_f32},
+      {"amdgcn.dot4_f32_fp8_fp8_signed_zero",
+       kFp8Fp8ToF32DotSignedZero, kF32NegZeroBits, device.dot.fp8_f32},
+
+      {"AmdDotReduceKernel.fdot2_f32_f16_reduce_path_signed_zero",
+       kF16F16ToF32DotReduceSignedZero, kF32NegZeroBits,
+       device.dot.f16_f32},
+      {"AmdDotReduceKernel.fdot2_f16_f16_reduce_path_signed_zero",
+       kF16F16ToF16DotReduceSignedZero, kF16NegZeroBits,
+       device.dot.f16_f16},
+      {"AmdDotReduceKernel.dot4_f32_fp8_fp8_reduce_path_signed_zero",
+       kFp8Fp8ToF32DotReduceSignedZero, kF32NegZeroBits,
+       device.dot.fp8_f32},
   };
 
   bool should_run = false;
   for (const SignedZeroCheck &check : checks) {
-    should_run |= shouldRunSignedZeroCheck(check);
+    should_run |= check.supported && signedZeroFilterMatches(check);
   }
   if (!should_run) {
-    return;
+    return true;
   }
 
   // f16 LHS = {-0, -0}; f16 RHS = {1, 1}; f16 C = {-0, -0};
   // f32 LHS = {-0, -0}; f32 RHS = {1, 1}; f32 C = {-0, -0};
   // Scalar f16/f32 inputs are the same {-0} * {1} + {-0} case.
   // fp8 LHS = {-0, -0, -0, -0}; fp8 RHS = {1, 1, 1, 1}.
-  const uint32_t input_host[] = {
-      0x8000, 0x8000, 0x3c00, 0x3c00, 0x8000, 0x8000,
-      0x80000000u, 0x80000000u, 0x3f800000u, 0x3f800000u,
-      0x80000000u, 0x80000000u, 0x8000, 0x3c00, 0x8000,
-      0x80000000u, 0x3f800000u, 0x80000000u,
-      0x80, 0x80, 0x80, 0x80, 0x38, 0x38, 0x38, 0x38};
-  static_assert(sizeof(input_host) / sizeof(input_host[0]) ==
-                kNumSignedZeroInputs);
+  const SignedZeroInputs input_host = {
+      /*f16_a=*/{kF16NegZeroBits, kF16NegZeroBits},
+      /*f16_b=*/{kF16PosOneBits, kF16PosOneBits},
+      /*f16_c=*/{kF16NegZeroBits, kF16NegZeroBits},
+
+      /*f32_a=*/{kF32NegZeroBits, kF32NegZeroBits},
+      /*f32_b=*/{kF32PosOneBits, kF32PosOneBits},
+      /*f32_c=*/{kF32NegZeroBits, kF32NegZeroBits},
+
+      /*f16_scalar_a=*/kF16NegZeroBits,
+      /*f16_scalar_b=*/kF16PosOneBits,
+      /*f16_scalar_c=*/kF16NegZeroBits,
+
+      /*f32_scalar_a=*/kF32NegZeroBits,
+      /*f32_scalar_b=*/kF32PosOneBits,
+      /*f32_scalar_c=*/kF32NegZeroBits,
+
+      /*fp8_a=*/{kFp8NegZeroBits, kFp8NegZeroBits, kFp8NegZeroBits,
+                 kFp8NegZeroBits},
+      /*fp8_b=*/{kFp8PosOneBits, kFp8PosOneBits, kFp8PosOneBits,
+                 kFp8PosOneBits},
+  };
+
   uint32_t output_host[kNumSignedZeroChecks] = {};
-  uint32_t *input_device = nullptr;
+  uint32_t ran_mask_host = 0;
+
+  SignedZeroInputs *input_device = nullptr;
   uint32_t *output_device = nullptr;
+  uint32_t *ran_mask_device = nullptr;
+
   HIP_CHECK(hipMalloc(&input_device, sizeof(input_host)));
   HIP_CHECK(hipMalloc(&output_device, sizeof(output_host)));
-  HIP_CHECK(hipMemcpy(input_device, input_host, sizeof(input_host),
+  HIP_CHECK(hipMalloc(&ran_mask_device, sizeof(ran_mask_host)));
+
+  HIP_CHECK(hipMemcpy(input_device, &input_host, sizeof(input_host),
                       hipMemcpyHostToDevice));
-  checkSignedZeroKernel<<<1, 1>>>(input_device, output_device);
+  HIP_CHECK(hipMemset(output_device, 0, sizeof(output_host)));
+  HIP_CHECK(hipMemset(ran_mask_device, 0, sizeof(ran_mask_host)));
+
+  checkSignedZeroKernel<<<1, 1>>>(input_device, output_device,
+                                  ran_mask_device);
   HIP_CHECK(hipGetLastError());
+
+  // Optional reduce-path checks: all lanes execute the same dot(a, b, c=-0),
+  // then reduce. This validates the wrapper and subgroup reduction without
+  // allowing +0 padding lanes to erase the sign.
+  if (device.subgroup_size == kSubgroupSize32) {
+    if (device.dot.f16_f32) {
+      checkDotReduceSignedZeroKernel<kSubgroupSize32, Type::FP16, Type::FP16,
+                                     Type::FP32>
+          <<<1, kSubgroupSize32>>>(
+              input_device, output_device, ran_mask_device,
+              kF16F16ToF32DotReduceSignedZero);
+      HIP_CHECK(hipGetLastError());
+    }
+    if (device.dot.f16_f16) {
+      checkDotReduceSignedZeroKernel<kSubgroupSize32, Type::FP16, Type::FP16,
+                                     Type::FP16>
+          <<<1, kSubgroupSize32>>>(
+              input_device, output_device, ran_mask_device,
+              kF16F16ToF16DotReduceSignedZero);
+      HIP_CHECK(hipGetLastError());
+    }
+    if (device.dot.fp8_f32) {
+      checkDotReduceSignedZeroKernel<kSubgroupSize32, Type::FP8, Type::FP8,
+                                     Type::FP32>
+          <<<1, kSubgroupSize32>>>(
+              input_device, output_device, ran_mask_device,
+              kFp8Fp8ToF32DotReduceSignedZero);
+      HIP_CHECK(hipGetLastError());
+    }
+  } else if (device.subgroup_size == kSubgroupSize64) {
+    if (device.dot.f16_f32) {
+      checkDotReduceSignedZeroKernel<kSubgroupSize64, Type::FP16, Type::FP16,
+                                     Type::FP32>
+          <<<1, kSubgroupSize64>>>(
+              input_device, output_device, ran_mask_device,
+              kF16F16ToF32DotReduceSignedZero);
+      HIP_CHECK(hipGetLastError());
+    }
+    if (device.dot.f16_f16) {
+      checkDotReduceSignedZeroKernel<kSubgroupSize64, Type::FP16, Type::FP16,
+                                     Type::FP16>
+          <<<1, kSubgroupSize64>>>(
+              input_device, output_device, ran_mask_device,
+              kF16F16ToF16DotReduceSignedZero);
+      HIP_CHECK(hipGetLastError());
+    }
+    if (device.dot.fp8_f32) {
+      checkDotReduceSignedZeroKernel<kSubgroupSize64, Type::FP8, Type::FP8,
+                                     Type::FP32>
+          <<<1, kSubgroupSize64>>>(
+              input_device, output_device, ran_mask_device,
+              kFp8Fp8ToF32DotReduceSignedZero);
+      HIP_CHECK(hipGetLastError());
+    }
+  }
+
+  HIP_CHECK(hipDeviceSynchronize());
+
   HIP_CHECK(hipMemcpy(output_host, output_device, sizeof(output_host),
                       hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(&ran_mask_host, ran_mask_device, sizeof(ran_mask_host),
+                      hipMemcpyDeviceToHost));
+
   HIP_CHECK(hipFree(input_device));
   HIP_CHECK(hipFree(output_device));
+  HIP_CHECK(hipFree(ran_mask_device));
 
   bool failed = false;
   for (const SignedZeroCheck &check : checks) {
-    if (!shouldRunSignedZeroCheck(check)) {
+    if (!check.supported || !signedZeroFilterMatches(check)) {
       continue;
     }
-    uint32_t actual_bits = output_host[check.index];
+
+    if (!signedZeroRan(ran_mask_host, check.index)) {
+      fprintf(stderr,
+              "%s: marked supported by host capability table, but the device "
+              "kernel did not mark the builtin/path as invocable. Check "
+              "offload arch, target features, and capability detection.\n",
+              check.name);
+      failed = true;
+      continue;
+    }
+
+    const uint32_t actual_bits = output_host[check.index];
     if (actual_bits != check.expected_bits) {
       fprintf(stderr,
               "%s: expected signed-zero result bits 0x%08x, got 0x%08x\n",
@@ -792,72 +1185,9 @@ void checkSignedZero(const DeviceCapabilities &device) {
                   check.name, actual_bits);
     }
   }
-  if (failed) {
-    fprintf(stderr,
-            "Signed-zero check failed; continuing to run benchmarks.\n");
-  }
+
+  return !failed;
 }
-
-template <> struct AmdDotTraits<Type::FP16, Type::FP16, Type::FP32> {
-  using TA = CType<Type::FP16>;
-  using TB = CType<Type::FP16>;
-  using TC = CType<Type::FP32>;
-  static constexpr int kElementsPerDot = 2;
-
-  __device__ static TC dot(const TA *a, const TB *b, TC c) {
-    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2)) {
-      const f16x2 a_vec = {a[0], a[1]};
-      const f16x2 b_vec = {b[0], b[1]};
-      return __builtin_amdgcn_fdot2(a_vec, b_vec, c, false);
-    }
-    __builtin_trap();
-    return c;
-  }
-};
-
-template <> struct AmdDotTraits<Type::FP16, Type::FP16, Type::FP16> {
-  using TA = CType<Type::FP16>;
-  using TB = CType<Type::FP16>;
-  using TC = CType<Type::FP16>;
-  static constexpr int kElementsPerDot = 2;
-
-  __device__ static TC dot(const TA *a, const TB *b, TC c) {
-    if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_fdot2_f16_f16)) {
-      const f16x2 a_vec = {a[0], a[1]};
-      const f16x2 b_vec = {b[0], b[1]};
-      return __builtin_amdgcn_fdot2_f16_f16(a_vec, b_vec, c);
-    }
-    __builtin_trap();
-    return c;
-  }
-};
-
-template <> struct AmdDotTraits<Type::FP8, Type::FP8, Type::FP32> {
-  using TA = CType<Type::FP8>;
-  using TB = CType<Type::FP8>;
-  using TC = CType<Type::FP32>;
-  static constexpr int kElementsPerDot = 4;
-
-  __device__ static uint32_t pack4(const uint8_t *values) {
-    return static_cast<uint32_t>(values[0]) |
-           (static_cast<uint32_t>(values[1]) << 8) |
-           (static_cast<uint32_t>(values[2]) << 16) |
-           (static_cast<uint32_t>(values[3]) << 24);
-  }
-
-  __device__ static TC dot(const TA *a, const TB *b, TC c) {
-#if defined(__gfx1200__) || defined(__gfx1201__)
-    return __builtin_amdgcn_dot4_f32_fp8_fp8(pack4(a), pack4(b), c);
-#else
-    // Host-side target gating skips this kernel outside gfx12. Keep this
-    // fallback so other offload-arch builds can still instantiate the template.
-    (void)a;
-    (void)b;
-    __builtin_trap();
-    return c;
-#endif
-  }
-};
 
 template <int T_M_tile, int T_K_tile, int T_SubgroupSize, Type T_A_type,
           Type T_B_type, Type T_C_type>
@@ -900,6 +1230,12 @@ struct AmdDotReduceKernel : MatvecKernel {
       return;
 
     int tile_k = lane * K_VEC;
+
+    // This benchmark computes a pure matvec reduction:
+    //   sum_k A[m, k] * B[n, k]
+    // It intentionally starts at +0. Do not use this kernel as the signed-zero
+    // oracle for dot(a, b, c=-0), because +0 padding/tail lanes and subgroup
+    // reduction can erase the sign of an instruction-level -0 result.
     TC c[T_M_tile] = {0};
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       TB b[K_VEC] = {0};
@@ -1014,7 +1350,7 @@ struct SubgroupReduceKernel : MatvecKernel {
         }
       }
 
-      // Partial reduciton. Ideally, we'd like this to generate FMAs.
+      // Partial reduction. Ideally, we'd like this to generate FMAs.
       for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
         for (int k = 0; k < K_VEC; ++k) {
           c[m_tile][k] = fma(static_cast<TC>(a[m_tile][k]),
@@ -1059,9 +1395,10 @@ struct WorkgroupReduceKernel : MatvecKernel {
   static constexpr int K_outer = T_K_tile / K_VEC;
   static_assert(T_K_tile == K_VEC * K_outer, "Invalid configuration");
 
-  // In this matvec kernel, the whole workgroups processes a row and cooperatively
-  // reduces the result using subgroup operations. At the end, only one thread
-  // within the subgroups stores the row value to the main memory.
+  // In this matvec kernel, the whole workgroups processes a row and
+  // cooperatively reduces the result using subgroup operations. At the end,
+  // only one thread within the subgroups stores the row value to the main
+  // memory.
   WorkgroupReduceKernel() {
     name = __FUNCTION__;
     A_type = Type::FP32;
@@ -1318,8 +1655,13 @@ int main(int argc, char **argv) {
   DeviceCapabilities device = detectDeviceCapabilities();
   std::printf("Detected target: %s\n", device.name);
 
+  bool signed_zero_ok = true;
   if (!getenv("SKIP_CHECK")) {
-    checkSignedZero(device);
+    signed_zero_ok = checkSignedZero(device);
+    if (!signed_zero_ok) {
+      fprintf(stderr,
+              "Signed-zero check failed; continuing to run benchmarks.\n");
+    }
   }
 
   test(NaiveMatmulKernel{});
@@ -1340,10 +1682,14 @@ int main(int argc, char **argv) {
     if (device.dot.f16_f16) {
       testF16F16DotKernels<kSubgroupSize64>();
     }
+    if (device.dot.fp8_f32) {
+      testFp8DotKernels<kSubgroupSize64>();
+    }
     testWorkgroupReduceKernels<kSubgroupSize64>();
   }
   if (!getenv("SKIP_CHECK")) {
     printNumericalCheckSummary();
   }
-  return 0;
+  return signed_zero_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
+
