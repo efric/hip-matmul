@@ -1,12 +1,14 @@
-# GFX950 SMFMAC 16x16x64 Sparse Trick Notes
+# GFX950 SMFMAC Sparse Trick Notes
 
-This note documents the gfx950/CDNA4 port of the existing CDNA3 F16 sparse
-SMFMAC "dense M=8 via sparse M=16" trick in `matmul.hip`.
+This note documents the gfx950/CDNA4 ports of the sparse SMFMAC
+"dense M=8 via sparse M=16" trick in `matmul.hip`. It covers both the
+16x16x64 F16/BF16 path and the 16x16x128 FP8_FP8 path.
 
 The implemented kernels are:
 
 - `MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64f16_shared_uniquedata_gfx950`
 - `MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64bf16_shared_uniquedata_gfx950`
+- `MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x128fp8_fp8_shared_uniquedata_gfx950`
 
 They are the CDNA4 counterparts of:
 
@@ -31,28 +33,31 @@ simple "CDNA3 but twice as wide" extension for this sparse trick.
 
 ## What Was Implemented
 
-`common.hip` now has BF16 type support:
+`common.hip` now has BF16 and FP8 type support:
 
-- `Type::BF16`
-- `str(Type::BF16)`
-- `type_size(Type::BF16)`
+- `Type::BF16` and `Type::FP8`
+- `str(Type::BF16)` and `str(Type::FP8)`
+- `type_size(Type::BF16) = 2` and `type_size(Type::FP8) = 1`
 - `CType<Type::BF16> = __bf16`
-- BF16 random-buffer generation
+- `CType<Type::FP8> = __hip_fp8_e4m3`
+- BF16 and FP8 random-buffer generation
 
 `matmul.hip` now has:
 
 - BF16 reference checking: `HANDLE_CASE(BF16, BF16, FP32)`
+- FP8 reference checking: `HANDLE_CASE(FP8, FP8, FP32)`
 - a shared F16/BF16 gfx950 base template
 - F16 and BF16 wrapper classes
-- active tests for `<4,2>`, `<4,4>`, and `<8,2>` for both F16 and BF16
+- a gfx950 `16x16x128_fp8_fp8` kernel
+- active tests for `<4,2>`, `<4,4>`, and `<8,2>` for F16, BF16, and FP8
 
 The old CDNA3 `16x16x32_f16_shared_uniquedata_v3` active tests are commented
 out in `main()` because they fail correctness on gfx950. That is expected: the
 kernel bakes in the CDNA3 sparse register layout.
 
-## Sparse Index Constants
+## F16/BF16 Sparse Index Constants
 
-The gfx950 kernels use:
+The F16/BF16 gfx950 kernels use:
 
 ```c++
 static constexpr int SPARSITY_EVEN = 0x00004444;
@@ -68,7 +73,7 @@ The repeated byte/halfword spelling keeps the intended pattern explicit across
 the packed halves used by the CDNA4 instruction. The runtime probes and final
 correctness checks were run with these exact constants.
 
-## Final A Packing
+## F16/BF16 Final A Packing
 
 For one output lane, the kernel computes:
 
@@ -96,7 +101,7 @@ regD[0] = regD[0] + regD[1];
 regD[1] = regD[2] + regD[3];
 ```
 
-## Final B Shuffle
+## F16/BF16 Final B Shuffle
 
 The final B register fill is:
 
@@ -133,7 +138,7 @@ Equivalently, for `base = 4*k_slice`, the B operand slots are:
 
 This is the key gfx950-specific learning.
 
-## Why The First Port Failed
+## Why The First F16/BF16 Port Failed
 
 The first implementation assumed the CDNA4 B operand could be formed as the
 CDNA3 layout with an added high 32-element half:
@@ -184,7 +189,7 @@ fed to recover dense K order?
 
 That question was answered with direct one-hot probes on gfx950.
 
-## Probe Methodology
+## F16/BF16 Probe Methodology
 
 Temporary HIP probes were compiled in `/tmp` on the gfx950 machine. They were
 not committed to this directory.
@@ -246,7 +251,7 @@ D0 A7/G3 <- B13/G3   D1 A7/G3 <- B15/G3
 
 Compressing that table gives the final B shuffle formula used by the kernel.
 
-## Verification Evidence
+## F16/BF16 Verification Evidence
 
 The final unfiltered harness was run with reduced benchmark duration:
 
@@ -254,7 +259,7 @@ The final unfiltered harness was run with reduced benchmark duration:
 BENCHMARK_MIN_MS=1 ./build_and_test.sh
 ```
 
-All six active gfx950 kernels printed `Checking correctness... OK`:
+Before the FP8 path was added, all six active F16/BF16 gfx950 kernels printed `Checking correctness... OK`:
 
 ```text
 MmtKernel_...16x16x64f16...<4, 2>   OK
@@ -285,14 +290,250 @@ This proves the active gfx950 path lowers to the intended CDNA4 sparse
 instructions and no active CDNA3 F16 sparse instruction remains in the generated
 code.
 
+
+## FP8 16x16x128 Path
+
+The gfx950 FP8 path uses:
+
+```c++
+__builtin_amdgcn_smfmac_f32_16x16x128_fp8_fp8
+```
+
+The implemented kernel is:
+
+```text
+MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x128fp8_fp8_shared_uniquedata_gfx950
+```
+
+It has the same high-level tile shape as the F16/BF16 sparse trick:
+
+- `M_tile = 8`
+- `N_tile = NS * 16`
+- `K_tile = KS * 128`
+- 256 threads
+- output type `FP32`
+
+The instruction uses four A VGPRs, eight B VGPRs, and four D VGPRs. Since FP8
+is one byte per element, the operands are naturally modeled as raw byte vectors:
+
+```c++
+using u8x16 = __attribute__((__vector_size__(16))) unsigned char;
+using u8x32 = __attribute__((__vector_size__(32))) unsigned char;
+```
+
+A uses `u8x16`, B uses `u8x32`, and D uses the same `f32x4` accumulator shape as
+the F16/BF16 path.
+
+### FP8 Encoding Learning
+
+`common.hip` now has `Type::FP8`, with:
+
+```c++
+CType<Type::FP8> = __hip_fp8_e4m3;
+```
+
+This is intentionally the non-FNUZ OCP e4m3 type.
+
+A temporary host probe showed:
+
+```text
+__hip_fp8_e4m3_fnuz(1.0f).__x = 0x40
+__hip_fp8_e4m3(1.0f).__x      = 0x38
+```
+
+A one-hot SMFMAC probe then showed that raw byte `0x40` produced a product of
+`4`, while raw byte `0x38` produced a product of `1`. That means the gfx950
+`fp8_fp8` SMFMAC builtin is interpreting operand bytes as the non-FNUZ/OCP e4m3
+encoding for this path. Using `__hip_fp8_e4m3_fnuz` would make the reference
+buffer encode `1.0` as hardware `2.0`, so it would be the wrong test type for
+this instruction.
+
+This is a separate issue from the sparse-layout question. The matrix calculator
+labels this type as `amd_fp8`, but the executable evidence from the builtin on
+gfx950 is that `0x38` is the byte encoding that behaves as `1.0`.
+
+### FP8 Sparse Constants
+
+The FP8 instruction covers twice as many K positions as the F16/BF16 16x16x64
+instruction, so the sparse selector pattern is repeated across all eight
+nibbles:
+
+```c++
+static constexpr int SPARSITY_EVEN = 0x44444444;
+static constexpr int SPARSITY_ODD = 0xEEEEEEEE;
+```
+
+The semantic is unchanged:
+
+- `0x4` selects positions 0 and 1 in each 4-wide sparse group
+- `0xE` selects positions 2 and 3 in each 4-wide sparse group
+
+### FP8 A Packing
+
+For one 128-wide dense K bank, the A packing is:
+
+```c++
+int a_m_row = (lane_id % 16) / 2;
+int a_k_range = lane_id / 16;
+int odd_lane = lane_id % 2;
+
+int a_elem_base = a_m_row * (KS * 128) + k_bank * 128 +
+                  a_k_range * 16 + odd_lane * 64;
+for (int i = 0; i < 16; ++i) {
+  a_reg.u8[i] = A_shared_elems[a_elem_base + i];
+}
+```
+
+Interpretation:
+
+- even physical sparse row loads `K = 16*a_k_range + slot`
+- odd physical sparse row loads `K = 64 + 16*a_k_range + slot`
+
+As with F16/BF16, post-processing reduces the two physical sparse rows back to
+one dense row:
+
+```c++
+regD[0] = regD[0] + regD[1];
+regD[1] = regD[2] + regD[3];
+```
+
+### FP8 One-Hot Mapping
+
+The decisive one-hot probe varied A byte slot `0..15`, A source lane group
+`0..3`, B byte slot `0..31`, and B source lane group `0..3`. It restricted A
+and B to specific source lanes so that the output row/column identified the
+actual cross-lane SMFMAC source relationship.
+
+For the even sparse selector, the observed mapping compresses to:
+
+```text
+even_b = 16 * floor(ag / 2) + 4 * floor((a % 8) / 2) + (a % 2)
+bg     = 2 * (ag % 2) + floor(a / 8)
+```
+
+where `a` is the A byte slot, `ag` is the A source lane group, `even_b` is the B
+byte slot, and `bg` is the B source lane group.
+
+For the odd sparse selector, the B byte slot is shifted by two:
+
+```text
+odd_b = even_b + 2
+bg    = 2 * (ag % 2) + floor(a / 8)
+```
+
+Representative raw probe rows with byte `0x38` showed exact products of `1`:
+
+```text
+EVEN:
+D0 A00/G0 <- B00/G0    D0 A00/G1 <- B00/G2
+D0 A00/G2 <- B16/G0    D0 A00/G3 <- B16/G2
+D0 A01/G0 <- B01/G0    D0 A01/G1 <- B01/G2
+D0 A01/G2 <- B17/G0    D0 A01/G3 <- B17/G2
+D0 A08/G0 <- B00/G1    D0 A08/G1 <- B00/G3
+D0 A08/G2 <- B16/G1    D0 A08/G3 <- B16/G3
+
+ODD:
+D0 A00/G0 <- B02/G0    D0 A00/G1 <- B02/G2
+D0 A00/G2 <- B18/G0    D0 A00/G3 <- B18/G2
+D0 A01/G0 <- B03/G0    D0 A01/G1 <- B03/G2
+D0 A01/G2 <- B19/G0    D0 A01/G3 <- B19/G2
+D0 A08/G0 <- B02/G1    D0 A08/G1 <- B02/G3
+D0 A08/G2 <- B18/G1    D0 A08/G3 <- B18/G3
+```
+
+The D component did not change the byte-slot formula for this probe; rows D0
+through D3 used the same A/B slot relationship.
+
+### FP8 Final B Shuffle
+
+Inverting the one-hot table gives the B operand order for the actual dense
+matmul packing. For source B lane group `g`:
+
+```text
+base = 8*g
+
+{base+0,  base+1,  base+64,  base+65,
+ base+2,  base+3,  base+66,  base+67,
+ base+4,  base+5,  base+68,  base+69,
+ base+6,  base+7,  base+70,  base+71,
+ base+32, base+33, base+96,  base+97,
+ base+34, base+35, base+98,  base+99,
+ base+36, base+37, base+100, base+101,
+ base+38, base+39, base+102, base+103}
+```
+
+The implemented B register fill uses that exact order:
+
+```c++
+int b_elem_base = n_block * (KS * 2048) + n_col * (KS * 128) +
+                  k_bank * 128 + k_slice * 8;
+
+b_reg.u8[0]  = B_shared_elems[b_elem_base + 0];
+b_reg.u8[1]  = B_shared_elems[b_elem_base + 1];
+b_reg.u8[2]  = B_shared_elems[b_elem_base + 64];
+b_reg.u8[3]  = B_shared_elems[b_elem_base + 65];
+...
+b_reg.u8[30] = B_shared_elems[b_elem_base + 102];
+b_reg.u8[31] = B_shared_elems[b_elem_base + 103];
+```
+
+This is the byte-width analogue of the gfx950 F16/BF16 shuffle. The larger
+constant offsets come from the 128-wide dense K bank: the odd sparse row starts
+at `+64`, and the second half of the B lane-group inversion starts at `+32`.
+
+### FP8 Verification Evidence
+
+Filtered FP8 verification was run with:
+
+```bash
+FILTER=16x16x128fp8_fp8 BENCHMARK_MIN_MS=1 ./build_and_test.sh
+```
+
+All three active FP8 shapes printed `Checking correctness... OK`:
+
+```text
+MmtKernel_...16x16x128fp8_fp8...<4, 2>  OK  tile MxNxK=8x64x256
+MmtKernel_...16x16x128fp8_fp8...<4, 4>  OK  tile MxNxK=8x64x512
+MmtKernel_...16x16x128fp8_fp8...<8, 2>  OK  tile MxNxK=8x128x256
+```
+
+The unfiltered active harness was then rerun:
+
+```bash
+BENCHMARK_MIN_MS=1 ./build_and_test.sh
+```
+
+All nine active gfx950 kernels printed `Checking correctness... OK`: the three
+F16 kernels, the three BF16 kernels, and the three FP8 kernels.
+
+Generated gfx950 assembly was checked after `-save-temps=obj`:
+
+```bash
+grep -c "v_smfmac_f32_16x16x128_fp8_fp8" build/matmul-hip-amdgcn-amd-amdhsa-gfx950.s
+```
+
+Observed count:
+
+```text
+v_smfmac_f32_16x16x128_fp8_fp8  10
+```
+
+The same assembly file still had ten F16 and ten BF16 CDNA4 sparse instructions:
+
+```text
+v_smfmac_f32_16x16x64_f16   10
+v_smfmac_f32_16x16x64_bf16  10
+```
+
+
 ## Current Technical Debt
 
-The final B register construction is element-explicit. That was intentional for
+The final B register construction is element-explicit for both the F16/BF16 and FP8 paths. That was intentional for
 bring-up: it documents the proved mapping and avoids hiding the key layout in a
 clever dword-level shuffle.
 
 A follow-up optimization can repack the B operand with fewer dword moves or
-vector loads. The invariant to preserve is exactly this logical slot order:
+vector loads. For F16/BF16, the invariant to preserve is exactly this logical slot order:
 
 ```text
 {base+0,  base+1,  base+32, base+33,
@@ -301,8 +542,10 @@ vector loads. The invariant to preserve is exactly this logical slot order:
  base+18, base+19, base+50, base+51}
 ```
 
-Do not rewrite this back to a contiguous-8 or CDNA3-style interleave unless a
-new gfx950 one-hot probe proves the replacement equivalent.
+For FP8, the invariant is the 32-byte order documented in the FP8 section.
+
+Do not rewrite either path back to a contiguous or CDNA3-style interleave unless
+a new gfx950 one-hot probe proves the replacement equivalent.
 
 ## Checklist For Future Changes
 
@@ -310,27 +553,31 @@ When modifying this path:
 
 1. Keep the CDNA3 and gfx950 sparse kernels separate. Their B shuffles are not
    interchangeable.
-2. Preserve the A low/high split: even rows use `+0`, odd rows use `+32` within
+2. Preserve the F16/BF16 A low/high split: even rows use `+0`, odd rows use `+32` within
    the 64-wide K bank.
-3. Preserve the gfx950 B slot order above.
-4. Run both F16 and BF16 filtered correctness:
+3. Preserve the FP8 A low/high split: even rows use `+0`, odd rows use `+64` within
+   the 128-wide K bank.
+4. Preserve the gfx950 B slot orders above.
+5. Run F16, BF16, and FP8 filtered correctness:
 
    ```bash
    FILTER=16x16x64f16 BENCHMARK_MIN_MS=1 ./build_and_test.sh
    FILTER=16x16x64bf16 BENCHMARK_MIN_MS=1 ./build_and_test.sh
+   FILTER=16x16x128fp8_fp8 BENCHMARK_MIN_MS=1 ./build_and_test.sh
    ```
 
-5. Run the unfiltered active harness:
+6. Run the unfiltered active harness:
 
    ```bash
    BENCHMARK_MIN_MS=1 ./build_and_test.sh
    ```
 
-6. Check assembly for the intended instructions:
+7. Check assembly for the intended instructions:
 
    ```bash
    grep -c "v_smfmac_f32_16x16x64_f16" build/matmul-hip-amdgcn-amd-amdhsa-gfx950.s
    grep -c "v_smfmac_f32_16x16x64_bf16" build/matmul-hip-amdgcn-amd-amdhsa-gfx950.s
+   grep -c "v_smfmac_f32_16x16x128_fp8_fp8" build/matmul-hip-amdgcn-amd-amdhsa-gfx950.s
    grep -c "v_smfmac_f32_16x16x32_f16" build/matmul-hip-amdgcn-amd-amdhsa-gfx950.s
    ```
 

@@ -8,6 +8,7 @@
 #define HIP_MATMUL_COMMON
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp8.h>
 
 #include <cstdio>
 #include <random>
@@ -33,7 +34,7 @@ struct MNKShape {
   int M, N, K;
 };
 
-enum class Type { SI8, SI16, SI32, FP16, BF16, FP32 };
+enum class Type { SI8, SI16, SI32, FP16, BF16, FP8, FP32 };
 
 inline const char *str(Type t) {
   switch (t) {
@@ -47,6 +48,8 @@ inline const char *str(Type t) {
     return "fp16";
   case Type::BF16:
     return "bf16";
+  case Type::FP8:
+    return "fp8";
   case Type::FP32:
     return "fp32";
   }
@@ -64,6 +67,8 @@ inline __device__ __host__ int type_size(Type t) {
     return 2;
   case Type::BF16:
     return 2;
+  case Type::FP8:
+    return 1;
   case Type::FP32:
     return 4;
   }
@@ -84,6 +89,9 @@ template <> struct CTypeImpl<Type::FP16> {
 };
 template <> struct CTypeImpl<Type::BF16> {
   using type = __bf16;
+};
+template <> struct CTypeImpl<Type::FP8> {
+  using type = __hip_fp8_e4m3;
 };
 template <> struct CTypeImpl<Type::FP32> {
   using type = float;
@@ -127,6 +135,8 @@ inline std::vector<std::byte> makeRandomBuffer(Type type, int size,
     fillRandomBuffer<Type::FP16>(size, r, result.data());
   } else if (type == Type::BF16) {
     fillRandomBuffer<Type::BF16>(size, r, result.data());
+  } else if (type == Type::FP8) {
+    fillRandomBuffer<Type::FP8>(size, r, result.data());
   } else if (type == Type::FP32) {
     fillRandomBuffer<Type::FP32>(size, r, result.data());
   }

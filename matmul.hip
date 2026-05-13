@@ -180,6 +180,7 @@ void checkMmtResults(Type A_type, Type B_type, Type C_type,
   HANDLE_CASE(FP32, FP32, FP32)
   HANDLE_CASE(FP16, FP16, FP32)
   HANDLE_CASE(BF16, BF16, FP32)
+  HANDLE_CASE(FP8, FP8, FP32)
   HANDLE_CASE(SI8, SI8, SI32)
 #undef HANDLE_CASE
 
@@ -5697,6 +5698,201 @@ class MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64bf16_shared_uniquedata_gfx9
     : public MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64_shared_uniquedata_gfx950_base<
           Type::BF16, NS, KS> {};
 
+
+// GFX950/CDNA4 FP8 counterpart of the unique-lane-data sparse trick.
+//
+// V_SMFMAC_F32_16X16X128_FP8_FP8 uses the same 4 A VGPR / 8 B VGPR /
+// 4 D VGPR footprint as the 16x16x64 f16/bf16 forms, but each operand byte is
+// an OCP e4m3 fp8 value. The instruction therefore covers a 128-wide dense K
+// bank when the two sparse rows are post-reduced.
+//
+// The one-hot gfx950 probe showed that raw byte 0x38 is 1.0 for this
+// instruction, i.e. it uses the non-FNUZ HIP __hip_fp8_e4m3 encoding.
+//
+// For a source B lane group g, the B register slots must be filled with dense
+// K offsets:
+//   base = 8*g
+//   {base+0,  base+1,  base+64, base+65,
+//    base+2,  base+3,  base+66, base+67,
+//    base+4,  base+5,  base+68, base+69,
+//    base+6,  base+7,  base+70, base+71,
+//    base+32, base+33, base+96, base+97,
+//    base+34, base+35, base+98, base+99,
+//    base+36, base+37, base+100, base+101,
+//    base+38, base+39, base+102, base+103}.
+// This is the fp8 analogue of the gfx950 f16/bf16 B shuffle above.
+template <int NS, int KS>
+class MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x128fp8_fp8_shared_uniquedata_gfx950
+    : public MmtKernel {
+  static_assert(NS >= 4 && !(NS % 4));
+  static_assert(KS >= 1 && KS <= 8);
+
+  static constexpr int SPARSITY_EVEN = 0x44444444;
+  static constexpr int SPARSITY_ODD = 0xEEEEEEEE;
+
+  virtual Type A_type() const override { return Type::FP8; }
+  virtual Type B_type() const override { return Type::FP8; }
+  virtual Type C_type() const override { return Type::FP32; }
+  virtual int M_tile() const override { return 8; }
+  virtual int N_tile() const override { return NS * 16; }
+  virtual int K_tile() const override { return KS * 128; }
+
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return m * (KS * 128) + k; };
+  }
+
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int n_block = n / 16;
+      int n_col = n % 16;
+      return n_block * (KS * 2048) + n_col * (KS * 128) + k;
+    };
+  }
+
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return m * (NS * 16) + n; };
+  }
+
+  virtual int num_threads() const override { return 256; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+
+  using u8x16 = __attribute__((__vector_size__(16))) unsigned char;
+  using u8x32 = __attribute__((__vector_size__(32))) unsigned char;
+  using f32x4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
+    union {
+      u8x16 vec;
+      uint8_t u8[16];
+    } a_reg;
+
+    f32x4 acc[NS / 4] = {{0}};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int tid = threadIdx.x;
+    int lane_id = tid % 64;
+    int warp_id = tid / 64;
+
+    constexpr int A_tile_size_in_vec16 = 8 * KS * 8;
+    constexpr int B_tile_size_in_vec16 = NS * KS * 128;
+
+    const u8x16 *A_global = static_cast<const u8x16 *>(A_data) +
+                            m_outer * K_outer * A_tile_size_in_vec16;
+    const u8x16 *B_global = static_cast<const u8x16 *>(B_data) +
+                            n_outer * K_outer * B_tile_size_in_vec16;
+    const u8x16 *B_global_ptr = B_global + tid;
+
+    __shared__ u8x16 A_shared[A_tile_size_in_vec16];
+    __shared__ u8x16 B_shared[B_tile_size_in_vec16];
+    auto *A_shared_elems = reinterpret_cast<uint8_t *>(A_shared);
+    auto *B_shared_elems = reinterpret_cast<uint8_t *>(B_shared);
+
+    int a_m_row = (lane_id % 16) / 2;
+    int a_k_range = lane_id / 16;
+    int odd_lane = lane_id % 2;
+    int n_col = lane_id % 16;
+    int k_slice = lane_id / 16;
+
+    int sparsity_idx = odd_lane ? SPARSITY_ODD : SPARSITY_EVEN;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      const u8x16 *A_ptr = A_global + k_outer * A_tile_size_in_vec16;
+      for (int i = tid; i < A_tile_size_in_vec16; i += 256) {
+        A_shared[i] = A_ptr[i];
+      }
+
+      for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
+        B_shared[i + tid] = B_global_ptr[i];
+      }
+      B_global_ptr += B_tile_size_in_vec16;
+      __syncthreads();
+
+      for (int k_bank = 0; k_bank < KS; ++k_bank) {
+        int a_elem_base = a_m_row * (KS * 128) + k_bank * 128 +
+                          a_k_range * 16 + odd_lane * 64;
+        for (int i = 0; i < 16; ++i) {
+          a_reg.u8[i] = A_shared_elems[a_elem_base + i];
+        }
+
+        for (int j = 0; j < NS / 4; ++j) {
+          int n_block = j * 4 + warp_id;
+          int b_elem_base = n_block * (KS * 2048) + n_col * (KS * 128) +
+                            k_bank * 128 + k_slice * 8;
+
+          union {
+            u8x32 vec;
+            uint8_t u8[32];
+          } b_reg;
+
+          b_reg.u8[0] = B_shared_elems[b_elem_base + 0];
+          b_reg.u8[1] = B_shared_elems[b_elem_base + 1];
+          b_reg.u8[2] = B_shared_elems[b_elem_base + 64];
+          b_reg.u8[3] = B_shared_elems[b_elem_base + 65];
+          b_reg.u8[4] = B_shared_elems[b_elem_base + 2];
+          b_reg.u8[5] = B_shared_elems[b_elem_base + 3];
+          b_reg.u8[6] = B_shared_elems[b_elem_base + 66];
+          b_reg.u8[7] = B_shared_elems[b_elem_base + 67];
+          b_reg.u8[8] = B_shared_elems[b_elem_base + 4];
+          b_reg.u8[9] = B_shared_elems[b_elem_base + 5];
+          b_reg.u8[10] = B_shared_elems[b_elem_base + 68];
+          b_reg.u8[11] = B_shared_elems[b_elem_base + 69];
+          b_reg.u8[12] = B_shared_elems[b_elem_base + 6];
+          b_reg.u8[13] = B_shared_elems[b_elem_base + 7];
+          b_reg.u8[14] = B_shared_elems[b_elem_base + 70];
+          b_reg.u8[15] = B_shared_elems[b_elem_base + 71];
+          b_reg.u8[16] = B_shared_elems[b_elem_base + 32];
+          b_reg.u8[17] = B_shared_elems[b_elem_base + 33];
+          b_reg.u8[18] = B_shared_elems[b_elem_base + 96];
+          b_reg.u8[19] = B_shared_elems[b_elem_base + 97];
+          b_reg.u8[20] = B_shared_elems[b_elem_base + 34];
+          b_reg.u8[21] = B_shared_elems[b_elem_base + 35];
+          b_reg.u8[22] = B_shared_elems[b_elem_base + 98];
+          b_reg.u8[23] = B_shared_elems[b_elem_base + 99];
+          b_reg.u8[24] = B_shared_elems[b_elem_base + 36];
+          b_reg.u8[25] = B_shared_elems[b_elem_base + 37];
+          b_reg.u8[26] = B_shared_elems[b_elem_base + 100];
+          b_reg.u8[27] = B_shared_elems[b_elem_base + 101];
+          b_reg.u8[28] = B_shared_elems[b_elem_base + 38];
+          b_reg.u8[29] = B_shared_elems[b_elem_base + 39];
+          b_reg.u8[30] = B_shared_elems[b_elem_base + 102];
+          b_reg.u8[31] = B_shared_elems[b_elem_base + 103];
+
+          acc[j] = __builtin_amdgcn_smfmac_f32_16x16x128_fp8_fp8(
+              a_reg.vec, b_reg.vec, acc[j], sparsity_idx, 0, 0);
+        }
+        __syncthreads();
+      }
+    }
+
+    for (int j = 0; j < NS / 4; ++j) {
+      float *regD = reinterpret_cast<float *>(&acc[j]);
+      regD[0] = regD[0] + regD[1];
+      regD[1] = regD[2] + regD[3];
+    }
+
+    constexpr int N_stride = NS * 16;
+    int m_pair = lane_id / 16;
+    int m0 = m_pair * 2;
+    int m1 = m_pair * 2 + 1;
+
+    constexpr int tile_size = 8 * NS * 16;
+    float *C_tile = static_cast<float *>(C_data) +
+                    tile_size * (N_outer * m_outer + n_outer);
+
+    for (int j = 0; j < NS / 4; ++j) {
+      int n_block = j * 4 + warp_id;
+      int n = n_block * 16 + n_col;
+
+      float *regD = reinterpret_cast<float *>(&acc[j]);
+      C_tile[m0 * N_stride + n] = regD[0];
+      C_tile[m1 * N_stride + n] = regD[1];
+    }
+  }
+};
+
 // M-padded MFMA kernel for skinny GEMMs (M=8->16).
 // Uses the dense mfma_i32_16x16x32_i8 instruction with zero-padding
 // on the A operand for lanes corresponding to M-rows 8-15.
@@ -6459,6 +6655,9 @@ int main() {
   test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64bf16_shared_uniquedata_gfx950<4, 2>());
   test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64bf16_shared_uniquedata_gfx950<4, 4>());
   test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64bf16_shared_uniquedata_gfx950<8, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x128fp8_fp8_shared_uniquedata_gfx950<4, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x128fp8_fp8_shared_uniquedata_gfx950<4, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x128fp8_fp8_shared_uniquedata_gfx950<8, 2>());
 
   // std::printf("\n\n\nStream-K experiments:\n\n");
   // test(
