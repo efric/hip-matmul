@@ -33,7 +33,7 @@ struct MNKShape {
   int M, N, K;
 };
 
-enum class Type { SI8, SI16, SI32, FP16, FP32 };
+enum class Type { SI8, SI16, SI32, FP16, BF16, FP32 };
 
 inline const char *str(Type t) {
   switch (t) {
@@ -45,6 +45,8 @@ inline const char *str(Type t) {
     return "si32";
   case Type::FP16:
     return "fp16";
+  case Type::BF16:
+    return "bf16";
   case Type::FP32:
     return "fp32";
   }
@@ -59,6 +61,8 @@ inline __device__ __host__ int type_size(Type t) {
   case Type::SI32:
     return 4;
   case Type::FP16:
+    return 2;
+  case Type::BF16:
     return 2;
   case Type::FP32:
     return 4;
@@ -77,6 +81,9 @@ template <> struct CTypeImpl<Type::SI32> {
 };
 template <> struct CTypeImpl<Type::FP16> {
   using type = _Float16;
+};
+template <> struct CTypeImpl<Type::BF16> {
+  using type = __bf16;
 };
 template <> struct CTypeImpl<Type::FP32> {
   using type = float;
@@ -118,6 +125,8 @@ inline std::vector<std::byte> makeRandomBuffer(Type type, int size,
     fillRandomBuffer<Type::SI32>(size, r, result.data());
   } else if (type == Type::FP16) {
     fillRandomBuffer<Type::FP16>(size, r, result.data());
+  } else if (type == Type::BF16) {
+    fillRandomBuffer<Type::BF16>(size, r, result.data());
   } else if (type == Type::FP32) {
     fillRandomBuffer<Type::FP32>(size, r, result.data());
   }

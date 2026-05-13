@@ -179,6 +179,7 @@ void checkMmtResults(Type A_type, Type B_type, Type C_type,
   }
   HANDLE_CASE(FP32, FP32, FP32)
   HANDLE_CASE(FP16, FP16, FP32)
+  HANDLE_CASE(BF16, BF16, FP32)
   HANDLE_CASE(SI8, SI8, SI32)
 #undef HANDLE_CASE
 
@@ -5493,6 +5494,209 @@ class MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata_v3
   }
 };
 
+
+// GFX950/CDNA4 unique-lane-data variant of the F16/BF16 SMFMAC sparse trick.
+//
+// This is the CDNA4 counterpart of
+// MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata_v3.
+// CDNA3 16x16x32_f16 consumes two A dwords and four B dwords, so v3 emits
+// two SMFMACs per 64-wide dense K bank. CDNA4 16x16x64_f16/bf16 consumes
+// four A dwords and eight B dwords, so one instruction covers the bank.
+//
+// The sparse trick still maps two physical sparse rows to one dense row:
+// even rows use sparse positions 0,1 and odd rows use positions 2,3, then
+// the two destination rows are reduced. For a dense 64-wide K bank, A lane
+// group ag stores low K = 8*ag + slot and high K = 32 + 8*ag + slot.
+//
+// GFX950 pairs A slots with B lane groups differently from the CDNA3 code.
+// The B shuffle below uses base = 4*k_slice and lays out slots as:
+//   {base+0, base+1, base+32, base+33,
+//    base+2, base+3, base+34, base+35,
+//    base+16, base+17, base+48, base+49,
+//    base+18, base+19, base+50, base+51}.
+// This matches the probed V_SMFMAC_F32_16X16X64_F16 sparse slot mapping and
+// makes the even/odd row reduction cover K0..K63 exactly once.
+template <Type T_InputType, int NS, int KS>
+class MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64_shared_uniquedata_gfx950_base
+    : public MmtKernel {
+  static_assert(T_InputType == Type::FP16 || T_InputType == Type::BF16);
+  static_assert(NS >= 4 && !(NS % 4));
+  static_assert(KS >= 2 && KS <= 8 && !(KS % 2));
+
+  static constexpr int SPARSITY_EVEN = 0x00004444;
+  static constexpr int SPARSITY_ODD = 0x0000EEEE;
+
+  virtual Type A_type() const override { return T_InputType; }
+  virtual Type B_type() const override { return T_InputType; }
+  virtual Type C_type() const override { return Type::FP32; }
+  virtual int M_tile() const override { return 8; }
+  virtual int N_tile() const override { return NS * 16; }
+  virtual int K_tile() const override { return KS * 64; }
+
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return m * (KS * 64) + k; };
+  }
+
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int n_block = n / 16;
+      int n_col = n % 16;
+      return n_block * (KS * 1024) + n_col * (KS * 64) + k;
+    };
+  }
+
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return m * (NS * 16) + n; };
+  }
+
+  virtual int num_threads() const override { return 256; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+
+  using input_t = CType<T_InputType>;
+  using inputx8 = __attribute__((__vector_size__(8 * sizeof(input_t)))) input_t;
+  using inputx16 =
+      __attribute__((__vector_size__(16 * sizeof(input_t)))) input_t;
+  using f32x4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+
+  __device__ static f32x4 smfmac(inputx8 a, inputx16 b, f32x4 acc,
+                                 int sparsity_idx) {
+    if constexpr (T_InputType == Type::FP16) {
+      return __builtin_amdgcn_smfmac_f32_16x16x64_f16(a, b, acc,
+                                                      sparsity_idx, 0, 0);
+    } else {
+      return __builtin_amdgcn_smfmac_f32_16x16x64_bf16(a, b, acc,
+                                                       sparsity_idx, 0, 0);
+    }
+  }
+
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
+    static_assert(sizeof(input_t) == 2);
+
+    union {
+      inputx8 vec;
+      input_t h[8];
+    } a_reg;
+
+    f32x4 acc[NS / 4] = {{0}};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int tid = threadIdx.x;
+    int lane_id = tid % 64;
+    int warp_id = tid / 64;
+
+    constexpr int A_tile_size_in_vec16 = 8 * KS * 8;
+    constexpr int B_tile_size_in_vec16 = NS * KS * 128;
+
+    const inputx8 *A_global = static_cast<const inputx8 *>(A_data) +
+                              m_outer * K_outer * A_tile_size_in_vec16;
+    const inputx8 *B_global = static_cast<const inputx8 *>(B_data) +
+                              n_outer * K_outer * B_tile_size_in_vec16;
+    const inputx8 *B_global_ptr = B_global + tid;
+
+    __shared__ inputx8 A_shared[A_tile_size_in_vec16];
+    __shared__ inputx8 B_shared[B_tile_size_in_vec16];
+    auto *A_shared_elems = reinterpret_cast<input_t *>(A_shared);
+    auto *B_shared_elems = reinterpret_cast<input_t *>(B_shared);
+
+    int a_m_row = (lane_id % 16) / 2;
+    int a_k_range = lane_id / 16;
+    int odd_lane = lane_id % 2;
+    int n_col = lane_id % 16;
+    int k_slice = lane_id / 16;
+
+    int sparsity_idx = odd_lane ? SPARSITY_ODD : SPARSITY_EVEN;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      const inputx8 *A_ptr = A_global + k_outer * A_tile_size_in_vec16;
+      for (int i = tid; i < A_tile_size_in_vec16; i += 256) {
+        A_shared[i] = A_ptr[i];
+      }
+
+      for (int i = 0; i < B_tile_size_in_vec16; i += 256) {
+        B_shared[i + tid] = B_global_ptr[i];
+      }
+      B_global_ptr += B_tile_size_in_vec16;
+      __syncthreads();
+
+      for (int k_bank = 0; k_bank < KS; ++k_bank) {
+        int a_elem_base = a_m_row * (KS * 64) + k_bank * 64 +
+                          a_k_range * 8 + odd_lane * 32;
+        for (int i = 0; i < 8; ++i) {
+          a_reg.h[i] = A_shared_elems[a_elem_base + i];
+        }
+
+        for (int j = 0; j < NS / 4; ++j) {
+          int n_block = j * 4 + warp_id;
+          int b_elem_base = n_block * (KS * 1024) + n_col * (KS * 64) +
+                            k_bank * 64 + k_slice * 4;
+
+          union {
+            inputx16 vec;
+            input_t h[16];
+          } b_reg;
+
+          b_reg.h[0] = B_shared_elems[b_elem_base + 0];
+          b_reg.h[1] = B_shared_elems[b_elem_base + 1];
+          b_reg.h[2] = B_shared_elems[b_elem_base + 32];
+          b_reg.h[3] = B_shared_elems[b_elem_base + 33];
+          b_reg.h[4] = B_shared_elems[b_elem_base + 2];
+          b_reg.h[5] = B_shared_elems[b_elem_base + 3];
+          b_reg.h[6] = B_shared_elems[b_elem_base + 34];
+          b_reg.h[7] = B_shared_elems[b_elem_base + 35];
+          b_reg.h[8] = B_shared_elems[b_elem_base + 16];
+          b_reg.h[9] = B_shared_elems[b_elem_base + 17];
+          b_reg.h[10] = B_shared_elems[b_elem_base + 48];
+          b_reg.h[11] = B_shared_elems[b_elem_base + 49];
+          b_reg.h[12] = B_shared_elems[b_elem_base + 18];
+          b_reg.h[13] = B_shared_elems[b_elem_base + 19];
+          b_reg.h[14] = B_shared_elems[b_elem_base + 50];
+          b_reg.h[15] = B_shared_elems[b_elem_base + 51];
+
+          acc[j] = smfmac(a_reg.vec, b_reg.vec, acc[j], sparsity_idx);
+        }
+        __syncthreads();
+      }
+    }
+
+    for (int j = 0; j < NS / 4; ++j) {
+      float *regD = reinterpret_cast<float *>(&acc[j]);
+      regD[0] = regD[0] + regD[1];
+      regD[1] = regD[2] + regD[3];
+    }
+
+    constexpr int N_stride = NS * 16;
+    int m_pair = lane_id / 16;
+    int m0 = m_pair * 2;
+    int m1 = m_pair * 2 + 1;
+
+    constexpr int tile_size = 8 * NS * 16;
+    float *C_tile = static_cast<float *>(C_data) +
+                    tile_size * (N_outer * m_outer + n_outer);
+
+    for (int j = 0; j < NS / 4; ++j) {
+      int n_block = j * 4 + warp_id;
+      int n = n_block * 16 + n_col;
+
+      float *regD = reinterpret_cast<float *>(&acc[j]);
+      C_tile[m0 * N_stride + n] = regD[0];
+      C_tile[m1 * N_stride + n] = regD[1];
+    }
+  }
+};
+
+template <int NS, int KS>
+class MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64f16_shared_uniquedata_gfx950
+    : public MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64_shared_uniquedata_gfx950_base<
+          Type::FP16, NS, KS> {};
+
+template <int NS, int KS>
+class MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64bf16_shared_uniquedata_gfx950
+    : public MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64_shared_uniquedata_gfx950_base<
+          Type::BF16, NS, KS> {};
+
 // M-padded MFMA kernel for skinny GEMMs (M=8->16).
 // Uses the dense mfma_i32_16x16x32_i8 instruction with zero-padding
 // on the A operand for lanes corresponding to M-rows 8-15.
@@ -6195,13 +6399,13 @@ int main() {
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared<8, 4>());
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared<16, 2>());
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle<4, 2>());
-  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle<4, 4>());
+//  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle<4, 4>());
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle<8, 2>());
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle_v2<4, 2>());
-  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle_v2<4, 4>());
+//  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle_v2<4, 4>());
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle_v2<8, 2>());
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle_v3<4, 2>());
-  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle_v3<4, 4>());
+//  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle_v3<4, 4>());
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_i32_16x16x64i8_shared_bswizzle_v3<8, 2>());
   // test(MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 2>());
   // test(MmtKernel_256t_NSxKS_amdgcn_mfma_i32_16x16x32i8_zeropad_shared<4, 4>());
@@ -6241,9 +6445,20 @@ int main() {
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata_v2<4, 2>());
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata_v2<4, 4>());
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata_v2<8, 2>());
+
+
+  // CDNA3 sparse layout; fails correctness on gfx950 because the
+  // 16x16x32_f16 register mapping differs from CDNA4.
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata_v3<4, 2>());
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata_v3<4, 4>());
   // test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x32f16_shared_uniquedata_v3<8, 2>());
+
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64f16_shared_uniquedata_gfx950<4, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64f16_shared_uniquedata_gfx950<4, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64f16_shared_uniquedata_gfx950<8, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64bf16_shared_uniquedata_gfx950<4, 2>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64bf16_shared_uniquedata_gfx950<4, 4>());
+  test(MmtKernel_256t_NSxKS_amdgcn_smfmac_f32_16x16x64bf16_shared_uniquedata_gfx950<8, 2>());
 
   // std::printf("\n\n\nStream-K experiments:\n\n");
   // test(

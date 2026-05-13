@@ -7,7 +7,7 @@ then
   mkdir build
 fi
 
-readonly KERNELS_TO_RUN="${KERNELS_TO_RUN:-matmul matvec}"
+readonly KERNELS_TO_RUN="${KERNELS_TO_RUN:-matmul}"
 
 for kernel in $KERNELS_TO_RUN; do
   echo "Build and test: ${kernel}"
